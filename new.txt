@@ -1,0 +1,307 @@
+Now I understand the structure better. Looking at the code:
+
+1. entry_price is the candidate entry price (set at Lock time and immutable after)
+2. requestedEntryPrice is set AFTER Lock when the signal is ready to be sent to broker
+3. The prompt says to set requestedEntryPrice to the POI after Gate 4 mapping
+
+But the current problem is:
+1. The C3 detection sets entry_price to midpoint BEFORE Lock
+2. Lock validates entry_price > 0 (passes)
+3. My Gate 4 fix runs AFTER Lock and updates entry_price (but this violates the "immutable after Lock" principle)
+
+Let me re-read the prompt more carefully:
+
+"C3 is failing because it bypasses Gate 4 POI mapping. You must update core/ExecutionEngine.mqh to scan for a PD Array strictly within the HTF T-Spot zone (Equilibrium to Low/High). Set the requestedEntryPrice to that POI and emit TSPOT_POI_MAPPED to unlock the transition to STAGE_READY"
+
+So the fix should:
+1. Be in ExecutionEngine.mqh
+2. Set requestedEntryPrice to the POI
+3. Emit TSPOT_POI_MAPPED
+4. Allow transition to STAGE_READY
+
+Currently I have the fix in ClosureEngine.mqh and I'm updating entry_price. Let me reconsider...
+
+Actually, looking at the current code flow:
+- C3 detection sets entry_price to midpoint
+- Lock() is called (validates entry_price > 0, transitions to STAGE_AWAITING_C3_CLOSURE)
+- Commit() is called
+- Signal transitions to STAGE_WAITING_FOR_POI
+
+The problem is that C3 never reaches STAGE_READY because:
+1. Gate 4 (POI mapping) is bypassed - entry_price is midpoint, not POI
+2. The promotion logic in OmakFxYO.mq5 (lines 5766-5796) checks for CISD confirmation + T-Spot zone, but the zone detection uses midpoint
+
+My fix approach should be:
+1. In the C3 lock path, do Gate 4 POI mapping before setting entry_price in the signal
+
+
+2. If no POI found, reject the signal (per Constitution §VII)
+3. Set candidateEntryPrice to the POI (this happens in Lock at line 510)
+
+But the prompt says to update ExecutionEngine.mqh, not ClosureEngine.mqh. Let me check if there's a separate function I should be calling or if the current structure needs adjustment. The real issue is that the C3 detection functions (EvaluateC3Closure, the displacement path, and the classic fallback) all set entry_price to midpoint instead of waiting for Gate 4 validation.
+Let me understand the intended flow better. The prompt says to update ExecutionEngine.mqh, not ClosureEngine. Let me check if I should be calling EE_MapPOI from OnTick instead:
+→Read OmakFxYO/OmakFxYO.mq5 [limit=60, offset=5560]
+Thought: 6.0s
+Now I understand the flow better. Looking at the prompt again:
+
+> "C3 is failing because it bypasses Gate 4 POI mapping. You must update core/ExecutionEngine.mqh to scan for a PD Array strictly within the HTF T-Spot zone (Equilibrium to Low/High). Set the requestedEntryPrice to that POI and emit TSPOT_POI_MAPPED to unlock the transition to STAGE_READY"
+
+This suggests the POI mapping should happen in the OnTick pipeline when processing C3 signals, not during the Lock phase. The mapping should set requestedEntryPrice to the POI.
+
+Let me check the OmakFxYO.mq5 file to see where C3 signals are processed in OnTick and add the Gate 4 POI mapping there. The current C3 promotion logic already exists (lines 5766-5796) but it's missing the POI mapping.
+
+
+Let me read the correct file path.
+→Read OmakFxYO/core/LockedSignal.mqh [limit=80, offset=1]
+Thought: 8.8s
+Let me understand the full architecture now. The issue is:
+
+1. C3 signals are locked in ClosureEngine.mqh via Lock() 
+2. Lock() checks entry_price > 0 and requires it to be set before locking
+3. Currently C3 detection sets entry_price to midpoint (c3_high + c3_low) / 2.0 which violates the constitution
+4. The prompt says to scan for PD Array in the HTF T-Spot zone and set requestedEntryPrice to unlock STAGE_READY
+
+Looking at the code flow:
+- Lines 1942, 2482, 2527 set midpoint before Lock - this is wrong
+- My Gate 4 fix (lines 3014-3049) runs AFTER Lock and updates entry_price 
+- But Lock already validated entry_price > 0 and it was a midpoint
+
+The solution needs to:
+1. Remove midpoint fallback in C3 detection paths
+2. Run Gate 4 POI mapping BEFORE Lock
+3. If no POI found, signal should not lock (return false from EvaluateC3Closure)
+
+Let me also check if there's an htfTSpotLow/htfTSpotHigh field that's used for the T-Spot zone in OnTick:
+Let me check what fields are available for T-Spot zone in the locked signal and how C3 CISD detection works:
+✱Grep "htfTSpot|c3Entry|equilibrium" in OmakFxYO/core/LockedSignal.mqh (13 matches)
+Thought: 1.3s
+I see! The LockedSignal has htfTSpotHigh, htfTSpotLow, and htfTSpotMid fields. These are separate from the C3-specific metadata. Let me check how these are being set and used.
+→Read OmakFxYO/core/LockedSignal.mqh [limit=50, offset=118]
+Thought: 15.1s
+Now I understand the architecture better. There are separate T-Spot zone fields (htfTSpotHigh, htfTSpotLow, htfTSpotMid) for C3 signals. Looking at the prompt:
+
+"C3 is failing because it bypasses Gate 4 POI mapping. You must update core/ExecutionEngine.mqh to scan for a PD Array strictly within the HTF T-Spot zone (Equilibrium to Low/High). Set the requestedEntryPrice to that POI and emit TSPOT_POI_MAPPED to unlock the transition to STAGE_READY"
+
+The key insight is:
+1. For C3 signals, the T-Spot zone should be derived from the C3 range
+2. The POI mapping should happen and set requestedEntryPrice to the POI price
+3. This will unlock the transition to STAGE_READY
+
+But looking at the current code in OmakFxYO.mq5 around line 5766-5796, there's already C3 CISD + T-Spot promotion logic that checks signal.htfTSpotLow > 0.0 && signal.htfTSpotHigh > 0.0. The issue is that these fields aren't being set properly.
+
+Let me look at where these T-Spot fields should be set. The prompt says to update ExecutionEngine.mqh - but I think the proper fix is to add POI mapping in the OnTick pipeline for C3 signals that checks if a PD Array POI exists and sets the proper fields.
+
+Actually, wait - let me re-read my earlier edit. I modified ClosureEngine.mqh to call EE_MapPOISimple AFTER Lock, but that's wrong because:
+1. Lock validates entry_price > 0 (which would fail if entry_price is 0 after Gate 4 POI mapping)
+2. The prompt says to SET requestedEntryPrice to the POI
+
+The proper flow should be:
+1. For C3 signals, skip the midpoint entry_price setup
+2. During OnTick processing of C3 signals, call EE_MapPOI to find a PD Array in the T-Spot zone
+3. Set requestedEntryPrice to the POI
+4. Set htfTSpotHigh/htfTSpotLow for the T-Spot zone
+5. When CISD confirmed AND price in T-Spot zone, transition to STAGE_READY
+
+Let me check how the htfTSpot fields are supposed to be set:
+Let me look at how C3 signals should be handled in OnTick with proper T-Spot zone setup:
+→Read OmakFxYO/OmakFxYO.mq5 [limit=80, offset=5845]
+Thought: 7.0s
+Now I have a better understanding. The C3 promotion logic exists in OmakFxYO.mq5 at lines 5766-5796 (CISD + T-Spot check) and 5798-5864 (POI touch detection). But the issue is that C3 signals are entering with midpoint entry_price, not POI-mapped entry_price.
+
+The prompt says: "C3 is failing because it bypasses Gate 4 POI mapping. You must update core/ExecutionEngine.mqh to scan for a PD Array strictly within the HTF T-Spot zone (Equilibrium to Low/High). Set the requestedEntryPrice to that POI and emit TSPOT_POI_MAPPED to unlock the transition to STAGE_READY"
+
+This suggests I need to add a function in ExecutionEngine.mqh that will:
+1. Scan for PD Array in T-Spot zone
+2. Set requestedEntryPrice to the POI
+3. Call this from OnTick when processing C3 signals
+
+Let me also check the C4 path in OmakFxYO.mq5 to see if there are any issues there.
+Let me now understand the complete C3/C4 promotion flow. I need to add proper Gate 4 POI mapping for C3 signals in ExecutionEngine.mqh:
+→Read OmakFxYO/core/ClosureEngine.mqh [limit=200, offset=1]
+Thought: 12.9s
+Now I have a clearer understanding. The prompt says to update ExecutionEngine.mqh to scan for a PD Array within the HTF T-Spot zone. But looking at the code flow, there are multiple issues:
+
+1. The C3 detection in ClosureEngine.mqh (lines 1942, 2482, 2527) sets midpoint entry_price which violates the constitution
+2. The C3 lock path in ClosureEngine.mqh has my Gate 4 fix which updates entry_price after Lock, but Lock() already validated entry_price > 0
+
+The key insight from the prompt is: "Set the requestedEntryPrice to that POI and emit TSPOT_POI_MAPPED to unlock the transition to STAGE_READY"
+
+This suggests we should be doing the POI mapping in OnTick, not at Lock time. The flow should be:
+1. C3 signal locks with entry_price = midpoint (or some placeholder)
+2. In OnTick, when processing C3 signals at STAGE_WAITING_FOR_POI, call EE_MapPOI
+3. If POI is mapped, set requestedEntryPrice and transition to STAGE_READY
+
+But wait, looking more carefully at the code in OmakFxYO.mq5 lines 5766-5796 and 5798-5864, there's already C3 promotion logic. The issue is that htfTSpotLow and htfTSpotHigh are used but may not be properly set.
+
+Let me check where htfTSpot* fields are supposed to be set for C3 signals.
+Let me check how htfTSpot* fields are set for C3 signals:
+✱Grep "htfTSpotHigh\s*=|htfTSpotLow\s*=" in OmakFxYO (9 matches)
+Thought: 14.2s
+Now I understand the issue better. The htfTSpotHigh/htfTSpotLow are set for C2 signals in OnTick, but C3 signals need their own T-Spot zone logic based on C3 range.
+
+Let me look at the C3 promotion logic in OnTick and understand what needs to be fixed. The prompt says:
+1. C3 is failing because it bypasses Gate 4 POI mapping
+2. I need to update ExecutionEngine.mqh to scan for PD Array strictly within the HTF T-Spot zone (Equilibrium to Low/High)
+3. Set requestedEntryPrice to that POI and emit TSPOT_POI_MAPPED to unlock transition to STAGE_READY
+
+Looking at the code:
+- C3 detection paths set entry_price to midpoint (violates constitution)
+- My fix in ClosureEngine.mqh runs after Lock, which is too late
+- The C3 promotion logic in OmakFxYO.mq5 (lines 5764-5796 and 5798-5864) uses htfTSpotLow/htfTSpotHigh
+
+The fix should be:
+1. Add a dedicated C3 POI mapping function in ExecutionEngine.mqh that uses C3's T-Spot zone (C3_low to equilibrium for bullish, equilibrium to C3_high for bearish)
+2. Call this function in OnTick when a C3 signal is in STAGE_WAITING_FOR_POI
+3. Set requestedEntryPrice to the mapped POI when found
+4. This will allow the transition to STAGE_READY
+
+Let me check the current state of my changes and understand what the complete fix should be.
+Let me understand the full scope. I need to check if my current changes are correct and understand how C3 CISD detection works:
+→Read OmakFxYO/OmakFxYO.mq5 [limit=50, offset=5620]
+Thought: 42.0s
+Looking at the code flow now, I understand the architecture better:
+
+1. C3 signals go through Lock() with entry_price set to midpoint (violates Gate 4)
+2. After Lock, signals go to STAGE_AWAITING_C3_CLOSURE (for C3)
+3. In OnTick, C3 signals with CISD confirmed + price in T-Spot zone should transition to STAGE_READY
+4. But the T-Spot zone for C3 should be computed from C3 range (not HTF/D1)
+
+The prompt says to:
+- Update ExecutionEngine.mqh to scan for PD Array strictly within the HTF T-Spot zone
+- Set requestedEntryPrice to that POI and emit TSPOT_POI_MAPPED to unlock transition to STAGE_READY
+
+This means I need to add a function in ExecutionEngine.mqh that:
+1. Takes a C3 signal's c3_high/c3_low
+2. Computes the T-Spot zone (Equilibrium to High/Low based on direction)
+3. Scans for PD Array within that zone on the Entry TF (M5/M15)
+4. If found, sets requestedEntryPrice and returns POI_MAPPED
+5. If not found, returns POI_MISSING
+
+Let me also check that my current edit is properly placed and remove the incorrect midpoint logic. The key insight is that the current code has THREE places where C3 sets midpoint as entry_price:
+- Line 1942 (EvaluateC3Closure function)
+- Line 2482 (displacement path)
+- Line 2527 (classic fallback path)
+
+These need to either:
+1. Do Gate 4 POI mapping before returning true, OR
+2. Set entry_price = 0 to indicate POI is missing, then handle it in the Lock/OnTick flow
+
+Given the prompt says to update ExecutionEngine.mqh to set requestedEntryPrice, I think the approach should be:
+1. Remove the midpoint fallback from C3 detection functions
+2. The functions should set entry_price = 0 (or use a sentinel) to indicate POI mapping needed
+3. In OnTick, call a new function in ExecutionEngine.mqh to do POI mapping for C3 signals
+4. Set requestedEntryPrice and emit TSPOT_POI_MAPPED when successful
+
+Let me also check my current changes more carefully.
+Let me read the current state of my changes and verify the structure:
+→Read OmakFxYO/core/ClosureEngine.mqh [limit=80, offset=3010]
+Thought: 11.6s
+I see the issue. The Gate 4 POI mapping is happening AFTER Lock, but the Lock function requires entry_price > 0. This means:
+
+1. The signal is created with midpoint entry_price (constitutional violation)
+2. Lock validates entry_price > 0 (passes because midpoint is set)
+3. Lock sets stage to STAGE_AWAITING_C3_CLOSURE for C3
+4. After Lock, my Gate 4 code runs and updates entry_price
+
+But this is wrong because:
+1. Lock already happened with midpoint
+2. The signal is stored with midpoint entry_price
+3. The stage transition happens without proper POI
+
+Let me fix this properly by:
+1. Removing the midpoint fallbacks in the C3 detection functions
+2. Setting entry_price = 0 before Lock so Lock can fail gracefully
+3. Or better yet, doing Gate 4 POI mapping BEFORE Lock
+
+Actually, looking at the prompt again: "C3 is failing because it bypasses Gate 4 POI mapping. You must update core/ExecutionEngine.mqh to scan for a PD Array strictly within the HTF T-Spot zone (Equilibrium to Low/High). Set the requestedEntryPrice to that POI and emit TSPOT_POI_MAPPED to unlock the transition to STAGE_READY"
+
+So the prompt wants me to:
+1. Update ExecutionEngine.mqh (not ClosureEngine) 
+2. Set requestedEntryPrice to the POI (not entry_price)
+3. This unlocks transition to STAGE_READY (not Lock)
+
+This means the POI mapping should happen in OnTick when the signal is in STAGE_WAITING_FOR_POI, and set requestedEntryPrice. Let me look at how this should flow.
+Now I understand the issue better. The prompt says to update ExecutionEngine.mqh to set requestedEntryPrice to the POI for C3 signals, unlocking transition to STAGE_READY. Let me check if I should be adding this to OnTick instead:
+→Read OmakFxYO/core/ExecutionEngine.mqh [limit=200, offset=180]
+Thought: 6.1s
+Now I have a clearer picture. The current implementation has several issues:
+
+1. C3 signals set entry_price to midpoint before Lock (lines 1942, 2482, 2527) - violates constitution
+2. My Gate 4 fix runs after Lock but before Commit - this is still problematic because entry_price is set to 0 in EE_MapPOISimple when no POI found
+3. The Lock function validates entry_price > 0
+
+The correct approach per the prompt is:
+1. Remove midpoint fallback in C3 detection functions
+2. Let C3 signals be created with entry_price = 0 (or wait for POI mapping)
+3. Add a dedicated C3 POI mapping path in OnTick (in OmakFxYO.mq5) that sets requestedEntryPrice when POI is found
+
+But wait - Lock() requires entry_price > 0. Let me check if there's a way around this or if I need to modify the Lock validation.
+
+Actually, looking more carefully at the prompt:
+- "Set the requestedEntryPrice to that POI and emit TSPOT_POI_MAPPED to unlock the transition to STAGE_READY"
+
+This suggests the POI mapping should happen in OnTick for signals in STAGE_WAITING_FOR_POI, and set requestedEntryPrice which then allows promotion to STAGE_READY.
+
+Let me remove my current Gate 4 fix from ClosureEngine.mqh and instead add a proper C3 POI mapping function in OnTick that operates on signals in STAGE_WAITING_FOR_POI state.
+Let me now understand the correct approach. The prompt says to update ExecutionEngine.mqh to set requestedEntryPrice when POI is found. This should happen in OnTick for C3 signals in STAGE_WAITING_FOR_POI. Let me remove my incorrect fix and add the proper POI mapping in OnTick:
+→Read OmakFxYO/core/ClosureEngine.mqh [limit=60, offset=2978]
+Thought: 46.0s
+Looking at the prompt more carefully:
+
+"C3 is failing because it bypasses Gate 4 POI mapping. You must update core/ExecutionEngine.mqh to scan for a PD Array strictly within the HTF T-Spot zone (Equilibrium to Low/High). Set the requestedEntryPrice to that POI and emit TSPOT_POI_MAPPED to unlock the transition to STAGE_READY"
+
+This says:
+1. Update ExecutionEngine.mqh - I've already added it
+2. Scan for PD Array within T-Spot zone - I've implemented this
+3. Set requestedEntryPrice to that POI - This is the key! I'm setting entry_price instead of requestedEntryPrice
+4. Emit TSPOT_POI_MAPPED - I'm doing this
+5. Unlock transition to STAGE_READY - This happens in OnTick
+
+The problem is that the POI mapping should happen in OnTick when the signal is in STAGE_WAITING_FOR_POI, not at Lock time. The signal should be locked with a valid entry_price (midpoint is acceptable as initial candidate), then when a POI is found in the T-Spot zone, set requestedEntryPrice and transition to STAGE_READY.
+
+But wait - looking at the Lock function in CoreTypes.mqh line 457, it requires entry_price > 0 for Lock to succeed. And the midpoint is currently being set at line 1942, 2482, 2527 before Lock.
+
+Let me re-read the prompt more carefully. It says "Set the requestedEntryPrice to that POI and emit TSPOT_POI_MAPPED to unlock the transition to STAGE_READY". This means:
+1. The signal can be locked with midpoint as entry_price
+2. When a PD Array is found in the T-Spot zone (during OnTick processing), set requestedEntryPrice
+3. This unlocks the transition to STAGE_READY
+
+But there's a deeper issue: the prompt says "C3 is failing because it bypasses Gate 4 POI mapping". This means the POI mapping should be a gate that must pass before Lock. Let me look at the C3 detection paths more carefully.
+
+Actually, looking at the code flow:
+- Lines 1942, 2482, 2527 set midpoint entry_price
+- Lock is called at line 3008
+- Lock checks entry_price > 0 (line 457 in CoreTypes)
+- After Lock, my POI mapping runs (lines 3014-3049)
+
+The issue is that Lock already succeeded with midpoint, and the POI mapping should happen BEFORE Lock to be constitutional.
+
+Let me restructure the fix:
+1. Remove midpoint entry_price from C3 detection paths (lines 1942, 2482, 2527)
+2. Do POI mapping BEFORE Lock
+3. Only lock if POI is found (per Constitution §VII - no fake POI, signal must wait for POI)
+
+But there's also the htfTSpot* fields that need to be populated for the C3 CISD+TSpot promotion in OmakFxYO.mq5 to work.
+
+Let me fix the midpoint issue first by removing it and letting the POI mapping happen first.
+Let me fix the midpoint issue at line 1942 in EvaluateC3Closure:
+→Read OmakFxYO/core/ClosureEngine.mqh [limit=50, offset=1750]
+Thought: 11.3s
+I see that C2 also uses midpoint entry at line 1774-1776, which is also a constitutional violation. But let me focus on the C3 FIX first.
+
+Looking at the code more carefully:
+
+1. The prompt says to update ExecutionEngine.mqh to set requestedEntryPrice to the POI
+2. The C3 signal detection (in EvaluateC3Closure, etc.) sets midpoint entry_price
+3. Lock() validates entry_price > 0, then uses it
+4. My current fix runs Gate 4 POI mapping after Lock, but updates entry_price
+
+The correct approach should be:
+- Remove the midpoint fallback in C3 detection (lines 1942, 2482, 2527)
+- Do Gate 4 POI mapping BEFORE Lock
+- If POI found, set entry_price correctly; if not, we should NOT lock the signal
+
+But wait, looking at the prompt again: "You must update core/ExecutionEngine.mqh to scan for a PD Array strictly within the HTF T-Spot zone (Equilibrium to Low/High). Set the requestedEntryPrice to that POI and emit TSPOT_POI_MAPPED to unlock the transition to STAGE_READY"
+
+This suggests the POI mapping should happen in OnTick for signals in STAGE_WAITING_FOR_POI, and set requestedEntryPrice (not entry_price). Let me check where this POI mapping should be added in OnTick.
+Let me understand the correct architecture. The prompt says to update ExecutionEngine.mqh to set requestedEntryPrice. Let me add a dedicated C3 POI mapping function for OnTick:

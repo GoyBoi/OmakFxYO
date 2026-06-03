@@ -1,0 +1,88 @@
+{
+  "branch_a": {
+    "total_ea_lines": 1000005,
+    "rg_gate_pass": 1077,
+    "execution_gate_pass": 0,
+    "execution_gate_market_deferred": 0,
+    "stage_poi_wait": 128519,
+    "signal_wait": 276,
+    "closures": 15630,
+    "closure_pass": 15630,
+    "signal_expired": 121224,
+    "signal_unlocked": 124354,
+    "order_sent": 0,
+    "trade_exec_market_buy": 0,
+    "trade_exec_market_sell": 0,
+    "trade_exec_limit": 0,
+    "pipeline_entry": 2337,
+    "anticipation_gate_unlock": 56430,
+    "anticipation_gate_lock": 5976,
+    "confirmation_gate_unlock": 0,
+    "confirmation_gate_lock": 9656,
+    "name": "Branch A Combined"
+  },
+  "branch_b": {
+    "total_ea_lines": 688475,
+    "rg_gate_pass": 1023,
+    "execution_gate_pass": 0,
+    "execution_gate_market_deferred": 0,
+    "stage_poi_wait": 85843,
+    "signal_wait": 308,
+    "closures": 10058,
+    "closure_pass": 10058,
+    "signal_expired": 80510,
+    "signal_unlocked": 83319,
+    "order_sent": 0,
+    "trade_exec_market_buy": 0,
+    "trade_exec_market_sell": 0,
+    "trade_exec_limit": 0,
+    "pipeline_entry": 2248,
+    "anticipation_gate_unlock": 34298,
+    "anticipation_gate_lock": 3860,
+    "confirmation_gate_unlock": 0,
+    "confirmation_gate_lock": 6200,
+    "name": "Branch B Combined"
+  },
+  "branch_a_unique_ids": {
+    "poi_wait": [
+      100000
+    ],
+    "rg_pass": [
+      100000
+    ],
+    "exec_pass": [],
+    "expired": [
+      100000
+    ],
+    "unlocked": [
+      100000
+    ]
+  },
+  "branch_b_unique_ids": {
+    "poi_wait": [
+      200000
+    ],
+    "rg_pass": [
+      200000
+    ],
+    "exec_pass": [],
+    "expired": [
+      200000
+    ],
+    "unlocked": [
+      200000
+    ]
+  },
+  "branch_a_expired_markers": {
+    "100000": [
+      "STATE_ADVANCE -> POI Wait",
+      "CS\t0\t15:20:46.577\tOmakFxYO (GOLDmicro,M5)\t2025.12.09 09:55:00   [STATE_ADVANCE] ID:100000 | C2 Closed -> POI Wait"
+    ]
+  },
+  "branch_b_expired_markers": {
+    "200000": [
+      "STATE_ADVANCE -> POI Wait",
+      "CS\t0\t15:15:05.741\tOmakFxYO (GOLDmicro,M15)\t2026.02.19 23:30:20   [STATE_ADVANCE] ID:200000 | C3 Closed -> POI Wait"
+    ]
+  }
+}
