@@ -3,7 +3,7 @@
 //
 //  Strategy:  TTrades Fractal Model + Dow Theory
 //  Branch A (Intraday):  D1 → H1 → M5
-//  Branch B (Swing):     D1 → H4 → M15
+//  Branch B (Swing):     W1 → H4 → M15
 //  Modes:     Anticipation Mode | Confirmation Mode
 //
 //  Version:   1.0.0
@@ -16,7 +16,7 @@
 #property link        ""
 #property version     "1.00"
 #property description "Omak FxYO — TTrades Fractal Model + Dow Theory"
-#property description "Branch A: D1→H1→M5 | Branch B: D1→H4→M15"
+#property description "Branch A: D1→H1→M5 | Branch B: W1→H4→M15"
 #property description "Anticipation Mode | Confirmation Mode"
 #property strict
 
@@ -172,7 +172,7 @@ input int    InpSetupLifespanBars_Intraday = 24;   // 2 H1 candles on M5 (PROMPT
 input int    InpSetupLifespanBars_Swing = 32;     // 2 H4 candles on M15 (PROMPT_E3: was 16)
 input int    InpSetupGraceBars = 8;               // orange-state grace period (PROMPT_E3: was 4)
 
-//--- Ongoing Tradeability & TF-Aware Grace (PROMPT_E4: new)
+//--- Ongoing Tradeability & TF-Aware Grace 
 input int    InpTradeabilityRecheckBars = 5;    // Recheck tradeability every N bars on entry TF (PROMPT_E4)
 input int    InpGraceBarsAnticipation = 12;     // Grace bars for C2/Anticipation expiry (PROMPT_E4)
 input int    InpGraceBarsConfirmation = 20;     // Grace bars for C3/Confirmation expiry (PROMPT_E4)
@@ -214,7 +214,7 @@ double g_InpPyramidRiskFactor = InpPyramidRiskFactor;
    string g_permanentSkipSymbols[];         // PERMANENT_SKIP list per AGENTS.md §XII
    int    g_permanentSkipCount;
 
-   // --- P1 FIX: First-bar warmup guard ---
+   // First-bar warmup guard ---
  int g_warmupBarsCounted = 0;     // Runtime counter
 bool g_warmupComplete = false;   // Flag
 
@@ -288,6 +288,7 @@ PendingGUIDLink g_pendingLinks[];      // dynamic array
  #include <OmakFxYO/core/LogGovernor.mqh>   // LogPrint macro (must follow CoreTypes)
  #include <OmakFxYO/core/BranchRouter.mqh>
  #include <OmakFxYO/core/BranchEvaluator.mqh>
+ #include <OmakFxYO/core/ConfluenceEngine.mqh>
  #include <OmakFxYO/core/SpreadFilter.mqh>
  #include <OmakFxYO/core/StructuralStateEngine.mqh>
 #include <OmakFxYO/core/LiquidityTierEngine.mqh>
@@ -1223,13 +1224,32 @@ void ClearSignalByGUID(ENUM_EXECUTION_BRANCH branch, ulong guid, string reason)
 
          ENUM_CLOSURE_TYPE closureType = g_activeSignal[i].closureType;
 
-         // P2_FIX: PERMANENT_SKIP check BEFORE READY_PROTECTED guard to prevent spam loop
-         // PROMPT_E4: PERMANENT_SKIP for affordability failures per AGENTS.md §XII
+         // P2_FIX: PERMANENT_SKIP check BEFORE READY_PROTECTED guard to prevent spam loop.
+         // Force-clear signal + permanent skip for affordability failures per AGENTS.md §XII.
+         // Self-contained early return — bypasses READY_PROTECTED guard entirely.
          if(StringFind(reason, "AFFORDABILITY") >= 0 ||
             StringFind(reason, "LOT_NOT_TRADEABLE") >= 0 ||
             StringFind(reason, "MINLOT") >= 0)
          {
+            LogPrint("[PERMANENT_SKIP] GUID=" + IntegerToString(g_activeSignal[i].m_guid) +
+                     " | reason=" + reason +
+                     " | slot=" + IntegerToString(i), LOG_LEVEL_WARN);
+            if(g_activeSignal[i].handoverState != HANDOVER_NONE &&
+               g_activeSignal[i].handoverState != HANDOVER_RELEASED)
+            {
+               g_activeSignal[i].ForceReleaseHandover("PERMANENT_SKIP:" + reason);
+            }
+            g_hasActiveSignal[i] = false;
+            g_activeSignal[i].slotClearedFor = STAGE_NONE;
+            g_activeSignal[i].Reset();
+            g_poiCache[i].isValid = false;
+            ClearCachedModeForGUID(guid);
             AddPermanentSkip(_Symbol, reason + " | GUID=" + IntegerToString(guid));
+            if(closureType == CLOSURE_C2)
+               LogPrint(StringFormat("[C2_SIGNAL_CLEARED] GUID=%I64u | reason=%s_PERMANENT_SKIP | slot=%d", guid, reason, i), LOG_LEVEL_INFO);
+            else
+               LogPrint(StringFormat("[SIGNAL_CLEARED] GUID=%I64u | reason=%s_PERMANENT_SKIP | slot=%d", guid, reason, i), LOG_LEVEL_INFO);
+            return;
          }
 
          // ZOMBIE DETECTION: force-clear signals with excessive retries
@@ -5574,17 +5594,42 @@ ENUM_TIMEFRAMES handoverTF = (ctx.branch == BRANCH_INTRADAY) ? PERIOD_M5 : PERIO
                          signal.m_guid, EnumToString(signal.stage), EnumToString(signal.closureType),
                          signal.entry_price, EnumToString(signal.direction), signal.executionMode), LOG_LEVEL_DEBUG);
                       
-                // C2 POI Touch Detection
-                 if(signal.closureType == CLOSURE_C2)
-                     {
-                         // CISD CHECK — Primary release gate for C2 signals
-                         if(CheckC2CISD(signal))
-                         {
-                             if(g_activeSignal[idx].stage != STAGE_READY)
-                             {
-                                 g_activeSignal[idx].TransitionStage(STAGE_READY);
-                                 ctx.branchLockedSignal.TransitionStage(STAGE_READY);
-                                 g_totalSignalsReady++;
+                 // C2 POI Touch Detection
+                  if(signal.closureType == CLOSURE_C2)
+                      {
+                          // ── Gate 2b: SMT Divergence Check (C2 only, soft gate) ──
+                          string corrSym = GetCorrelatedSymbol(_Symbol);
+                          ENUM_TIMEFRAMES smtTF = (signal.branchId == BRANCH_SWING) ? PERIOD_H4 : PERIOD_H1;
+                          bool smtPass = true;
+                          if(corrSym != "")
+                          {
+                             smtPass = HasSMTDivergence(corrSym, smtTF, (signal.direction == DIRECTION_BUY));
+                          }
+
+                          if(!smtPass)
+                          {
+                             LogPrint("[SMT_DIVERGENCE_FAIL] C2 blocked at CISD release | GUID=" +
+                                      IntegerToString(signal.m_guid) + " | corrSym=" + corrSym, LOG_LEVEL_INFO);
+                             continue;
+                          }
+
+                          // ── Time Sensitivity Filter ──
+                          ENUM_TIMEFRAMES anchorTF = (signal.branchId == BRANCH_SWING) ? PERIOD_W1 : PERIOD_D1;
+                          if(!CheckHTFTimeSensitivity(anchorTF))
+                          {
+                             LogPrint("[TIME_FILTER_BLOCK] C2 blocked at CISD release | GUID=" +
+                                      IntegerToString(signal.m_guid) + " | anchor=" + EnumToString(anchorTF), LOG_LEVEL_INFO);
+                             continue;
+                          }
+
+                          // CISD CHECK — Primary release gate for C2 signals
+                          if(CheckC2CISD(signal))
+                          {
+                              if(g_activeSignal[idx].stage != STAGE_READY)
+                              {
+                                  g_activeSignal[idx].TransitionStage(STAGE_READY);
+                                  ctx.branchLockedSignal.TransitionStage(STAGE_READY);
+                                  g_totalSignalsReady++;
                                  LogPrint(StringFormat("[CISD_CONFIRMED] GUID=%I64u | C2 release via CISD | dir=%s | entryTF=%s | close=%.5f %s c2_extreme=%.5f",
                                      signal.m_guid,
                                      EnumToString(signal.direction),
@@ -5734,12 +5779,37 @@ else
                                  signal.m_guid, signalMidpoint, bufferLow, bufferHigh, ask, bid, 
                                  (inTSpotBuy ? "YES" : "NO"), (inTSpotSell ? "YES" : "NO"), (poiTouched ? "YES" : "NO")), LOG_LEVEL_DEBUG);
 
-                        if(poiTouched && g_activeSignal[idx].stage != STAGE_READY)
-                         {
-                             ENUM_SIGNAL_STAGE oldStage = g_activeSignal[idx].stage;
-                             g_activeSignal[idx].TransitionStage(STAGE_READY);
-                             ctx.branchLockedSignal.TransitionStage(STAGE_READY);  // CRITICAL FIX: Sync ctx
-                             g_totalSignalsReady++;
+                         if(poiTouched && g_activeSignal[idx].stage != STAGE_READY)
+                          {
+                              // ── Gate 2b: SMT Divergence Check (C2 only, soft gate) ──
+                              string corrSymPOI = GetCorrelatedSymbol(_Symbol);
+                              ENUM_TIMEFRAMES smtTFPOI = (signal.branchId == BRANCH_SWING) ? PERIOD_H4 : PERIOD_H1;
+                              bool smtPassPOI = true;
+                              if(corrSymPOI != "")
+                              {
+                                 smtPassPOI = HasSMTDivergence(corrSymPOI, smtTFPOI, (signal.direction == DIRECTION_BUY));
+                              }
+
+                              if(!smtPassPOI)
+                              {
+                                 LogPrint("[SMT_DIVERGENCE_FAIL] C2 blocked at POI touch | GUID=" +
+                                          IntegerToString(signal.m_guid) + " | corrSym=" + corrSymPOI, LOG_LEVEL_INFO);
+                                 continue;
+                              }
+
+                              // ── Time Sensitivity Filter ──
+                              ENUM_TIMEFRAMES anchorTFPOI = (signal.branchId == BRANCH_SWING) ? PERIOD_W1 : PERIOD_D1;
+                              if(!CheckHTFTimeSensitivity(anchorTFPOI))
+                              {
+                                 LogPrint("[TIME_FILTER_BLOCK] C2 blocked at POI touch | GUID=" +
+                                          IntegerToString(signal.m_guid) + " | anchor=" + EnumToString(anchorTFPOI), LOG_LEVEL_INFO);
+                                 continue;
+                              }
+
+                              ENUM_SIGNAL_STAGE oldStage = g_activeSignal[idx].stage;
+                              g_activeSignal[idx].TransitionStage(STAGE_READY);
+                              ctx.branchLockedSignal.TransitionStage(STAGE_READY);  // CRITICAL FIX: Sync ctx
+                              g_totalSignalsReady++;
                             LogPrint("[FSM] GUID=" + IntegerToString(signal.m_guid) +
                                     " | " + EnumToString(oldStage) + " → " + EnumToString(STAGE_READY) +
                                     " | readyCount=" + IntegerToString(g_totalSignalsReady), LOG_LEVEL_INFO);
@@ -5802,14 +5872,23 @@ else
                                       LogPrint("[FSM] GUID=" + IntegerToString(g_activeSignal[idx].m_guid) +
                                               " | C3 POI mapped at " + DoubleToString(g_activeSignal[idx].requestedEntryPrice, _Digits), LOG_LEVEL_INFO);
 
-                                      ENUM_SIGNAL_STAGE oldStage = g_activeSignal[idx].stage;
-                                      g_activeSignal[idx].TransitionStage(STAGE_READY);
-                                      ctx.branchLockedSignal.TransitionStage(STAGE_READY);
-                                      g_totalSignalsReady++;
-                                      LogPrint("[STAGE_READY] C3 Path Restored | GUID: " + IntegerToString(g_activeSignal[idx].m_guid) +
-                                               " | " + EnumToString(oldStage) + " → " + EnumToString(STAGE_READY), LOG_LEVEL_INFO);
+                                       // ── Time Sensitivity Filter (C3) ──
+                                       ENUM_TIMEFRAMES c3AnchorTF = (signal.branchId == BRANCH_SWING) ? PERIOD_W1 : PERIOD_D1;
+                                       if(!CheckHTFTimeSensitivity(c3AnchorTF))
+                                       {
+                                          LogPrint("[TIME_FILTER_BLOCK] C3 blocked at POI touch | GUID=" +
+                                                   IntegerToString(signal.m_guid) + " | anchor=" + EnumToString(c3AnchorTF), LOG_LEVEL_INFO);
+                                          continue;
+                                       }
 
-                                      if(RG_EvaluateAndGate(g_activeSignal[idx], ctx.branch))
+                                       ENUM_SIGNAL_STAGE oldStage = g_activeSignal[idx].stage;
+                                       g_activeSignal[idx].TransitionStage(STAGE_READY);
+                                       ctx.branchLockedSignal.TransitionStage(STAGE_READY);
+                                       g_totalSignalsReady++;
+                                       LogPrint("[STAGE_READY] C3 Path Restored | GUID: " + IntegerToString(g_activeSignal[idx].m_guid) +
+                                                " | " + EnumToString(oldStage) + " → " + EnumToString(STAGE_READY), LOG_LEVEL_INFO);
+
+                                       if(RG_EvaluateAndGate(g_activeSignal[idx], ctx.branch))
                                       {
                                           LogPrint("[RG_GATE_PASS] C3 POI touch | GUID=" + IntegerToString(g_activeSignal[idx].m_guid), LOG_LEVEL_INFO);
                                           ExecutionGatePass(g_activeSignal[idx], ctx.branch);

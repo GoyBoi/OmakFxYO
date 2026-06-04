@@ -500,43 +500,71 @@ ENUM_CLOSURE_TYPE ApplyWickFilter(
    ENUM_CLOSURE_TYPE current_type
 )
 {
-   // SIGNAL LIBERATION PATCH: Relaxed wick thresholds
-   // Allow signals with slightly larger wicks (tolerance band instead of hard rejection)
-   if(wick_ratio < 0.3)
+   // AGENTS.md §XVII Gate 2: 50% Mechanical Wick Threshold
+   // If wickRatio > 0.5: reversal signature — does NOT support expansion
+   // If wickRatio <= 0.5: supports expansion
+   if(wick_ratio > 0.5)
    {
-      // Clean candles — pure signal
-      if(InpEnableTrace) LogPrint("[WICK_RULE_PASS] ratio=" + DoubleToString(wick_ratio, 2) + " | clean candle, pure signal", LOG_LEVEL_DEBUG);
-      return current_type;
+      LogPrint("[WICK_RULE_BLOCK] ratio=" + DoubleToString(wick_ratio, 2) +
+               " | reversal signature, does not support expansion", LOG_LEVEL_INFO);
+      return CLOSURE_NONE;
    }
 
-   if(wick_ratio > 0.8)
-   {
-      // Extreme wick — C2 structure remains intact; keep as C2
-      LogPrint("[WICK_RULE_BLOCK] ratio=" + DoubleToString(wick_ratio, 2) + " | extreme wick, reversal signature", LOG_LEVEL_DEBUG);
-      if(current_type == CLOSURE_C2)
-      {
-         if(InpEnableTrace)
-            LGovPrint("[WF] Extreme wick on C2 (" + DoubleToString(wick_ratio, 2) + ") – keeping as C2", LOG_LEVEL_DEBUG, LOG_CHANNEL_SIGNAL);
-         return CLOSURE_C2;  // NOT demoted to C3
-      }
-      return current_type;
-   }
-
-   // Mid-range wicks (0.3-0.8) — fully valid
-   if(InpEnableTrace) LogPrint("[WICK_RULE_PASS] ratio=" + DoubleToString(wick_ratio, 2) + " | moderate wick, allowed with penalty", LOG_LEVEL_DEBUG);
-   if(current_type == CLOSURE_C2)
-   {
-      // Allow C2 with soft penalty encoded in confidence later
-      if(InpEnableTrace && wick_ratio > 0.6)
-         LGovPrint("[WF] Moderate wick (" + DoubleToString(wick_ratio, 2) + ") on C2 — allowed with penalty", LOG_LEVEL_DEBUG, LOG_CHANNEL_SIGNAL);
-      return current_type;
-   }
-
+   LogPrint("[WICK_RULE_PASS] ratio=" + DoubleToString(wick_ratio, 2) +
+            " | supports expansion", LOG_LEVEL_INFO);
    return current_type;
 }
 
 //+------------------------------------------------------------------+
-//| DOW THEORY: Fractal-Based Swing Detection                        |
+//| CheckHTFTimeSensitivity — AGENTS.md §XVII Time-Sensitivity Filter   |
+//+------------------------------------------------------------------+
+/**
+ * AGENTS.md §XVII: Before advancing to STAGE_READY, check HTF candle progress.
+ * If >80% of the HTF candle (D1 for Branch A, W1 for Branch B) has elapsed,
+ * the signal is invalidated — there must be "enough time to continue expansion."
+ *
+ * @param anchorTF Anchor timeframe (PERIOD_D1 for Branch A, PERIOD_W1 for Branch B)
+ * @return true if pass (<=80% elapsed), false if blocked (>80% elapsed)
+ */
+bool CheckHTFTimeSensitivity(ENUM_TIMEFRAMES anchorTF)
+{
+   datetime candleOpen = iTime(_Symbol, anchorTF, 0);
+   datetime nextCandleOpen = iTime(_Symbol, anchorTF, 1);
+
+   if(candleOpen <= 0 || nextCandleOpen <= 0)
+   {
+      LogPrint("[TIME_FILTER_BLOCK] unable to read candle times for TF=" +
+               EnumToString(anchorTF), LOG_LEVEL_WARN);
+      return false;
+   }
+
+   datetime now = TimeCurrent();
+   double elapsed = (double)(now - candleOpen);
+   double duration = (double)(nextCandleOpen - candleOpen);
+
+   if(duration <= 0.0)
+   {
+      LogPrint("[TIME_FILTER_BLOCK] invalid candle duration for TF=" +
+               EnumToString(anchorTF), LOG_LEVEL_WARN);
+      return false;
+   }
+
+   double progress = elapsed / duration;
+
+   if(progress > 0.80)
+   {
+      LogPrint("[TIME_FILTER_BLOCK] progress=" + DoubleToString(progress * 100, 1) +
+               "% | >80% of " + EnumToString(anchorTF) + " candle elapsed, signal invalidated",
+               LOG_LEVEL_INFO);
+      return false;
+   }
+
+   LogPrint("[TIME_FILTER_PASS] progress=" + DoubleToString(progress * 100, 1) +
+            "% | sufficient " + EnumToString(anchorTF) + " candle remaining",
+            LOG_LEVEL_INFO);
+   return true;
+}
+
 //+------------------------------------------------------------------+
 /**
  * DetectFractalSweep — Dow Theory compliant swing high/low detection

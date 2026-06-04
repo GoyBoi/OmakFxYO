@@ -79,4 +79,45 @@ bool HasSMTDivergence(string corrSym, ENUM_TIMEFRAMES tf, bool bullish)
    return false;
 }
 
+//+------------------------------------------------------------------+
+//| GetCorrelatedSymbol — SMT correlated asset lookup                |
+//+------------------------------------------------------------------+
+/**
+ * AGENTS.md §XVIII: Returns the SMT-correlated symbol for a given primary symbol.
+ * If the symbol has no defined correlated pair (e.g., Vix75), returns "".
+ * This allows SMT to act as a soft confluence check — symbols without
+ * correlations automatically pass the SMT gate.
+ *
+ * Correlated pairs:
+ *   EURUSD ↔ GBPUSD
+ *   USDJPY ↔ USDCHF
+ *   XAUUSD ↔ XAGUSD
+ *
+ * @param primarySymbol The symbol to find a correlate for
+ * @return Correlated symbol, or "" if none exists
+ */
+string GetCorrelatedSymbol(string primarySymbol)
+{
+   if(primarySymbol == "EURUSD") return "GBPUSD";
+   if(primarySymbol == "GBPUSD") return "EURUSD";
+   if(primarySymbol == "USDJPY") return "USDCHF";
+   if(primarySymbol == "USDCHF") return "USDJPY";
+   if(primarySymbol == "XAUUSD") return "XAGUSD";
+   if(primarySymbol == "XAGUSD") return "XAUUSD";
+
+   return "";
+}
+
+//+------------------------------------------------------------------+
+//| IsSMTApplicable — Checks if symbol has a valid SMT correlated pair |
+//+------------------------------------------------------------------+
+/**
+ * Returns true if the symbol has a defined correlated pair, false otherwise.
+ * When false, SMT divergence should be treated as neutral/not required.
+ */
+bool IsSMTApplicable(string symbol)
+{
+   return (GetCorrelatedSymbol(symbol) != "");
+}
+
 #endif // OMAK_CONFLUENCEENGINE_MQH

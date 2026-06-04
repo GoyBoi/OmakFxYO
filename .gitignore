@@ -24,3 +24,15 @@ logs/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Documentation, reports, scripts — only .mqh and .mq5 should be tracked
+*.md
+*.txt
+*.pdf
+scripts/
+Quant_Backtest_Reports/
+Documentation/
+Additional_Context.md
+Prompt_P6_Report.md
+We_Need_to_Remove.md
+Raw_log_sample.md

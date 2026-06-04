@@ -733,7 +733,7 @@ g_sseContext.displacementWarmedUp = true;
 //+------------------------------------------------------------------+
 //| SSE_DetectCISD — Mechanical CISD (Change In State of Delivery)   |
 //|                                                                  |
-//| Mechanical CISD per AGENTS.md §XVI Gate 3:                       |
+//| Mechanical CISD per AGENTS.md §XVII Gate 3:                      |
 //| Price must close ABOVE the opening price of the initiating       |
 //| candle of the consecutive down-close series that formed the      |
 //| swing low (bullish), or BELOW the opening price of the           |
@@ -741,8 +741,18 @@ g_sseContext.displacementWarmedUp = true;
 //| formed the swing high (bearish).                                 |
 //|                                                                  |
 //| The initiating candle is the FIRST candle (oldest) in the        |
-//| consecutive same-direction close series ending at the swing      |
-//| extreme. A single close beyond this level constitutes CISD.      |
+//| consecutive same-direction close series that LED TO the swing    |
+//| point. A single close on a completed bar beyond this level       |
+//| constitutes mechanical CISD.                                     |
+//|                                                                  |
+//| Fix P5:                                                          |
+//|   - Swing detected via fractal (local min/max), NOT absolute     |
+//|     extreme (eliminates pattern-trading swing approach)          |
+//|   - Series identified from the candle immediately older than     |
+//|     the swing point, walking backward through consecutive        |
+//|     same-direction closes                                        |
+//|   - Confirmation uses rates[1].close (last COMPLETED bar),       |
+//|     NOT rates[0].close (current forming bar)                     |
 //|                                                                  |
 //| Direction: DIRECTION_BUY  → swing low → close > seriesOpen      |
 //|            DIRECTION_SELL → swing high → close < seriesOpen     |
@@ -756,17 +766,17 @@ bool SSE_DetectCISD(
     int lookbackBars = 20
 )
 {
-    if(lookbackBars < 5)
-       lookbackBars = 5;
+    if(lookbackBars < 8)
+       lookbackBars = 8;
 
     MqlRates rates[];
     ArraySetAsSeries(rates, true);
     ZeroMemory(rates);
 
     int copied = CopyRates(symbol, tf, 0, lookbackBars, rates);
-    if(copied < 5)
+    if(copied < 8)
     {
-        LogPrint("[CISD_DETECT] Insufficient bars | tf=" + EnumToString(tf) +
+        LogPrint("[CISD_DETECT] Insufficient bars for swing detection | tf=" + EnumToString(tf) +
                  " | copied=" + IntegerToString(copied), LOG_LEVEL_DEBUG);
         return false;
     }
@@ -775,42 +785,52 @@ bool SSE_DetectCISD(
 
     if(direction == DIRECTION_BUY)
     {
-        // Step 1: Find swing low (lowest low) in bars [1 .. maxBars-1]
+        // Step 1: Find the swing low (fractal low) in bars [2 .. maxBars-2]
+        // A swing low is a candle whose low is lower than both adjacent candles
         int swingIdx = -1;
-        double swingLow = DBL_MAX;
-        for(int i = 1; i < maxBars; i++)
+        for(int i = 2; i < maxBars - 1; i++)
         {
-            if(rates[i].low < swingLow)
+            if(rates[i].low < rates[i-1].low && rates[i].low < rates[i+1].low)
             {
-                swingLow = rates[i].low;
                 swingIdx = i;
+                break;
             }
         }
 
-        if(swingIdx < 0 || swingLow >= DBL_MAX)
+        if(swingIdx < 0)
         {
             LogPrint("[CISD_FAILED] No swing low found on " + EnumToString(tf), LOG_LEVEL_INFO);
             return false;
         }
 
-        // Step 2: Walk backward from swingIdx to find the oldest consecutive down-close candle
-        int firstDownIdx = swingIdx;
+        // Step 2: From the swing low candle, walk backward (older)
+        // to find consecutive down-close candles that LED TO this low.
+        // Include the swing candle if it is a down-close; otherwise
+        // skip it and begin from the next older bar.
+        int firstDownIdx = -1;
         for(int i = swingIdx; i < maxBars; i++)
         {
             if(rates[i].close < rates[i].open)
                 firstDownIdx = i;
-            else
+            else if(i > swingIdx)
                 break;
         }
 
-        double seriesOpen = rates[firstDownIdx].open;
+        if(firstDownIdx < 0)
+        {
+            LogPrint("[CISD_FAILED] No down-close series before swing low on " + EnumToString(tf), LOG_LEVEL_INFO);
+            return false;
+        }
 
-        // Step 3: CISD confirmed if current close is above the initiating candle's open
-        if(rates[0].close > seriesOpen)
+        double seriesOpen = rates[firstDownIdx].open;
+        double confirmClose = rates[1].close;
+
+        // Step 3: CISD confirmed ONLY on a completed candle CLOSE above trigger
+        if(confirmClose > seriesOpen)
         {
             LogPrint("[CISD_CONFIRMED] BULLISH on " + EnumToString(tf) +
                      " | seriesOpen=" + DoubleToString(seriesOpen, _Digits) +
-                     " | close=" + DoubleToString(rates[0].close, _Digits) +
+                     " | confirmClose=" + DoubleToString(confirmClose, _Digits) +
                      " | swingIdx=" + IntegerToString(swingIdx) +
                      " | firstDownIdx=" + IntegerToString(firstDownIdx), LOG_LEVEL_INFO);
             return true;
@@ -818,47 +838,53 @@ bool SSE_DetectCISD(
 
         LogPrint("[CISD_FAILED] BULLISH on " + EnumToString(tf) +
                  " | seriesOpen=" + DoubleToString(seriesOpen, _Digits) +
-                 " | close=" + DoubleToString(rates[0].close, _Digits), LOG_LEVEL_INFO);
+                 " | confirmClose=" + DoubleToString(confirmClose, _Digits), LOG_LEVEL_INFO);
         return false;
     }
     else if(direction == DIRECTION_SELL)
     {
-        // Step 1: Find swing high (highest high) in bars [1 .. maxBars-1]
+        // Step 1: Find the swing high (fractal high) in bars [2 .. maxBars-2]
         int swingIdx = -1;
-        double swingHigh = -DBL_MAX;
-        for(int i = 1; i < maxBars; i++)
+        for(int i = 2; i < maxBars - 1; i++)
         {
-            if(rates[i].high > swingHigh)
+            if(rates[i].high > rates[i-1].high && rates[i].high > rates[i+1].high)
             {
-                swingHigh = rates[i].high;
                 swingIdx = i;
+                break;
             }
         }
 
-        if(swingIdx < 0 || swingHigh <= -DBL_MAX)
+        if(swingIdx < 0)
         {
             LogPrint("[CISD_FAILED] No swing high found on " + EnumToString(tf), LOG_LEVEL_INFO);
             return false;
         }
 
-        // Step 2: Walk backward from swingIdx to find the oldest consecutive up-close candle
-        int firstUpIdx = swingIdx;
+        // Step 2: Walk backward from swing high to find consecutive up-close candles
+        int firstUpIdx = -1;
         for(int i = swingIdx; i < maxBars; i++)
         {
             if(rates[i].close > rates[i].open)
                 firstUpIdx = i;
-            else
+            else if(i > swingIdx)
                 break;
         }
 
-        double seriesOpen = rates[firstUpIdx].open;
+        if(firstUpIdx < 0)
+        {
+            LogPrint("[CISD_FAILED] No up-close series before swing high on " + EnumToString(tf), LOG_LEVEL_INFO);
+            return false;
+        }
 
-        // Step 3: CISD confirmed if current close is below the initiating candle's open
-        if(rates[0].close < seriesOpen)
+        double seriesOpen = rates[firstUpIdx].open;
+        double confirmClose = rates[1].close;
+
+        // Step 3: CISD confirmed ONLY on a completed candle CLOSE below trigger
+        if(confirmClose < seriesOpen)
         {
             LogPrint("[CISD_CONFIRMED] BEARISH on " + EnumToString(tf) +
                      " | seriesOpen=" + DoubleToString(seriesOpen, _Digits) +
-                     " | close=" + DoubleToString(rates[0].close, _Digits) +
+                     " | confirmClose=" + DoubleToString(confirmClose, _Digits) +
                      " | swingIdx=" + IntegerToString(swingIdx) +
                      " | firstUpIdx=" + IntegerToString(firstUpIdx), LOG_LEVEL_INFO);
             return true;
@@ -866,7 +892,7 @@ bool SSE_DetectCISD(
 
         LogPrint("[CISD_FAILED] BEARISH on " + EnumToString(tf) +
                  " | seriesOpen=" + DoubleToString(seriesOpen, _Digits) +
-                 " | close=" + DoubleToString(rates[0].close, _Digits), LOG_LEVEL_INFO);
+                 " | confirmClose=" + DoubleToString(confirmClose, _Digits), LOG_LEVEL_INFO);
         return false;
     }
 
