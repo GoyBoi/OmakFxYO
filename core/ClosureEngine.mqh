@@ -16,6 +16,7 @@
 //+------------------------------------------------------------------+
 #include <OmakFxYO/core/CoreTypes.mqh>     // ENUM_DIRECTION, DIRECTION_NONE, LiquidityTier, SClosureSignal, etc.
 #include <OmakFxYO/core/LogGovernor.mqh>    // Log governance (NEW)
+#include <OmakFxYO/core/RiskManager.mqh>    // RM_ComputeEntryTFSL — Manipulation Leg SL (§V)
 
 //+------------------------------------------------------------------+
 //| Forward Declarations                                             |
@@ -1333,21 +1334,23 @@ bool ValidateDisplacement(const string mode, double sweepDist, double c1Range, d
 }
 
 //+------------------------------------------------------------------+
-//| ConfirmCISD — Per TTrades: "When I get a candle 2 or candle 3  |
-//| closure on the higher time frame I drop down to the lower time   |
-//| frame I must see a change in the state of delivery inside that   |
-//| higher time frame candle. If CISD is missing, I ignore the setup |
-//| completely."                                                     |
+//| ConfirmCISD — DEPRECATED: Use SSE_DetectCISD in                  |
+//| StructuralStateEngine.mqh instead. This function uses a          |
+//| close-vs-high/low comparison that violates the constitution.     |
+//| Per TTrades: "When I get a candle 2 or candle 3 closure on the  |
+//| higher time frame I drop down to the lower time frame I must see |
+//| a change in the state of delivery inside that higher time frame  |
+//| candle. If CISD is missing, I ignore the setup completely."      |
 //+------------------------------------------------------------------+
 bool ConfirmCISD(SLockedSignal &signal)
 {
    BranchContext ctx = g_branchAContext;
    if(g_activeBranch == BRANCH_SWING) ctx = g_branchBContext;
 
-   // Per TTrades: Drop to LTF, find the swing high/low formed within the HTF
-   // closure candle, check if price closed through the candles that created it.
-   
-ENUM_TIMEFRAMES ltf = (ctx.branch == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
+ // VERBATIM REPAIR: 3-Tier TF Mapping (§XVII)
+    // CISD must be confirmed on Structure TF (H1/H4), NOT Entry TF (M5/M15).
+    
+ ENUM_TIMEFRAMES ltf = (ctx.branch == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4;
     ENUM_TIMEFRAMES htf = (ctx.branch == BRANCH_SWING) ? PERIOD_H4 : PERIOD_H1;
     
     // Get the time range of the closure candle (C2 or C3)
@@ -1510,6 +1513,43 @@ int closeAboveCount = 0;
 }
 
 //+------------------------------------------------------------------+
+//| ConfirmBranchCISD — 3-Tier Structural Highway Gate 3             |
+//| Confirms CISD on the Structure TF (H1 for Branch A, H4 for       |
+//| Branch B). Only after Tier 2 (Structure/CISD) is confirmed may    |
+//| the signal drop to Tier 3 (Entry TF) for POI mapping.             |
+//+------------------------------------------------------------------+
+bool ConfirmBranchCISD(const string symbol, ENUM_TIMEFRAMES structTF, ENUM_EXECUTION_BRANCH branch)
+{
+    BranchContext ctx = (branch == BRANCH_INTRADAY) ? g_branchAContext : g_branchBContext;
+    ENUM_DIRECTION dir = (ctx.bias.bias == BIAS_BULLISH) ? DIRECTION_BUY :
+                          (ctx.bias.bias == BIAS_BEARISH) ? DIRECTION_SELL : DIRECTION_NONE;
+    if (dir == DIRECTION_NONE)
+    {
+        LogPrint("[CISD_FAILED] ConfirmBranchCISD: no bias direction for branch=" +
+                 IntegerToString(branch), LOG_LEVEL_DEBUG);
+        return false;
+    }
+    SSE_CISDResult result = SSE_DetectCISD(symbol, structTF, dir, 20);
+    if (result.confirmed)
+    {
+        static datetime s_lastCisdLogBar[2] = {0, 0};
+        datetime barTime = iTime(symbol, structTF, 0);
+        if(barTime > 0 && barTime != s_lastCisdLogBar[branch])
+        {
+            s_lastCisdLogBar[branch] = barTime;
+            LogPrint(StringFormat("[CISD_CONFIRMED] Branch %d | structTF=%s | dir=%s | swingPrice=%.5f | seriesOpen=%.5f",
+                     branch, EnumToString(structTF), EnumToString(dir), result.swingPrice, result.seriesOpen), LOG_LEVEL_INFO);
+        }
+    }
+    else
+    {
+        LogPrint(StringFormat("[CISD_FAILED] Branch %d | structTF=%s | dir=%s | No mechanical CISD on Structure TF",
+                 branch, EnumToString(structTF), EnumToString(dir)), LOG_LEVEL_DEBUG);
+    }
+    return result.confirmed;
+}
+
+//+------------------------------------------------------------------+
 //| IsSetupStructurallyInvalid — Per Pro+: "If the setup fails—    |
 //| defined by price returning to the initial high or low without   |
 //| forming a higher Timeframes swing point"                        |
@@ -1550,7 +1590,19 @@ bool IsSetupStructurallyInvalid(
          return true;
       }
    }
-   return false;
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| GetAnchorContext — Returns Anchor TF High/Low/Equilibrium         |
+//| BRANCH A (Intraday): D1 High/Low | BRANCH B (Swing): W1 High/Low |
+//+------------------------------------------------------------------+
+void GetAnchorContext(ENUM_EXECUTION_BRANCH branchId, double &anchorHigh, double &anchorLow, double &anchorEq)
+{
+   ENUM_TIMEFRAMES anchorTF = (branchId == BRANCH_INTRADAY) ? PERIOD_D1 : PERIOD_W1;
+   anchorHigh = iHigh(_Symbol, anchorTF, 1);
+   anchorLow  = iLow(_Symbol, anchorTF, 1);
+   anchorEq   = (anchorHigh + anchorLow) / 2.0;
 }
 
 bool EvaluateC2Closure(
@@ -1779,33 +1831,30 @@ LogPrint("[C2_REJECT] NO_REVERSAL_CLOSURE | C2 did NOT produce reversal closure"
 // entry_price is set by caller (DetectClosureSignal) after EvaluateC2Closure returns true.
    // See ENTRY_PRICE_OWNERSHIP_REPORT.md for ownership documentation.
 
-// REGRESSION_GUARD_SL_DIRECTION: Protected swing per TTFM C2 — symbol agnostic
-   if(signal.is_bullish)
-   {
-      signal.stop_loss = c2_low;   // protected low for buy
-   }
-   else
-   {
-      signal.stop_loss = c2_high;  // protected high for sell
-   }
-   LogPrint("[SL_CALC] EvaluateC2Closure | direction=" + (signal.is_bullish?"BUY":"SELL") +
-            " c2_low=" + DoubleToString(c2_low, _Digits) +
-            " c2_high=" + DoubleToString(c2_high, _Digits) +
-            " sl=" + DoubleToString(signal.stop_loss, _Digits) +
-            " source=protected_swing c1_high=" + DoubleToString(c1_high, _Digits) +
-            " c1_low=" + DoubleToString(c1_low, _Digits), LOG_LEVEL_INFO);
+// VERBATIM REPAIR: Manipulation Leg SL (§V) — Entry TF extreme
+   signal.stop_loss = RM_ComputeEntryTFSL(_Symbol, g_activeBranch, signal.is_bullish, signal.entry_price);
 
     signal.equilibrium = (c1_high + c1_low) / 2.0;
    signal.c2_wick_ratio = wick_ratio;
 
-   // TTrades T-Spot Entry for Anticipation Mode
-   double tSpotC2 = (c2_high + c2_low) / 2.0;
-   double currentPriceC2 = (signal.is_bullish) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   signal.entry_price = (tSpotC2 > 0.0) ? tSpotC2 : currentPriceC2;
+      // VERBATIM REPAIR: Synchronous Mapping (§II) — POI before Lock, propagate result
+      SLockedSignal poiSignal;
+      poiSignal.Reset();
+      poiSignal.branch = g_activeBranch; 
+      poiSignal.branchId = g_activeBranch; // CRITICAL: Fix uninitialized -1 sentinel
+      poiSignal.direction = signal.is_bullish ? DIRECTION_BUY : DIRECTION_SELL;
+      poiSignal.symbol = _Symbol;
 
-   LogPrint("[ENTRY_CANDIDATE_SET] C2 T-Spot | GUID_pre=" + IntegerToString(signal.m_guid) +
+      // Law: POI mapper MUST receive synchronized identity to select M5 vs M15 chart.
+      if (EE_MapTSpotPOI(poiSignal)) {
+          if (poiSignal.entry_price > 0) {
+              signal.entry_price = poiSignal.entry_price;
+          }
+      }
+
+    LogPrint("[ENTRY_CANDIDATE_SET] C2 POI mapped | GUID_pre=" + IntegerToString(signal.m_guid) +
             " entry=" + DoubleToString(signal.entry_price, _Digits) +
-            " tspot=" + DoubleToString(tSpotC2, _Digits), LOG_LEVEL_INFO);
+            " source=EE_MapTSpotPOI", LOG_LEVEL_INFO);
 
    // Log C2 signal with distinct marker
    if(InpEnableTrace)
@@ -1832,6 +1881,14 @@ if(closureSig != g_lastC2ClosureSignature || TimeCurrent() - g_lastClosureLogTim
              " sweep=" + EnumToString(sweep), LOG_LEVEL_INFO);
 
     signal.m_detectionTime = TimeCurrent();
+
+    // VERBATIM REPAIR: Inv XII N4 Bias Gate
+    // Enforce Law of Gate Sequence (§XVII): Gate 1 must pass before C2 acceptance
+    if(!IsBiasAligned(signal.is_bullish, ctx.bias))
+    {
+       LogPrint("[COMMIT_BIAS_REJECT_C2] GUID:" + IntegerToString(signal.m_guid), LOG_LEVEL_WARN);
+       return false;
+    }
    return true;
 }
 
@@ -1966,47 +2023,46 @@ signal.c3_high = c3_high;
      signal.c3_open = c3_open;
      signal.c3_close = c3_close;
 
-     // TTrades T-Spot Zone for C3 (Gate 4) - Per AGENTS.md §XVI: Zone-based, not midpoint
-     double htfEquilibrium = (c1_high + c1_low) / 2.0;
-     if(bullish)
-     {
-        signal.tSpotMin = c1_low;
-        signal.tSpotMax = htfEquilibrium;
-     }
-     else
-     {
-        signal.tSpotMin = htfEquilibrium;
-        signal.tSpotMax = c1_high;
-     }
+      // Generate provisional GUID for traceable acceptance
+      signal.m_guid = (ulong)TimeCurrent() ^ (ulong)GetTickCount64();
 
-     // Entry price set to 0 - will be mapped via EE_MapC3POI in OnTick pipeline
-     signal.entry_price = 0.0;
+      // VERBATIM REPAIR: Synchronous Mapping & IFVG Expansion (Law of Gate 4 / §II)
+      // POI mapping MUST occur before Lock(). T-Spot zone MUST be set on the
+      // poiSignal so EE_MapTSpotPOI can scan for OB/FVG/IFVG within the zone.
+      SLockedSignal poiSignal;
+      poiSignal.Reset();
+      poiSignal.branch = g_activeBranch;
+      poiSignal.branchId = g_activeBranch;
+      poiSignal.direction = bullish ? DIRECTION_BUY : DIRECTION_SELL;
+      poiSignal.symbol = _Symbol;
 
-LogPrint("[C3_TSPOT_ZONE_SET] GUID_pre=" + IntegerToString(signal.m_guid) +
-               " | tSpotMin=" + DoubleToString(signal.tSpotMin, _Digits) +
-               " | tSpotMax=" + DoubleToString(signal.tSpotMax, _Digits) +
-               " | htfEq=" + DoubleToString(htfEquilibrium, _Digits), LOG_LEVEL_INFO);
+      double anchorHigh, anchorLow, anchorEq;
+      GetAnchorContext(poiSignal.branchId, anchorHigh, anchorLow, anchorEq);
+      poiSignal.tSpotMin = bullish ? anchorLow : anchorEq;
+      poiSignal.tSpotMax = bullish ? anchorEq : anchorHigh;
 
-     // C3 entry_price is 0 - will be mapped via EE_MapC3POI when price enters T-Spot zone
-     // No guard needed here - zone validity checked in IsValidC3Setup
+      if (EE_MapTSpotPOI(poiSignal)) {
+          if (poiSignal.entry_price > 0) {
+              signal.entry_price = poiSignal.entry_price;
+              LogPrint("[C3_SYNC_LOCK] GUID:" + IntegerToString(signal.m_guid) + " | Price:" + DoubleToString(poiSignal.entry_price, _Digits), LOG_LEVEL_INFO);
+          }
+      } else {
+          LogPrint("[GATE_4_FAIL] No OB/FVG/IFVG found in T-Spot zone. Signal rejected.", LOG_LEVEL_WARN);
+          return false;
+      }
 
-     if(signal.is_bullish)
-       signal.stop_loss = c2_low;
-    else
-       signal.stop_loss = c2_high;
+     // VERBATIM REPAIR: Manipulation Leg SL (§V) — Entry TF extreme
+     signal.stop_loss = RM_ComputeEntryTFSL(_Symbol, g_activeBranch, signal.is_bullish, signal.entry_price);
 
-    signal.equilibrium = (c1_high + c1_low) / 2.0;
-    signal.c2_wick_ratio = ComputeWickRatio(c2_open, c2_close, c2_high, c2_low);
-    signal.c3_wick_ratio = ComputeWickRatio(c3_open, c3_close, c3_high, c3_low);
-    signal.c3EngulfingC2 = false;
-    signal.c3CisdRequired = true;
-    signal.m_detectionTime = TimeCurrent();
-    signal.m_upgradedFromC2 = false;
+     signal.equilibrium = (c1_high + c1_low) / 2.0;
+     signal.c2_wick_ratio = ComputeWickRatio(c2_open, c2_close, c2_high, c2_low);
+     signal.c3_wick_ratio = ComputeWickRatio(c3_open, c3_close, c3_high, c3_low);
+     signal.c3EngulfingC2 = false;
+     signal.c3CisdRequired = true;
+     signal.m_detectionTime = TimeCurrent();
+     signal.m_upgradedFromC2 = false;
 
-    // Generate provisional GUID for traceable acceptance
-    signal.m_guid = (ulong)TimeCurrent() ^ (ulong)GetTickCount64();
-
-    LogPrint("[C3_ACCEPTED] GUID=" + IntegerToString(signal.m_guid) +
+     LogPrint("[C3_ACCEPTED] GUID=" + IntegerToString(signal.m_guid) +
              " direction=" + (bullish ? "BUY" : "SELL") +
              " | entry=" + DoubleToString(signal.entry_price, _Digits) +
              " | c3_close=" + DoubleToString(c3_close, _Digits) +
@@ -2015,9 +2071,10 @@ LogPrint("[C3_TSPOT_ZONE_SET] GUID_pre=" + IntegerToString(signal.m_guid) +
              " | c2_low=" + DoubleToString(c2_low, _Digits) +
              " | c2_high=" + DoubleToString(c2_high, _Digits) +
              " | c1_high=" + DoubleToString(c1_high, _Digits) +
-             " | c1_low=" + DoubleToString(c1_low, _Digits), LOG_LEVEL_INFO);
+             " | c1_low=" + DoubleToString(c1_low, _Digits) +
+             " | sl_source=entry_tf_manip_leg", LOG_LEVEL_INFO);
 
-    return true;
+     return true;
 }
 
 //+------------------------------------------------------------------+
@@ -2087,9 +2144,9 @@ bool EvaluateC4Closure(
    if(g_activeBranch == BRANCH_SWING) ctx = g_branchBContext;
    ENUM_TIMEFRAMES ltf = (ctx.branch == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
 
-   bool cisdOk = SSE_DetectCISD(_Symbol, ltf, direction, 15);
+   SSE_CISDResult c4CisdResult = SSE_DetectCISD(_Symbol, ltf, direction, 15);
 
-   if(!cisdOk)
+   if(!c4CisdResult.confirmed)
       return false;
 
    // Signal accepted — C4 is valid
@@ -2114,10 +2171,8 @@ bool EvaluateC4Closure(
 
    signal.entry_price = c4_open;
 
-   if(signal.is_bullish)
-      signal.stop_loss = c2_low;
-   else
-      signal.stop_loss = c2_high;
+    // VERBATIM REPAIR: Manipulation Leg SL (§V) — Entry TF extreme
+   signal.stop_loss = RM_ComputeEntryTFSL(_Symbol, g_activeBranch, signal.is_bullish, signal.entry_price);
 
 signal.equilibrium = (c4_high + c4_low) / 2.0;
     signal.c2_wick_ratio = ComputeWickRatio(c2_open, c2_close, c2_high, c2_low);
@@ -2136,9 +2191,41 @@ signal.equilibrium = (c4_high + c4_low) / 2.0;
              " | c2_low=" + DoubleToString(c2_low, _Digits) +
              " | expansion_high=" + DoubleToString(c4_high, _Digits) +
              " | expansion_low=" + DoubleToString(c4_low, _Digits) +
-             " | cisd=" + (cisdOk ? "OK" : "FAIL"), LOG_LEVEL_INFO);
+             " | cisd=" + (c4CisdResult.confirmed ? "OK" : "FAIL") +
+             " | cisd_swing=" + DoubleToString(c4CisdResult.swingPrice, _Digits), LOG_LEVEL_INFO);
 
    return true;
+}
+
+// VERBATIM REPAIR: Synchronous Lock Wrapper (§IV)
+bool PrepareAndLockSignal(SLockedSignal &sig) {
+    if (EE_MapTSpotPOI(sig)) { 
+        if (sig.entry_price > 0) {
+            SClosureSignal tmp;
+            tmp.valid = true;
+            tmp.type = sig.closureType;
+            tmp.is_bullish = (sig.direction == DIRECTION_BUY);
+            tmp.entry_price = sig.entry_price;
+            tmp.stop_loss = sig.stop_loss;
+            tmp.c2_high = sig.c2_high;
+            tmp.c2_low = sig.c2_low;
+            tmp.c2_open = sig.c2_open;
+            tmp.c2_close = sig.c2_close;
+            tmp.c2_barIndex = sig.c2_barIndex;
+            tmp.c3_high = sig.c3_high;
+            tmp.c3_low = sig.c3_low;
+            tmp.c3_open = sig.c3_open;
+            tmp.c3_close = sig.c3_close;
+            tmp.equilibrium = sig.equilibrium;
+            tmp.m_detectionTime = sig.m_detectionTime;
+            tmp.tSpotMin = sig.tSpotMin;
+            tmp.tSpotMax = sig.tSpotMax;
+            sig.Lock(tmp, 0, sig.branch, sig.entryTF);
+            return true;
+        }
+    }
+    LogPrint("[SYNC_LOCK_FAIL] No POI found. Signal discarded.", LOG_LEVEL_INFO);
+    return false;
 }
 
 bool RecalculateSignalForC3(SLockedSignal &signal, string symbol)
@@ -2198,7 +2285,7 @@ void DetectClosureSignal(
       }
 
       out_signal.Reset();
-      
+
       // Guard: Skip detection if fewer than 5 bars exist on target TF
       // This prevents Copy* calls from firing when tester has not built history
       string sym = (symbol == "" || symbol == NULL) ? _Symbol : symbol;
@@ -2212,8 +2299,8 @@ void DetectClosureSignal(
          LGovPrint("[CE] Insufficient structure bars=" +
                    IntegerToString(Bars(sym, checkTF)) +
                    " on TF=" + EnumToString(checkTF) +
-                   " | skipping closure detection", LOG_LEVEL_DEBUG, LOG_CHANNEL_SYSTEM);
-         return;
+                    " | skipping closure detection", LOG_LEVEL_DEBUG, LOG_CHANNEL_SYSTEM);
+          return;
       }
 
       // Use file-scope static variables for deduplication
@@ -2246,7 +2333,7 @@ ArraySetAsSeries(closes, true);
          copied = CopyHigh(sym, timeframe, 0, 4, highs);
          if(copied < 4)
          {
-            LGovPrint("[CLOSURE] DetectClosureSignal ERROR: CopyHigh failed | copied=" + IntegerToString(copied) + " | required=4", LOG_LEVEL_ERROR, LOG_CHANNEL_SYSTEM);
+             LGovPrint("[CLOSURE] DetectClosureSignal ERROR: CopyHigh failed | copied=" + IntegerToString(copied) + " | required=4", LOG_LEVEL_ERROR, LOG_CHANNEL_SYSTEM);
             return;
          }
       }
@@ -2258,7 +2345,7 @@ ArraySetAsSeries(closes, true);
          copied = CopyLow(sym, fallbackTF, 0, 4, lows);
          if(copied < 4)
          {
-            LGovPrint("[CLOSURE] DetectClosureSignal ERROR: CopyLow failed | copied=" + IntegerToString(copied) + " | required=4", LOG_LEVEL_ERROR, LOG_CHANNEL_SYSTEM);
+             LGovPrint("[CLOSURE] DetectClosureSignal ERROR: CopyLow failed | copied=" + IntegerToString(copied) + " | required=4", LOG_LEVEL_ERROR, LOG_CHANNEL_SYSTEM);
             return;
          }
       }
@@ -2270,7 +2357,7 @@ ArraySetAsSeries(closes, true);
          copied = CopyClose(sym, fallbackTF, 0, 4, closes);
          if(copied < 4)
          {
-            LGovPrint("[CLOSURE] DetectClosureSignal ERROR: CopyClose failed | copied=" + IntegerToString(copied) + " | required=4", LOG_LEVEL_ERROR, LOG_CHANNEL_SYSTEM);
+             LGovPrint("[CLOSURE] DetectClosureSignal ERROR: CopyClose failed | copied=" + IntegerToString(copied) + " | required=4", LOG_LEVEL_ERROR, LOG_CHANNEL_SYSTEM);
             return;
          }
       }
@@ -2282,7 +2369,7 @@ copied = CopyOpen(sym, timeframe, 0, 4, opens);
          copied = CopyOpen(sym, fallbackTF, 0, 4, opens);
          if(copied < 4)
          {
-            LGovPrint("[CLOSURE] DetectClosureSignal ERROR: CopyOpen failed | copied=" + IntegerToString(copied) + " | required=4", LOG_LEVEL_ERROR, LOG_CHANNEL_SYSTEM);
+             LGovPrint("[CLOSURE] DetectClosureSignal ERROR: CopyOpen failed | copied=" + IntegerToString(copied) + " | required=4", LOG_LEVEL_ERROR, LOG_CHANNEL_SYSTEM);
             return;
          }
       }
@@ -2294,7 +2381,7 @@ copied = CopyOpen(sym, timeframe, 0, 4, opens);
          copied = CopyTime(sym, fallbackTF, 0, 4, times);
          if(copied < 4)
          {
-            LGovPrint("[CLOSURE] DetectClosureSignal ERROR: CopyTime failed | copied=" + IntegerToString(copied) + " | required=4", LOG_LEVEL_ERROR, LOG_CHANNEL_SYSTEM);
+             LGovPrint("[CLOSURE] DetectClosureSignal ERROR: CopyTime failed | copied=" + IntegerToString(copied) + " | required=4", LOG_LEVEL_ERROR, LOG_CHANNEL_SYSTEM);
             return;
          }
       }
@@ -2509,22 +2596,37 @@ bool c3_displacement_valid = (InpUseDisplacementEngine && c3_displacement && c3_
 signal_c3.c3_open = c3_open;
         signal_c3.c3_close = c3_close;
 
-           signal_c3.stop_loss = signal_c3.is_bullish ? c2_low : c2_high;
+           signal_c3.stop_loss = RM_ComputeEntryTFSL(_Symbol, g_activeBranch, signal_c3.is_bullish, signal_c3.entry_price);
             signal_c3.equilibrium = (c1_high + c1_low) / 2.0;
             signal_c3.c3_wick_ratio = ComputeWickRatio(c3_open, c3_close, c3_high, c3_low);
-            // TTrades T-Spot Entry
-            double tSpotC3_disp = (c3_high + c3_low) / 2.0;
-            double cPriceC3_disp = (signal_c3.is_bullish) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            signal_c3.entry_price = (tSpotC3_disp > 0.0) ? tSpotC3_disp : cPriceC3_disp;
-            LogPrint("[ENTRY_CANDIDATE_SET] C3 displacement T-Spot | GUID_pre=" + IntegerToString(signal_c3.m_guid) +
-                     " entry=" + DoubleToString(signal_c3.entry_price, _Digits) +
-                     " tspot=" + DoubleToString(tSpotC3_disp, _Digits), LOG_LEVEL_INFO);
+            // VERBATIM REPAIR: Use Anchor TF boundaries for T-Spot 
+            {   SLockedSignal tmpC3; tmpC3.Reset();
+                tmpC3.direction = signal_c3.is_bullish ? DIRECTION_BUY : DIRECTION_SELL;
+                tmpC3.branch = g_activeBranch;
+                tmpC3.branchId = g_activeBranch;
+                tmpC3.symbol = _Symbol;
+                double anchorHigh, anchorLow, anchorEq;
+                GetAnchorContext(tmpC3.branchId, anchorHigh, anchorLow, anchorEq);
+
+                // Bearish Zone: Equilibrium to HTF High | Bullish Zone: HTF Low to Equilibrium 
+                tmpC3.tSpotMin = (tmpC3.direction == DIRECTION_BUY) ? anchorLow : anchorEq;
+                tmpC3.tSpotMax = (tmpC3.direction == DIRECTION_BUY) ? anchorEq : anchorHigh;
+
+                // Enforce Synchronous Mapping before Lock (§II)
+                EE_MapTSpotPOI(tmpC3);
+                if(tmpC3.entry_price > 0.0) signal_c3.entry_price = tmpC3.entry_price;
+                signal_c3.tSpotMin = tmpC3.tSpotMin; signal_c3.tSpotMax = tmpC3.tSpotMax; }
+            LogPrint("[C3_TSPOT_ZONE_SET] Displacement | tSpotMin=" + DoubleToString(signal_c3.tSpotMin, _Digits) +
+                     " | tSpotMax=" + DoubleToString(signal_c3.tSpotMax, _Digits) +
+                     " | entry=" + DoubleToString(signal_c3.entry_price, _Digits), LOG_LEVEL_INFO);
             // Use C1 bar time for setup origin (setup starts with C1 per TTFM)
             signal_c3.setupStartTime = times[3];
             signal_c3.setupHtfCandleStart = times[3];
 
             if(InpEnableTrace)
-              LGovPrint("[C3_DETECTED] Displacement active | entry_price=" + DoubleToString(signal_c3.entry_price, _Digits), LOG_LEVEL_DEBUG, LOG_CHANNEL_SIGNAL);
+              LGovPrint("[C3_DETECTED] Displacement active | tSpot zone=[" +
+                        DoubleToString(signal_c3.tSpotMin, _Digits) + "," +
+                        DoubleToString(signal_c3.tSpotMax, _Digits) + "]", LOG_LEVEL_DEBUG, LOG_CHANNEL_SIGNAL);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -2553,19 +2655,32 @@ signal_c3.c3_open = c3_open;
        signal_c3.c3_open  = c3_open;
        signal_c3.c3_close = c3_close;
 
-signal_c3.stop_loss     = c3_bullish_engulf ? c2_low : c2_high;
+signal_c3.stop_loss     = RM_ComputeEntryTFSL(_Symbol, g_activeBranch, signal_c3.is_bullish, signal_c3.entry_price);
            signal_c3.equilibrium   = (c1_high + c1_low) / 2.0;
            signal_c3.c3_wick_ratio = c3_wick_ratio;
            signal_c3.c2_wick_ratio = ComputeWickRatio(c2_open, c2_close, c2_high, c2_low);
-           // TTrades T-Spot Entry
-           double tSpotC3_cf = (c3_high + c3_low) / 2.0;
-           double cPriceC3_cf = (signal_c3.is_bullish) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-           signal_c3.entry_price = (tSpotC3_cf > 0.0) ? tSpotC3_cf : cPriceC3_cf;
-           LogPrint("[ENTRY_CANDIDATE_SET] C3 classic fallback T-Spot | GUID_pre=" + IntegerToString(signal_c3.m_guid) +
-                    " entry=" + DoubleToString(signal_c3.entry_price, _Digits) +
-                    " tspot=" + DoubleToString(tSpotC3_cf, _Digits), LOG_LEVEL_INFO);
-           // Use C1 bar time for setup origin (setup starts with C1 per TTFM)
-           signal_c3.setupStartTime = times[3];
+            // VERBATIM REPAIR: Use Anchor TF boundaries for T-Spot 
+            {   SLockedSignal tmpC3; tmpC3.Reset();
+                tmpC3.direction = signal_c3.is_bullish ? DIRECTION_BUY : DIRECTION_SELL;
+                tmpC3.branch = g_activeBranch;
+                tmpC3.branchId = g_activeBranch;
+                tmpC3.symbol = _Symbol;
+                double anchorHigh, anchorLow, anchorEq;
+                GetAnchorContext(tmpC3.branchId, anchorHigh, anchorLow, anchorEq);
+
+                // Bearish Zone: Equilibrium to HTF High | Bullish Zone: HTF Low to Equilibrium 
+                tmpC3.tSpotMin = (tmpC3.direction == DIRECTION_BUY) ? anchorLow : anchorEq;
+                tmpC3.tSpotMax = (tmpC3.direction == DIRECTION_BUY) ? anchorEq : anchorHigh;
+
+                // Enforce Synchronous Mapping before Lock (§II)
+                EE_MapTSpotPOI(tmpC3);
+                if(tmpC3.entry_price > 0.0) signal_c3.entry_price = tmpC3.entry_price;
+                signal_c3.tSpotMin = tmpC3.tSpotMin; signal_c3.tSpotMax = tmpC3.tSpotMax; }
+            LogPrint("[C3_TSPOT_ZONE_SET] Classic fallback | tSpotMin=" + DoubleToString(signal_c3.tSpotMin, _Digits) +
+                     " | tSpotMax=" + DoubleToString(signal_c3.tSpotMax, _Digits) +
+                     " | entry=" + DoubleToString(signal_c3.entry_price, _Digits), LOG_LEVEL_INFO);
+            // Use C1 bar time for setup origin (setup starts with C1 per TTFM)
+            signal_c3.setupStartTime = times[3];
            signal_c3.setupHtfCandleStart = times[3];
 
            if(InpEnableTrace)
@@ -2594,16 +2709,30 @@ signal_c3.stop_loss     = c3_bullish_engulf ? c2_low : c2_high;
       signal_c2.c2_open  = c2_open;
       signal_c2.c2_close = c2_close;
 
-      signal_c2.stop_loss     = signal_c2.is_bullish ? c2_low : c2_high;
+      signal_c2.stop_loss     = RM_ComputeEntryTFSL(_Symbol, g_activeBranch, signal_c2.is_bullish, signal_c2.entry_price);
       signal_c2.equilibrium   = (c1_high + c1_low) / 2.0;
       signal_c2.c2_wick_ratio = ComputeWickRatio(c2_open, c2_close, c2_high, c2_low);
-      // TTrades T-Spot Entry
-      double tSpotC2_cf = (c2_high + c2_low) / 2.0;
-      double cPriceC2_cf = (signal_c2.is_bullish) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      signal_c2.entry_price = (tSpotC2_cf > 0.0) ? tSpotC2_cf : cPriceC2_cf;
+      // VERBATIM REPAIR: Use Anchor TF boundaries for T-Spot 
+      {   SLockedSignal tmpC2; tmpC2.Reset();
+          tmpC2.direction = signal_c2.is_bullish ? DIRECTION_BUY : DIRECTION_SELL;
+          tmpC2.branch = g_activeBranch;
+          tmpC2.branchId = g_activeBranch;
+          tmpC2.symbol = _Symbol;
+          double anchorHigh, anchorLow, anchorEq;
+          GetAnchorContext(tmpC2.branchId, anchorHigh, anchorLow, anchorEq);
+
+          // Bearish Zone: Equilibrium to HTF High | Bullish Zone: HTF Low to Equilibrium 
+          tmpC2.tSpotMin = (tmpC2.direction == DIRECTION_BUY) ? anchorLow : anchorEq;
+          tmpC2.tSpotMax = (tmpC2.direction == DIRECTION_BUY) ? anchorEq : anchorHigh;
+
+          // Enforce Synchronous Mapping before Lock (§II)
+          EE_MapTSpotPOI(tmpC2);
+          if(tmpC2.entry_price > 0.0) signal_c2.entry_price = tmpC2.entry_price;
+          signal_c2.tSpotMin = tmpC2.tSpotMin; signal_c2.tSpotMax = tmpC2.tSpotMax; }
       LogPrint("[ENTRY_CANDIDATE_SET] C2 classic fallback T-Spot | GUID_pre=" + IntegerToString(signal_c2.m_guid) +
                " entry=" + DoubleToString(signal_c2.entry_price, _Digits) +
-               " tspot=" + DoubleToString(tSpotC2_cf, _Digits), LOG_LEVEL_INFO);
+               " tspotMin=" + DoubleToString(signal_c2.tSpotMin, _Digits) +
+               " tspotMax=" + DoubleToString(signal_c2.tSpotMax, _Digits), LOG_LEVEL_INFO);
      }
 
      // ═══════════════════════════════════════════════════════════
@@ -2718,7 +2847,7 @@ if(InpUseDisplacementEngine && c3_displacement_valid)
 
                // CISD check on LTF
                ENUM_TIMEFRAMES ltf = (ctx.branch == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
-               bool ltfCisd = SSE_DetectCISD(_Symbol, ltf, engulfDir, 15);
+               SSE_CISDResult delayedCisdResult = SSE_DetectCISD(_Symbol, ltf, engulfDir, 15);
 
                // Build C3 event and register with narrative
                SSequenceLineage lineage;
@@ -2728,16 +2857,20 @@ if(InpUseDisplacementEngine && c3_displacement_valid)
                lineage.anchorBarTime = c1BarTime;
                lineage.detectionTime = TimeCurrent();
 
+               double c3ProtectedSwing = delayedCisdResult.swingPrice > 0.0
+                  ? delayedCisdResult.swingPrice
+                  : (engulfDir == DIRECTION_BUY ? c2Low : c2High);
+
                SClosureEvent c3Event = SFractalNarrative::BuildEvent(
                   CLOSURE_C3, engulfDir,
                   c2High, c2Low,
                   c2Open, c2Close,
                   scan_high, scan_low, scan_open, scan_close,
                   scan_open,
-                  engulfDir == DIRECTION_BUY ? c2Low : c2High,
+                  c3ProtectedSwing,
                   c2WickRatio,
                   ComputeWickRatio(scan_open, scan_close, scan_high, scan_low),
-                  ltfCisd, true, scanIdx, lineage
+                  delayedCisdResult.confirmed, true, scanIdx, lineage
               );
 
               // RegisterC3Event must modify the global array directly
@@ -2772,17 +2905,29 @@ if(InpUseDisplacementEngine && c3_displacement_valid)
                   signal_c3.c3_high = scan_high;
                   signal_c3.c3_low = scan_low;
                   signal_c3.c3_open = scan_open;
-                  signal_c3.c3_close = scan_close;
-                  // TTrades T-Spot Entry
-                  { double tSpotC3_dc = (scan_high + scan_low) / 2.0;
-                    double cPriceC3_dc = (engulfDir == DIRECTION_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-                    signal_c3.entry_price = (tSpotC3_dc > 0.0) ? tSpotC3_dc : cPriceC3_dc; }
-                  LogPrint("[ENTRY_CANDIDATE_SET] C3 delayed continuation T-Spot | GUID_pre=" + IntegerToString(signal_c3.m_guid) +
-                           " entry=" + DoubleToString(signal_c3.entry_price, _Digits) +
-                           " scan_high=" + DoubleToString(scan_high, _Digits) +
-                           " scan_low=" + DoubleToString(scan_low, _Digits), LOG_LEVEL_INFO);
-                  signal_c3.stop_loss = engulfDir == DIRECTION_BUY ? c2Low : c2High;
-                 signal_c3.equilibrium = (c1High + c1Low) / 2.0;
+                   signal_c3.c3_close = scan_close;
+                    // VERBATIM REPAIR: Use Anchor TF boundaries for T-Spot 
+                    {   SLockedSignal tmpC3; tmpC3.Reset();
+                        tmpC3.direction = signal_c3.is_bullish ? DIRECTION_BUY : DIRECTION_SELL;
+                        tmpC3.branch = g_activeBranch;
+                        tmpC3.branchId = g_activeBranch;
+                        tmpC3.symbol = _Symbol;
+                        double anchorHigh, anchorLow, anchorEq;
+                        GetAnchorContext(tmpC3.branchId, anchorHigh, anchorLow, anchorEq);
+
+                        // Bearish Zone: Equilibrium to HTF High | Bullish Zone: HTF Low to Equilibrium 
+                        tmpC3.tSpotMin = (tmpC3.direction == DIRECTION_BUY) ? anchorLow : anchorEq;
+                        tmpC3.tSpotMax = (tmpC3.direction == DIRECTION_BUY) ? anchorEq : anchorHigh;
+
+                        // Enforce Synchronous Mapping before Lock (§II)
+                        EE_MapTSpotPOI(tmpC3);
+                        if(tmpC3.entry_price > 0.0) signal_c3.entry_price = tmpC3.entry_price;
+                        signal_c3.tSpotMin = tmpC3.tSpotMin; signal_c3.tSpotMax = tmpC3.tSpotMax; }
+                    LogPrint("[C3_TSPOT_ZONE_SET] Delayed continuation | tSpotMin=" + DoubleToString(signal_c3.tSpotMin, _Digits) +
+                             " | tSpotMax=" + DoubleToString(signal_c3.tSpotMax, _Digits) +
+                             " | entry=" + DoubleToString(signal_c3.entry_price, _Digits), LOG_LEVEL_INFO);
+                   signal_c3.stop_loss = RM_ComputeEntryTFSL(_Symbol, g_activeBranch, signal_c3.is_bullish, signal_c3.entry_price);
+                  signal_c3.equilibrium = (c1High + c1Low) / 2.0;
 signal_c3.c2_wick_ratio = c2WickRatio;
                   signal_c3.c3_wick_ratio = ComputeWickRatio(scan_open, scan_close, scan_high, scan_low);
                    signal_c3.c3EngulfingC2 = true;
@@ -2984,16 +3129,21 @@ if(EvaluateC4Closure(
 // FIX A: C3/C4 takes priority over C2 - standalone C3/C4 should not be overwritten
 if(c3_evaluated || delayedC3Evaluated || c4Evaluated)
        {
-          signal_c3.entry_price = c4_open;
-          out_signal = signal_c3;
+           // Per AGENTS.md §XVII Gate 4: C3 entry_price is 0.0 until POI is mapped via EE_MapTSpotPOI
+           // c4_open (current bar open) must NOT be used as a midpoint fallback — constitutional violation
+           if(signal_c3.type != CLOSURE_C3)
+           {
+              signal_c3.entry_price = c4_open;
+           }
+           out_signal = signal_c3;
           
           // C3 SPAM KILLER: IMPROVED detection using type + fractalState + timestamp + entry
           // Uses type (not closureType), fractalState, direction, and entry price for uniqueness
-          string closureSig = IntegerToString(signal_c3.type) + "|" +
-                              IntegerToString(signal_c3.fractalState) + "|" +
-                              (signal_c3.is_bullish ? "BUY" : "SELL") + "|" +
-                              DoubleToString(signal_c3.entry_price, _Digits) + "|" +
-                              "C3";  // Tag as C3 for modal upgrade distinction
+           string closureSig = IntegerToString(signal_c3.type) + "|" +
+                               IntegerToString(signal_c3.fractalState) + "|" +
+                               (signal_c3.is_bullish ? "BUY" : "SELL") + "|" +
+                               DoubleToString(signal_c3.entry_price > 0 ? signal_c3.entry_price : 0, _Digits) + "|" +
+                                IntegerToString(signal_c3.m_guid) + "|" + "C3";
    
           bool isNewClosure = (closureSig != g_lastC3ClosureSignature ||
                                TimeCurrent() - g_lastClosureLogTime > 5);
@@ -3016,7 +3166,7 @@ if(c3_evaluated || delayedC3Evaluated || c4Evaluated)
                    c3Signal.type = signal_c3.type;
                    c3Signal.is_bullish = signal_c3.is_bullish;
                    c3Signal.entry_price = signal_c3.entry_price;
-                   c3Signal.stop_loss = (signal_c3.is_bullish ? signal_c3.c2_low : signal_c3.c2_high);
+                    c3Signal.stop_loss = RM_ComputeEntryTFSL(_Symbol, g_activeBranch, signal_c3.is_bullish, signal_c3.entry_price);
                    c3Signal.c1_high = signal_c3.c1_high;
                    c3Signal.c1_low = signal_c3.c1_low;
                    c3Signal.c2_high = signal_c3.c2_high;
@@ -3034,97 +3184,28 @@ if(c3_evaluated || delayedC3Evaluated || c4Evaluated)
                    c3Signal.setupInitialLow = signal_c3.setupInitialLow;
                     c3Signal.setupIsBullish = signal_c3.setupIsBullish;
                     c3Signal.c1_close = signal_c3.c1_close;
-                    c3Signal.fractalState = signal_c3.fractalState;
-                    c3Signal.m_guid = signal_c3.m_guid;
+                     c3Signal.fractalState = signal_c3.fractalState;
+                     c3Signal.m_guid = signal_c3.m_guid;
+                     c3Signal.tSpotMin = signal_c3.tSpotMin;
+                     c3Signal.tSpotMax = signal_c3.tSpotMax;
 
+// VERBATIM REPAIR: Pass-Through Lock (§IV)
 SLockedSignal c3LockedSignal;
-                      c3LockedSignal.Reset();
-                      if(c3LockedSignal.Lock(c3Signal, 0, ctx.branch, _Period))
-                      {
-                           LogPrint("[C3_LOCK_ATTEMPT] SUCCESS | GUID=" + IntegerToString(c3LockedSignal.m_guid) +
-                                   " | closureType=" + EnumToString(c3LockedSignal.closureType) +
-                                   " | mode=" + (c3LockedSignal.executionMode == MODE_ANTICIPATION ? "ANTICIPATION" : "CONFIRMATION"), LOG_LEVEL_INFO);
-
-// CRITICAL FIX: Gate 4 POI mapping for C3 signals
-                            // Per AGENTS.md §XVI Gate 4: T-Spot zone + PD Array required
-                            // For C3 standalone: use C3 high/low as T-Spot reference
-                            // T-Spot zone: Bullish (HTF Low to Equilibrium), Bearish (Equilibrium to HTF High)
-                            ENUM_TIMEFRAMES entryTf = (ctx.branch == BRANCH_SWING) ? PERIOD_M15 : PERIOD_M5;
-                            
-// Compute T-Spot zone properly from C3 range
-                             double equilibrium = (c3LockedSignal.c3_high + c3LockedSignal.c3_low) / 2.0;
-                             double zoneLow, zoneHigh;
-                             if(c3LockedSignal.direction == DIRECTION_BUY)
-                             {
-                                 zoneLow = c3LockedSignal.c3_low;
-                                 zoneHigh = equilibrium;
-                             }
-                             else
-                             {
-                                 zoneLow = equilibrium;
-                                 zoneHigh = c3LockedSignal.c3_high;
-                             }
-                             
-                             double candidateEntry = 0.0;
-                             bool poiMapped = EE_MapPOISimple(_Symbol, entryTf, zoneHigh, zoneLow, (c3LockedSignal.direction == DIRECTION_BUY), candidateEntry);
-                            
-                            if(!poiMapped)
-                            {
-                                LogPrint("[TSPOT_POI_MISSING] C3 Gate 4 failed - no PD Array in T-Spot zone | GUID=" + IntegerToString(c3LockedSignal.m_guid) +
-                                         " | zone=[" + DoubleToString(zoneLow, _Digits) + ", " + DoubleToString(zoneHigh, _Digits) + "]", LOG_LEVEL_WARN);
-                                // Per Constitution §VII: No fake POI - signal cannot proceed without valid POI
-                                return; // Exit without committing signal
-                            }
-                            
-                            LogPrint("[TSPOT_POI_MAPPED] C3 Gate 4 success | GUID=" + IntegerToString(c3LockedSignal.m_guid) +
-                                    " | entry=" + DoubleToString(candidateEntry, _Digits), LOG_LEVEL_INFO);
-                            
-                            // Update entry price with mapped POI
-                            c3LockedSignal.entry_price = candidateEntry;
-
-                          if(c3LockedSignal.Commit())
-                         {
-                             // REGRESSION_GUARD_V52.5_SIGNAL_CONSOLIDATION: Single storage path
-                             if(CommitSignalToStore(c3LockedSignal, g_activeBranch, regType))
-                             {
-                                  c3LockedSignal.isStored = true;
-                                  c3LockedSignal.TransitionStage(STAGE_WAITING_FOR_POI);
-                                  g_lastC3ClosureSignature = closureSig;
-                                  g_lastClosureLogTime = TimeCurrent();
-
-                                  string closureLabel = (regType == CLOSURE_C4) ? "C4" : "C3";
-                                 LogPrint("[C3_LOCKED] SUCCESS | GUID=" + IntegerToString(c3LockedSignal.m_guid) +
-                                         " | closure=" + EnumToString(regType) +
-                                         " | entry=" + DoubleToString(c3LockedSignal.entry_price, _Digits) +
-                                         " | stage=" + EnumToString(c3LockedSignal.stage) +
-                                         " | mode=" + (c3LockedSignal.executionMode == MODE_CONFIRMATION ? "CONFIRMATION" : "ANTICIPATION") +
-                                         " | branch=" + EnumToString(ctx.branch), LOG_LEVEL_INFO);
-                                 if(g_logLevel <= LOG_LEVEL_INFO)
-                                 {
-                                     LogPrint("[GUID_ASSIGNED] " + closureLabel + " | GUID:" + IntegerToString(c3LockedSignal.m_guid) +
-                                             " | closure=" + EnumToString(regType) +
-                                             " | entry=" + DoubleToString(c3LockedSignal.entry_price, _Digits) +
-                                             " | stage=" + EnumToString(c3LockedSignal.stage) +
-                                             " | mode=" + (c3LockedSignal.executionMode == MODE_CONFIRMATION ? "CONFIRMATION" : "ANTICIPATION"),
-                                             LOG_LEVEL_INFO);
-                                 }
-                             }
-                             else
-                             {
-                                 LogPrint("[C3_REJECT] CommitSignalToStore failed | GUID:" + IntegerToString(c3LockedSignal.m_guid), LOG_LEVEL_WARN);
-                             }
-                         }
-                         else
-                         {
-                             LogPrint("[C3_REJECT] Commit() failed | GUID=" + IntegerToString(c3LockedSignal.m_guid), LOG_LEVEL_WARN);
-                         }
-                     }
-                     else
-                     {
-                         LogPrint("[C3_LOCK_FAILED] Lock() rejected | GUID=" + IntegerToString(c3Signal.m_guid) +
-                                 " | entry=" + DoubleToString(c3Signal.entry_price, _Digits) +
-                                 " | type=" + EnumToString(c3Signal.type), LOG_LEVEL_WARN);
-                     }
+c3LockedSignal.Reset();
+c3LockedSignal.direction = signal_c3.is_bullish ? DIRECTION_BUY : DIRECTION_SELL;
+c3LockedSignal.branch = g_activeBranch;
+c3LockedSignal.branchId = g_activeBranch;
+c3LockedSignal.closureType = regType;
+if (EE_MapTSpotPOI(c3LockedSignal)) {
+    // Pass scanner results directly to Lock
+    c3LockedSignal.Lock(c3LockedSignal.tSpotMin, c3LockedSignal.tSpotMax); 
+    c3LockedSignal.TransitionStage(STAGE_WAITING_FOR_POI);
+    LogPrint("[C3_ROUTE_RESTORED] GUID:" + IntegerToString(c3LockedSignal.m_guid), LOG_LEVEL_INFO);
+    CommitSignalToStore(c3LockedSignal, g_activeBranch, regType);
+    lockedSignal = c3LockedSignal;
+} else {
+    LogPrint("[C3_LOCK_REJECTED] GUID: " + IntegerToString(signal_c3.m_guid) + " | entry_price is 0.0", LOG_LEVEL_WARN);
+}
                }
          }
 
@@ -3144,11 +3225,11 @@ SLockedSignal c3LockedSignal;
 // C2 SPAM KILLER: IMPROVED detection using type + fractalState + timestamp + entry + GUID tracking
        // Uses type (not closureType), fractalState, direction, and entry price for uniqueness
        // ENHANCED: Include GUID to distinguish C2 from modal upgrade C3
-       string closureSig = IntegerToString(signal_c2.type) + "|" +
-                           IntegerToString(signal_c2.fractalState) + "|" +
-                           (signal_c2.is_bullish ? "BUY" : "SELL") + "|" +
-                           DoubleToString(signal_c2.entry_price, _Digits) + "|" +
-                           "C2";  // Tag as C2 for modal upgrade distinction
+        string closureSig = IntegerToString(signal_c2.type) + "|" +
+                            IntegerToString(signal_c2.fractalState) + "|" +
+                            (signal_c2.is_bullish ? "BUY" : "SELL") + "|" +
+                            DoubleToString(signal_c2.entry_price > 0 ? signal_c2.entry_price : 0, _Digits) + "|" +
+                            IntegerToString(signal_c2.m_guid) + "|" + "C2";
 
 bool isNewClosure = (closureSig != g_lastC2ClosureSignature ||
                               TimeCurrent() - g_lastClosureLogTime > 5);
@@ -3233,8 +3314,8 @@ bool isNewClosure = (closureSig != g_lastC2ClosureSignature ||
                 {
                     LogPrint("[ENTRY_CANDIDATE_INVALID] entry_price=" + DoubleToString(signal_c2.entry_price, _Digits) +
                             " | Cannot lock with invalid entry price | GUID=" + IntegerToString(lockedSignal.m_guid), LOG_LEVEL_ERROR);
-                    LogPrint("[LOCKED_SIGNAL_REJECTED] GUID=" + IntegerToString(lockedSignal.m_guid) +
-                             " | reason=ENTRY_CANDIDATE_INVALID | entry_price=" + DoubleToString(signal_c2.entry_price, _Digits), LOG_LEVEL_INFO);
+                     LogPrint("[LOCKED_SIGNAL_REJECTED] GUID=" + IntegerToString(lockedSignal.m_guid) +
+                              " | reason=ENTRY_CANDIDATE_INVALID | entry_price=" + DoubleToString(signal_c2.entry_price, _Digits), LOG_LEVEL_INFO);
                     return;
                 }
                
@@ -3249,10 +3330,10 @@ bool isNewClosure = (closureSig != g_lastC2ClosureSignature ||
                   if(!RegisterPipelineSignal(lockedSignal.m_guid, CLOSURE_C2, signal_c2.c1_high, signal_c2.c1_low,
                                              signal_c2.c2_high, signal_c2.c2_low, signal_c2.is_bullish ? DIRECTION_BUY : DIRECTION_SELL))
                   {
-                      LogPrint("[C2_PREALLOC_FAIL] GUID=" + IntegerToString(lockedSignal.m_guid) + " | failed to pre-allocate", LOG_LEVEL_ERROR);
-                      lockedSignal.ResetIfUncommitted();
-                      return;
-                  }
+                       LogPrint("[C2_PREALLOC_FAIL] GUID=" + IntegerToString(lockedSignal.m_guid) + " | failed to pre-allocate", LOG_LEVEL_ERROR);
+                       lockedSignal.ResetIfUncommitted();
+                       return;
+                   }
 
                   LogPrint("[C2_LOCK_ATTEMPT] SUCCESS | GUID=" + IntegerToString(lockedSignal.m_guid) +
                          " | closureType=" + EnumToString(lockedSignal.closureType), LOG_LEVEL_INFO);
@@ -3294,12 +3375,12 @@ bool isNewClosure = (closureSig != g_lastC2ClosureSignature ||
                        {
                         string rejectModeStr = (lockedSignal.executionMode == MODE_ANTICIPATION) ? "ANTICIPATION" :
                                               (lockedSignal.executionMode == MODE_CONFIRMATION) ? "CONFIRMATION" : "NONE";
-                        LogPrint("[COMMIT_REJECT] Bias misalignment | mode=" + rejectModeStr + "[" + IntegerToString(lockedSignal.executionMode) + "]" +
-                                 " | is_bullish=" + (lockedSignal.direction == DIRECTION_BUY ? "true" : "false") +
-                                 " | bias=" + biasName, LOG_LEVEL_WARN);
-                           lockedSignal.ResetIfUncommitted();
-                           return;
-                       }
+                         LogPrint("[COMMIT_REJECT] Bias misalignment | mode=" + rejectModeStr + "[" + IntegerToString(lockedSignal.executionMode) + "]" +
+                                  " | is_bullish=" + (lockedSignal.direction == DIRECTION_BUY ? "true" : "false") +
+                                  " | bias=" + biasName, LOG_LEVEL_WARN);
+                            lockedSignal.ResetIfUncommitted();
+                            return;
+                        }
                         string biasAlignModeStr = (lockedSignal.executionMode == MODE_ANTICIPATION) ? "ANTICIPATION" :
                                                   (lockedSignal.executionMode == MODE_CONFIRMATION) ? "CONFIRMATION" : "NONE";
                          LogPrint("[BIAS_ALIGNED] OK | mode=" + biasAlignModeStr + "[" + IntegerToString(lockedSignal.executionMode) + "]" +
@@ -3330,14 +3411,9 @@ else
                     {
                        if(lockedSignal.closureType == CLOSURE_C2)
                        {
-                          if(lockedSignal.direction == DIRECTION_BUY)
-                             lockedSignal.stop_loss = lockedSignal.c2_low;
-                          else if(lockedSignal.direction == DIRECTION_SELL)
-                             lockedSignal.stop_loss = lockedSignal.c2_high;
+                          lockedSignal.stop_loss = RM_ComputeEntryTFSL(_Symbol, g_activeBranch, lockedSignal.direction == DIRECTION_BUY, lockedSignal.entry_price);
                           
-                          LogPrint("[SL_PROTECTED_SWING_C2] direction=" + EnumToString(lockedSignal.direction) +
-                                   " | c2_low=" + DoubleToString(lockedSignal.c2_low, _Digits) +
-                                   " | c2_high=" + DoubleToString(lockedSignal.c2_high, _Digits) +
+                          LogPrint("[SL_MANIP_LEG_C2] direction=" + EnumToString(lockedSignal.direction) +
                                    " | sl=" + DoubleToString(lockedSignal.stop_loss, _Digits), LOG_LEVEL_INFO);
                        }
                        
@@ -3598,29 +3674,33 @@ bool HasC3ClosureSignal(SClosureSignal &signal)
 }
 
 /**
- * CheckC2CISD — C2 Entry Release via CISD
+ * CheckC2CISD — C2 Entry Release via CISD (Structure TF)
  *
- * Implements TTrades CISD entry model: For a buy C2 signal (swept low),
- * CISD triggers when price closes above C2 high on the entry TF.
+ * VERBATIM REPAIR: 3-Tier TF Mapping (§XVII)
+ * CISD must be confirmed on the Structure TF (H1/H4), NOT the Entry TF (M5/M15).
+ * Only after Structure CISD passes may the signal drop to Entry TF for POI mapping.
+ *
+ * For a buy C2 signal (swept low), CISD triggers when price closes above
+ * C2 high on the Structure TF.
  * For a sell C2 signal (swept high), CISD triggers when price closes
- * below C2 low on the entry TF.
+ * below C2 low on the Structure TF.
  *
  * @param signal Locked C2 signal with direction and c2_high/c2_low
- * @return true if CISD condition is met on the last completed entry TF bar
+ * @return true if CISD condition is met on the last completed Structure TF bar
  */
 bool CheckC2CISD(SLockedSignal &signal)
 {
    if(signal.m_guid == 0)
       return false;
 
-   // Require signal to be at least 1 entry-TF bar old
-   ENUM_TIMEFRAMES entryTF = GetEntryTF(signal.branchId);
-   int tfSeconds = (int)PeriodSeconds(entryTF);
+   // VERBATIM REPAIR: Use Structure TF (H1/H4) — not Entry TF (M5/M15)
+   ENUM_TIMEFRAMES structTF = GetStructureTF(signal.branchId);
+   int tfSeconds = (int)PeriodSeconds(structTF);
    if(tfSeconds > 0 && TimeCurrent() - signal.m_detectionTime < tfSeconds)
       return false;
 
-   // Close of last completed bar on entry TF (index 1 = completed bar)
-   double lastClose = iClose(_Symbol, entryTF, 1);
+   // Close of last completed bar on Structure TF (index 1 = completed bar)
+   double lastClose = iClose(_Symbol, structTF, 1);
    if(lastClose <= 0.0)
       return false;
 
@@ -4633,9 +4713,8 @@ bool CE_DoubleGate(
         out_signal.c3_open = c3_open;
         out_signal.c3_close = c3_close;
 
-        out_signal.stop_loss = out_signal.is_bullish ? c2_low : c2_high;
-        LogPrint("[SL_SOURCE_C3ALT] direction=" + (out_signal.is_bullish?"BUY":"SELL") +
-                 " c2_extreme=" + DoubleToString(out_signal.is_bullish?c2_low:c2_high, _Digits) +
+        out_signal.stop_loss = RM_ComputeEntryTFSL(_Symbol, g_activeBranch, out_signal.is_bullish, out_signal.entry_price);
+        LogPrint("[SL_MANIP_LEG_C3ALT] direction=" + (out_signal.is_bullish?"BUY":"SELL") +
                  " sl=" + DoubleToString(out_signal.stop_loss, _Digits), LOG_LEVEL_INFO);
         out_signal.equilibrium = (c1_high + c1_low) / 2.0;
 

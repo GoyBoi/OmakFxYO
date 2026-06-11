@@ -70,61 +70,61 @@ RG_FAIL_RR_TOO_LOW,
 //+------------------------------------------------------------------+
   //| SignalSnapshot — Frozen trade context for deterministic execution |
   //+------------------------------------------------------------------+
-  struct SSignalSnapshotRisk
-  {
-      ulong    signalID;
-      string   symbol;
-      ENUM_TIMEFRAMES timeframe;
-      ENUM_TIMEFRAMES structureTF;
-      datetime barTime;
-      string   branchName;
+struct SSignalSnapshotRisk
+{
+    ulong    signalID;
+    string   symbol;
+    ENUM_TIMEFRAMES timeframe;
+    ENUM_TIMEFRAMES structureTF;
+    datetime barTime;
+    string   branchName;
 
-      double   entryPrice;
-      double   stopLoss;
-      double   stopLossPoints; // DEPRECATED – gate computes internally; kept for logging only
-      ENUM_DIRECTION direction;
-      double   tpPrice;
-      ENUM_CLOSURE_TYPE closureType;  // P9 Fix: Closure type for exposure check
+    double   entryPrice;
+    double   stopLoss;
+    double   stopLossPoints; // DEPRECATED – gate computes internally; kept for logging only
+    ENUM_DIRECTION direction;
+    double   tpPrice;
+    ENUM_CLOSURE_TYPE closureType;  // P9 Fix: Closure type for exposure check
 
-      // C2 protected swing extremes (for structural SL fallback)
-       double   c2_low;
-       double   c2_high;
+    // C2 protected swing extremes (for structural SL fallback)
+     double   c2_low;
+     double   c2_high;
 
-       // Signal contract: runtime execution mode (not inferred from closure type)
-       int      executionMode;
+     // Signal contract: runtime execution mode (not inferred from closure type)
+     int      executionMode;
 
-       double   atrValue;
-      bool     atrReady;
+     double   atrValue;
+    bool     atrReady;
 
-      double   tickValue;
-      double   tickSize;
+    double   tickValue;
+    double   tickSize;
 
-      double   minLot;
-      double   maxLot;
-      double   lotStep;
+    double   minLot;
+    double   maxLot;
+    double   lotStep;
 
-      double   baseLot;
-      double   normalizedLot;
-      double   scaledLot;
-      double   quantizedLot;
+    double   baseLot;
+    double   normalizedLot;
+    double   scaledLot;
+    double   quantizedLot;
 
-      datetime timestamp;
-  };
+    datetime timestamp;
+
+    // Hard-initialization to prevent 100-lot arithmetic fraud
+    SSignalSnapshotRisk() { baseLot = 0.0; }
+};
 
 static SSignalSnapshotRisk g_snapshotRisk;
 
 //+------------------------------------------------------------------+
   //| RG_CreateSnapshot — Create frozen snapshot for deterministic execution |
   //+------------------------------------------------------------------+
-SSignalSnapshotRisk RG_CreateSnapshot(
-      ulong signalID,
+void RG_CreateSnapshot(SSignalSnapshotRisk &snap, const SLockedSignal &sig, double calculatedLot, 
       string symbol,
       ENUM_TIMEFRAMES timeframe,
       ENUM_TIMEFRAMES structureTF,
       datetime barTime,
       string branchName,
-      double entryPrice,
-      double stopLoss,
       double stopLossPoints,
       ENUM_DIRECTION direction = DIRECTION_NONE,
       double tpPrice = 0.0,
@@ -134,22 +134,22 @@ SSignalSnapshotRisk RG_CreateSnapshot(
       int executionModeVal = MODE_NONE
    )
    {
-      SSignalSnapshotRisk snap;
       RG_Reset();
 
-      snap.signalID = signalID;
+      snap.signalID = sig.m_guid;
       snap.symbol = symbol;
       snap.timeframe = timeframe;
       snap.structureTF = structureTF;
       snap.barTime = barTime;
       snap.branchName = branchName;
       snap.timestamp = TimeCurrent();
-      snap.entryPrice = entryPrice;
-      snap.stopLoss = stopLoss;
+      snap.entryPrice = sig.entry_price;
+      snap.stopLoss = sig.stop_loss;
       snap.stopLossPoints = stopLossPoints;
       snap.direction = direction;
       snap.tpPrice = tpPrice;
       snap.closureType = closureType;
+      snap.baseLot = calculatedLot;
 
       snap.c2_low = c2_low_val;
       snap.c2_high = c2_high_val;
@@ -170,8 +170,7 @@ SSignalSnapshotRisk RG_CreateSnapshot(
       snap.lotStep = sp.volumeStep;
 
 g_snapshotRisk = snap;
-      return snap;
-  }
+   }
 
 //+------------------------------------------------------------------+
   //| RG_Reset — Reset snapshot to invalid state                     |
@@ -800,6 +799,33 @@ ENUM_RG_FAIL RG_IsReady()
   }
 
 //+------------------------------------------------------------------+
+//| SincereRiskCalculation — §XII Sincere Telemetry Wrapper          |
+//+------------------------------------------------------------------+
+/**
+ * VERBATIM REPAIR: §XII Sincere Telemetry Wrapper
+ * Uses OrderCalcProfit for broker-authoritative risk, with manual formula
+ * fallback if broker value is suspect.
+ *
+ * @param sig     Locked signal with entry_price, stop_loss, symbol, GUID
+ * @param volume  Trade volume to evaluate
+ * @return        Abs risk value (positive) from broker or manual fallback
+ */
+double SincereRiskCalculation(const SLockedSignal &sig, double volume)
+{
+    double brokerLoss = 0.0;
+    bool success = OrderCalcProfit(ORDER_TYPE_BUY, sig.symbol, volume, sig.entry_price, sig.stop_loss, brokerLoss);
+
+    // Log raw broker telemetry channel
+    LogPrint(StringFormat("[TELEMETRY_RISK] GUID:%I64u | BrokerRaw:%.2f", sig.m_guid, brokerLoss), LOG_LEVEL_INFO);
+
+    // Manual Formula Fallback (The 100x Fraud Guard)
+    double slTicks = MathAbs(sig.entry_price - sig.stop_loss) / SymbolInfoDouble(sig.symbol, SYMBOL_TRADE_TICK_SIZE);
+    double manualLoss = slTicks * SymbolInfoDouble(sig.symbol, SYMBOL_TRADE_TICK_VALUE) * volume;
+
+    return (success && MathAbs(brokerLoss) < manualLoss * 10.0) ? MathAbs(brokerLoss) : manualLoss;
+}
+
+//+------------------------------------------------------------------+
 //| PreTradeSimulation — Margin + equity projection before order     |
 //| Prevents reactive account blow-ups by validating trade impact     |
 //| BEFORE OrderSend is called. Universal across broker types.        |
@@ -868,7 +894,7 @@ PreTradeSimulation SimulateTradeImpact(
     }
 
 // === 2. Max loss if SL hit — broker-reality computation ===
-// Always prefer OrderCalcProfit; SY_ComputeMaxLoss handles calc-mode-aware fallback.
+// VERBATIM REPAIR: Manual formula via SY_ComputeMaxLoss (tickValue/tickSize).
        double maxLoss = SY_ComputeMaxLoss(symbol, orderType, volume, entryPrice, slPrice);
 
        if(maxLoss <= 0.0)
@@ -1086,30 +1112,17 @@ SSymbolProfile execSp = SY_GetProfile(symbol);
           return false;
        }
 
-// IsLotTradeable check — broker minimum affordability with OrderCalcProfit
-        // Per AGENTS.md §XIII: Log actual minRisk value used in comparison
+// VERBATIM REPAIR: §XII Sincere Telemetry Wrapper replaces raw formula
+        SLockedSignal tempSig;
+        tempSig.Reset();
+        tempSig.symbol = symbol;
+        tempSig.entry_price = price;
+        tempSig.stop_loss = sl;
+        tempSig.m_guid = signalID;
+        double minRisk = SincereRiskCalculation(tempSig, minVol);
+
         double riskAmount = AccountInfoDouble(ACCOUNT_EQUITY) * (InpRiskPercent / 100.0);
-        double minRisk = 0.0;
-        bool useOrderCalc = (price > 0.0 && sl > 0.0 && symbol != "");
-        if(useOrderCalc)
-        {
-           ENUM_ORDER_TYPE ocpOrderType = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-           double ocpProfit = 0.0;
-           if(OrderCalcProfit(ocpOrderType, symbol, minVol, price, sl, ocpProfit))
-           {
-              minRisk = MathAbs(ocpProfit);
-           }
-        }
-        else
-        {
-           // Fallback: compute slPoints from price and sl (if available)
-           double slPts = (sl > 0.0 && price > 0.0) ? MathAbs(price - sl) / execSp.point : 0.0;
-           if(slPts > 0.0 && execSp.tickValue > 0.0)
-           {
-              minRisk = minVol * slPts * execSp.tickValue;
-           }
-        }
-        
+
         if(!IsLotTradeable(0.0, execSp.tickValue, minVol,
                            AccountInfoDouble(ACCOUNT_EQUITY), InpRiskPercent, symbol,
                            price, sl, isBuy))
@@ -1119,7 +1132,7 @@ SSymbolProfile execSp = SY_GetProfile(symbol);
                     " | minLot=" + DoubleToString(minVol, 4) +
                     " | minRisk=" + DoubleToString(minRisk, 2) +
                     " | riskAmount=" + DoubleToString(riskAmount, 4) +
-                    " | method=" + (useOrderCalc ? "OrderCalcProfit" : "formula") +
+                    " | method=SincereRiskCalculation" +
                     " | symbol=" + symbol +
                     " | GUID=" + IntegerToString(signalID), LOG_LEVEL_WARN);
            return false;
@@ -1538,82 +1551,32 @@ if(req.tp > 0)
 }
 
 //+------------------------------------------------------------------+
-//| RG_ValidateAndAdjustStops — P2 FIX: Unified stop validation     |
-//| Validates SL/TP direction and distance for any symbol (incl. 3-digit gold) |
+//| RG_ValidateAndAdjustStops — Universal Validator Expansion        |
+//| VERBATIM REPAIR: Finding 2 - Supports all 6 MQL5 order types     |
 //+------------------------------------------------------------------+
-bool RG_ValidateAndAdjustStops(string symbol, ENUM_ORDER_TYPE orderType,
-                                 double &sl, double &tp,
-                                 double entryPrice, string guid)
- {
-     SSymbolProfile spAdj2 = SY_GetProfile(symbol);
-     double point      = spAdj2.point;
-     int    digits     = spAdj2.digits > 0 ? spAdj2.digits : _Digits;
-     double tickSize   = spAdj2.tickSize;
-     int    stopsLevel = (int)spAdj2.stopsLevel;
-     double spread     = (spAdj2.tickBid > 0.0 && spAdj2.tickAsk > 0.0)
-                           ? (spAdj2.tickAsk - spAdj2.tickBid)
-                           : (SymbolInfoDouble(symbol, SYMBOL_ASK) - SymbolInfoDouble(symbol, SYMBOL_BID));
+bool RG_ValidateAndAdjustStops(MqlTradeRequest &req, const SLockedSignal &sig) {
+    double minDist = SymbolInfoInteger(sig.symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+    
+    // Hard Reject: Protection cannot be 0.00 (§VII.A)
+    if (req.sl <= 0.0) return false;
 
-     double minDist = (stopsLevel * point) + spread + (2 * tickSize);
+    bool isBuy = (req.type == ORDER_TYPE_BUY || req.type == ORDER_TYPE_BUY_LIMIT || req.type == ORDER_TYPE_BUY_STOP);
+    bool isSell = (req.type == ORDER_TYPE_SELL || req.type == ORDER_TYPE_SELL_LIMIT || req.type == ORDER_TYPE_SELL_STOP);
 
-     bool adjusted = false;
+    if (isBuy) {
+        if (req.sl > req.price - minDist) req.sl = req.price - minDist;
+        LogPrint(StringFormat("[RG_STOPS_OK] BUY_TYPE | Entry:%.5f | SL:%.5f", req.price, req.sl), LOG_LEVEL_INFO);
+        return true;
+    }
+    
+    if (isSell) {
+        if (req.sl < req.price + minDist) req.sl = req.price + minDist;
+        LogPrint(StringFormat("[RG_STOPS_OK] SELL_TYPE | Entry:%.5f | SL:%.5f", req.price, req.sl), LOG_LEVEL_INFO);
+        return true;
+    }
 
-     double bid = (spAdj2.tickBid > 0.0) ? spAdj2.tickBid : SymbolInfoDouble(symbol, SYMBOL_BID);
-     double ask = (spAdj2.tickAsk > 0.0) ? spAdj2.tickAsk : SymbolInfoDouble(symbol, SYMBOL_ASK);
-
-     if(orderType == ORDER_TYPE_BUY)
-     {
-         if(sl >= bid - minDist || sl <= 0)
-         {
-             sl = NormalizeDouble(bid - minDist, digits);
-             adjusted = true;
-         }
-         if(tp <= ask + minDist || tp <= 0)
-         {
-             tp = NormalizeDouble(ask + minDist * 2, digits);
-             adjusted = true;
-         }
-         if(sl >= entryPrice)
-         {
-             sl = NormalizeDouble(entryPrice - minDist, digits);
-             adjusted = true;
-         }
-         if(tp <= entryPrice)
-         {
-             tp = NormalizeDouble(entryPrice + minDist * 2, digits);
-             adjusted = true;
-         }
-     }
-     else if(orderType == ORDER_TYPE_SELL)
-     {
-         if(sl <= ask + minDist || sl <= 0)
-         {
-             sl = NormalizeDouble(ask + minDist, digits);
-             adjusted = true;
-         }
-         if(tp >= bid - minDist || tp <= 0)
-         {
-             tp = NormalizeDouble(bid - minDist * 2, digits);
-             adjusted = true;
-         }
-         if(sl <= entryPrice)
-         {
-             sl = NormalizeDouble(entryPrice + minDist, digits);
-             adjusted = true;
-         }
-         if(tp >= entryPrice)
-         {
-             tp = NormalizeDouble(entryPrice - minDist * 2, digits);
-             adjusted = true;
-         }
-     }
-
-     if(adjusted)
-         LogPrint("[STOP_ADJUSTED] GUID=" + guid + " | SL=" + DoubleToString(sl, digits) +
-                  " | TP=" + DoubleToString(tp, digits) + " | minDist=" + DoubleToString(minDist, digits), LOG_LEVEL_WARN);
-
-     return true;
- }
+    return false; // Reject unknown types
+}
 
 //+------------------------------------------------------------------+
 //| ConfirmOrderSent — Verify order was actually placed             |
@@ -1688,21 +1651,29 @@ bool IsPyramidHeatCapSafe(double additionalRiskDollars, double maxHeatPercent = 
 //+------------------------------------------------------------------+
 //| RG_EvaluateAndGate — Quick viability gate after STAGE_READY      |
 //| Called immediately after TransitionStage(STAGE_READY) in the     |
-//| pipeline. Uses constitutional SL anchor (c2_low/c2_high) to      |
-//| build a provisional risk snapshot and evaluate gate readiness.   |
+//| pipeline. Uses Entry-TF Manipulation Leg extreme to build a      |
+//| provisional risk snapshot and evaluate gate readiness.           |
 //| Returns true if signal is viable for execution on the same tick. |
 //+------------------------------------------------------------------+
 bool RG_EvaluateAndGate(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch)
 {
-    double provisionalSL = (signal.direction == DIRECTION_BUY)
-        ? signal.c2_low
-        : signal.c2_high;
-    if(provisionalSL <= 0.0)
+    ENUM_TIMEFRAMES entryTF = (branch == BRANCH_SWING) ? PERIOD_M15 : PERIOD_M5;
+
+    // VERBATIM REPAIR: Entry-TF Manipulation Leg SL (§II)
+    bool isBuy = (signal.direction == DIRECTION_BUY);
+    int manipBars = 10;
+    double manipExtreme = isBuy
+        ? iLow(_Symbol, entryTF, iLowest(_Symbol, entryTF, MODE_LOW, manipBars, 1))
+        : iHigh(_Symbol, entryTF, iHighest(_Symbol, entryTF, MODE_HIGH, manipBars, 1));
+    if(manipExtreme <= 0.0)
     {
         LogPrint("[RG_GATE_FAIL] GUID=" + IntegerToString(signal.m_guid) +
-                 " | reason=NO_C2_ANCHOR | step=RG_EvaluateAndGate", LOG_LEVEL_DEBUG);
+                 " | reason=NO_MANIP_ANCHOR | step=RG_EvaluateAndGate", LOG_LEVEL_DEBUG);
         return false;
     }
+    double buffer = InpMinSLPoints * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double provisionalSL = isBuy ? (manipExtreme - buffer) : (manipExtreme + buffer);
+
     double slDist = MathAbs(signal.entry_price - provisionalSL) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
     if(slDist <= 0.0)
     {
@@ -1715,12 +1686,11 @@ bool RG_EvaluateAndGate(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch)
         : signal.entry_price - (slDist * _Point * 2.0);
 
     ENUM_TIMEFRAMES structTF = (branch == BRANCH_SWING) ? PERIOD_H4 : PERIOD_H1;
-    ENUM_TIMEFRAMES entryTF = (branch == BRANCH_SWING) ? PERIOD_M15 : PERIOD_M5;
 
-    SSignalSnapshotRisk snap = RG_CreateSnapshot(
-        signal.m_guid, _Symbol, entryTF, structTF, TimeCurrent(),
-        "Branch" + IntegerToString(branch),
-        signal.entry_price, provisionalSL, slDist,
+    SSignalSnapshotRisk snap;
+    RG_CreateSnapshot(snap, signal, 0.0,
+        _Symbol, entryTF, structTF, TimeCurrent(),
+        "Branch" + IntegerToString(branch), slDist,
         signal.direction, provisionalTP, signal.closureType,
         signal.c2_low, signal.c2_high,
         signal.executionMode
@@ -1734,6 +1704,39 @@ bool RG_EvaluateAndGate(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch)
         return false;
     }
     return true;
+}
+
+//+------------------------------------------------------------------+
+//| VERBATIM REPAIR: Permanent Skip Recovery (§II)                   |
+//| EvaluateSkipRecovery — Clear permanent skip when equity grows    |
+//| by 10% or 48-hour cooldown expires.                               |
+//+------------------------------------------------------------------+
+static bool m_permanentSkip = false;
+static datetime m_skipSetTime = 0;
+
+void EvaluateSkipRecovery(string symbol) {
+    static double lastRecoveryEquity = 0;
+    static bool s_equityInitialized = false;
+    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+    
+    if(!s_equityInitialized)
+    {
+        lastRecoveryEquity = currentEquity;
+        s_equityInitialized = true;
+    }
+    
+    // Condition 1: Equity growth of 10% clears the skip
+    if (currentEquity >= lastRecoveryEquity * 1.10) {
+        m_permanentSkip = false;
+        lastRecoveryEquity = currentEquity;
+        LogPrint("[SKIP_RECOVERY] Equity milestone reached. Symbol unblocked: " + symbol, LOG_LEVEL_INFO);
+    }
+    
+    // Condition 2: 48-hour cooldown (Backtest time) — only check when skip is active
+    if (m_permanentSkip && TimeCurrent() - m_skipSetTime > 172800) {
+        m_permanentSkip = false;
+        LogPrint("[SKIP_RECOVERY] Cooldown expired. Symbol unblocked: " + symbol, LOG_LEVEL_INFO);
+    }
 }
 
   #endif // OMAK_RISKGATE_MQH

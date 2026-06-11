@@ -27,6 +27,7 @@
 #include <OmakFxYO/core/UniversalConfig.mqh>    // Symbol-class volatility config
 #include <OmakFxYO/core/SymbolClassVolatility.mqh> // Symbol-class ATR multipliers
 #include <OmakFxYO/core/FractalNarrative.mqh>   // Fractal narrative (v52.5+)
+#include <OmakFxYO/core/RiskManager.mqh>        // RM_ComputeEntryTFSL — Manipulation Leg SL (§V)
 
 //+------------------------------------------------------------------+
 //| SCISDResult — CISD Detection Result                            |
@@ -352,14 +353,14 @@ s_lastBias.bias = BIAS_NEUTRAL;
  // SAFETY GUARDS — Placed FIRST before any pipeline execution
  // ═══════════════════════════════════════════════════════════════════════
     
-    // BAR GUARD: Check bars available on structureTF BEFORE any analysis
-    int _bars_available = Bars(symbol, ctx.structureTF);
-    if(_bars_available < 50)
-    {
-       LGovPrint("[BE] Insufficient bars on structureTF=" +
-                 EnumToString(ctx.structureTF) +
-                 " | bars=" + IntegerToString(_bars_available) +
-                 " | skipping", LOG_LEVEL_DEBUG, LOG_CHANNEL_PIPELINE);
+     // BAR GUARD: Check bars available on entryTF BEFORE any analysis
+     int _bars_available = Bars(symbol, ctx.entryTF);
+     if(_bars_available < 50)
+     {
+        LGovPrint("[BE] Insufficient bars on entryTF=" +
+                  EnumToString(ctx.entryTF) +
+                  " | bars=" + IntegerToString(_bars_available) +
+                  " | skipping", LOG_LEVEL_DEBUG, LOG_CHANNEL_PIPELINE);
        result.isBranchActive = false;
        result.valid = false;
        return result;
@@ -761,13 +762,14 @@ datetime lastWarmup = g_sseContext.warmupTimestamp;
      if(ctx.branchLockedSignal.stage == STAGE_WAITING_FOR_POI ||
        ctx.branchLockedSignal.stage == STAGE_AWAITING_C3_CLOSURE)
     {
-        datetime currentEntryBar = iTime(symbol, ctx.entryTF, 0);
+        uint secondsSinceLock = (uint)(TimeCurrent() - ctx.branchLockedSignal.lockTime);
         int barsWaiting = 0;
-        if(ctx.branchLockedSignal.lockTime > 0 && currentEntryBar > ctx.branchLockedSignal.lockTime)
+        if(ctx.branchLockedSignal.lockTime > 0)
         {
-            // Calculate bars since lock (approximate)
-            int tfSeconds = (int)PeriodSeconds(ctx.entryTF);
-            barsWaiting = (int)((currentEntryBar - ctx.branchLockedSignal.lockTime) / tfSeconds);
+            if(secondsSinceLock < (uint)PeriodSeconds(ctx.branchLockedSignal.entryTF))
+                barsWaiting = 0; // Keep breathing (§III) — not yet 1 full bar
+            else
+                barsWaiting = (int)(secondsSinceLock / (uint)PeriodSeconds(ctx.branchLockedSignal.entryTF));
         }
 
 // PHASE 2 FIX: Differentiate expiration by closure type
@@ -811,7 +813,7 @@ datetime lastWarmup = g_sseContext.warmupTimestamp;
            }
 
 // Reset signal to allow new closures
-              ctx.branchLockedSignal.TransitionStage(STAGE_NONE);
+               ctx.branchLockedSignal.TransitionStage(STAGE_EXPIRED);
               ctx.branchLockedSignal.m_guid = 0;
               ctx.branchLockedSignal.entry_price = 0.0;
               ctx.branchLockedSignal.closureType = CLOSURE_NONE;
@@ -1325,16 +1327,26 @@ void BE_ResolveParams(ENUM_EXECUTION_BRANCH branch, SBranchResolvedParams &out)
  */
 bool BE_EvaluateAllBranches(const string symbol, ENUM_EXECUTION_BRANCH activeBranch)
 {
-     // Set active branch for logging enforcement
-     g_activeBranch = activeBranch;
+      // ── §XIII Law of Proactive Affordability: Skip all signal detection for untradeable symbols ──
+      if(g_symbolUntradeable)
+      {
+          LogPrint("[SYMBOL_UNTRADEABLE_GATE] Skipping signal detection | symbol=" + symbol +
+                   " | reason=" + g_symbolUntradeableReason, LOG_LEVEL_WARN);
+          g_branchesEvaluated = true;
+          g_cachedCtxInitialized = true;
+          return false;
+      }
 
-     bool evaluateA = (activeBranch == BRANCH_INTRADAY);
-     bool evaluateB = (activeBranch == BRANCH_SWING);
+      // Set active branch for logging enforcement
+      g_activeBranch = activeBranch;
 
-     BranchResult resultA;
-     resultA.valid = false;
-     BranchResult resultB;
-     resultB.valid = false;
+      bool evaluateA = (activeBranch == BRANCH_INTRADAY);
+      bool evaluateB = (activeBranch == BRANCH_SWING);
+
+      BranchResult resultA;
+      resultA.valid = false;
+      BranchResult resultB;
+      resultB.valid = false;
 
      if(evaluateA)
         resultA = BE_EvaluateBranch(BRANCH_INTRADAY, symbol);
@@ -1726,8 +1738,12 @@ bool ValidateTopDownContext(BranchContext &ctx, const string symbol)
         // TIER 2 — HTF Confirmation Check
         // ═══════════════════════════════════════════════════════════════
         ENUM_TIMEFRAMES htfTf = ctx.structureTF;
-        bool htfCisd = SSE_DetectCISD(symbol, htfTf, signalDir, 20);
+        SSE_CISDResult htfCisdResult = SSE_DetectCISD(symbol, htfTf, signalDir, 20);
+        bool htfCisd = htfCisdResult.confirmed;
         bool htfClosureAligned = false;
+
+        // VERBATIM REPAIR: Manipulation Leg SL (§V) — Entry TF extreme
+        sig.stop_loss = RM_ComputeEntryTFSL(symbol, sig.branchId, sig.direction == DIRECTION_BUY, sig.entry_price);
 
         // Also check the structure signal for alignment
         if(ctx.structureSignal.valid)
@@ -1775,34 +1791,97 @@ bool ValidateTopDownContext(BranchContext &ctx, const string symbol)
         tier2Pass = true;
 
         // ═══════════════════════════════════════════════════════════════
-        // TIER 3 — LTF CISD at POI
+        // TIER 3 — Entry/POI Validation (Entry TF)
+        // VERBATIM REPAIR: 3-Tier TF Mapping (§XVII)
+        // Tier 2 already confirmed CISD on Structure TF. Tier 3 operates
+        // on Entry TF for POI validation only — NO CISD check on Entry TF.
         // ═══════════════════════════════════════════════════════════════
         ENUM_TIMEFRAMES entryTf = ctx.entryTF;
-        bool ltfCisd = SSE_DetectCISD(symbol, entryTf, signalDir, 15);
 
-      if(sig.closureType == CLOSURE_C3)
-      {
-         LogPrint("[C3_CONTEXT] GUID=" + IntegerToString(sig.m_guid) +
-                " LTF_CISD=" + (ltfCisd ? "PASS" : "WAIT"), LOG_LEVEL_INFO);
-      }
+        // VERBATIM REPAIR: Manipulation Leg SL (§V) — Entry TF extreme
+        sig.stop_loss = RM_ComputeEntryTFSL(symbol, sig.branchId, sig.direction == DIRECTION_BUY, sig.entry_price);
 
-        if(!ltfCisd)
+        // Tier 3: Verify POI is mapped (entry_price > 0) or signal is in POI-wait state
+        bool poiAvailable = (sig.entry_price > 0.0);
+        bool poiWaitActive = (sig.stage == STAGE_WAITING_FOR_POI);
+
+        if(!poiAvailable && !poiWaitActive)
         {
             LogPrint("[CONTEXT] Tier3_WAIT | GUID=" + IntegerToString(sig.m_guid) +
-                     " | LTF CISD not yet present" +
+                     " | POI not yet available" +
                      " | entryTf=" + EnumToString(entryTf) +
                      " | signal=" + (isBullish ? "BULL" : "BEAR") +
-                     " | stage=STAGE_WAITING_FOR_CISD", LOG_LEVEL_INFO);
-
-            // Signal must wait for LTF CISD
-            g_activeSignal[idx].TransitionStage(STAGE_WAITING_FOR_CISD);
+                     " | stage=" + EnumToString(sig.stage), LOG_LEVEL_INFO);
             continue;
         }
 
         LogPrint("[CONTEXT] Tier3_PASS | GUID=" + IntegerToString(sig.m_guid) +
-                 " | LTF CISD confirmed on " + EnumToString(entryTf) +
+                 " | POI validated on Entry TF " + EnumToString(entryTf) +
                  " | stage=" + EnumToString(sig.stage), LOG_LEVEL_INFO);
-        tier3Pass = true;
+        tier3Pass = (poiAvailable || poiWaitActive);
+
+        // ═══════════════════════════════════════════════════════════════
+        // ALL THREE TIERS PASSED — Pre-STAGE_READY Affordability Gate
+        // ═══════════════════════════════════════════════════════════════
+        // Per AGENTS.md §VII and Prompt 5: Use OrderCalcProfit to verify
+        // that the structural SL distance is affordable under the
+        // synchronized 1% risk budget BEFORE allowing STAGE_READY.
+        // This prevents signals from reaching execution readiness with
+        // an unaffordable stop loss (the "hollow readiness" problem).
+        if(tier1Pass && tier2Pass && tier3Pass && sig.stop_loss > 0.0 && sig.entry_price > 0.0)
+        {
+            SSymbolProfile spAR = SY_GetProfile(_Symbol);
+            double minLotAR = spAR.volumeMin;
+            double accountEqAR = AccountInfoDouble(ACCOUNT_EQUITY);
+            double riskAmtAR = accountEqAR * (InpRiskPercent / 100.0);
+
+            if(minLotAR > 0.0 && accountEqAR > 0.0 && riskAmtAR > 0.0)
+            {
+                // VERBATIM REPAIR: Manual tickValue/tickSize formula — no OrderCalcProfit
+                double tickValAR = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+                double tickSzAR = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+                double slDistAR = MathAbs(sig.entry_price - sig.stop_loss);
+                double minRiskAR = 0.0;
+
+                if(tickValAR > 0.0 && tickSzAR > 0.0 && slDistAR > 0.0)
+                {
+                    minRiskAR = (slDistAR / tickSzAR) * tickValAR * minLotAR;
+                }
+
+                if(minRiskAR > 0.0)
+                {
+                    LogPrint("[AFFORD_CHECK] GUID=" + IntegerToString(sig.m_guid) +
+                             " | entry=" + DoubleToString(sig.entry_price, _Digits) +
+                             " | sl=" + DoubleToString(sig.stop_loss, _Digits) +
+                             " | minLot=" + DoubleToString(minLotAR, 4) +
+                             " | minRisk=" + DoubleToString(minRiskAR, 2) +
+                             " | budget=" + DoubleToString(riskAmtAR, 2) +
+                             " | method=formula", LOG_LEVEL_INFO);
+
+                    if(minRiskAR > riskAmtAR)
+                    {
+                        LogPrint("[AFFORD_CHECK_BLOCK] GUID=" + IntegerToString(sig.m_guid) +
+                                 " | reason=MINLOT_RISK_EXCEEDS_BUDGET" +
+                                 " | minRisk=" + DoubleToString(minRiskAR, 2) +
+                                 " > budget=" + DoubleToString(riskAmtAR, 2), LOG_LEVEL_WARN);
+                        g_activeSignal[idx].TransitionStage(STAGE_EXPIRED);
+                        continue;
+                    }
+
+                    LogPrint("[AFFORD_CHECK_PASS] GUID=" + IntegerToString(sig.m_guid) +
+                             " | minRisk=" + DoubleToString(minRiskAR, 2) +
+                             " <= budget=" + DoubleToString(riskAmtAR, 2), LOG_LEVEL_INFO);
+                }
+                else
+                {
+                    LogPrint("[AFFORD_CHECK_FAIL] Manual calc failed for affordability check | GUID=" +
+                             IntegerToString(sig.m_guid) +
+                             " | tickVal=" + DoubleToString(tickValAR, 8) +
+                             " | tickSz=" + DoubleToString(tickSzAR, 8) +
+                             " | slDist=" + DoubleToString(slDistAR, _Digits), LOG_LEVEL_WARN);
+                }
+            }
+        }
 
         // ═══════════════════════════════════════════════════════════════
         // ALL THREE TIERS PASSED
@@ -1830,7 +1909,7 @@ bool ValidateTopDownContext(BranchContext &ctx, const string symbol)
         // Populate context tracker for telemetry exposure
         g_contextTracker.d1Bias = d1Bias;
         g_contextTracker.htfCisdConfirmed = htfCisd;
-        g_contextTracker.ltfCisdConfirmed = ltfCisd;
+        g_contextTracker.ltfCisdConfirmed = poiAvailable;
         g_contextTracker.activeTier = 3;
 
         if(htfCisd)

@@ -355,8 +355,9 @@ double SY_NormalizeLot(string symbol, double lot)
 
 //+------------------------------------------------------------------+
 //| SY_ComputeMaxLoss — Compute maximum loss in account currency     |
-//| using broker's OrderCalcProfit as primary. Falls back to calc-   |
-//| mode-aware manual formula only if broker call fails.            |
+//| VERBATIM REPAIR: Universal Risk Sincerity (§V)                   |
+//| Uses tickValue/tickSize formula directly — no OrderCalcProfit.   |
+//| Avoids 100x 'pips mode' inflation in the MT5 tester.            |
 //+------------------------------------------------------------------+
 double SY_ComputeMaxLoss(
    string symbol,
@@ -369,28 +370,6 @@ double SY_ComputeMaxLoss(
    if(volume <= 0.0 || entryPrice <= 0.0 || stopLoss <= 0.0)
       return 0.0;
 
-   double brokerLoss = 0.0;
-   if(OrderCalcProfit((ENUM_ORDER_TYPE)orderType, symbol, volume, entryPrice, stopLoss, brokerLoss))
-   {
-      LogPrint("[LOT_CALCPROFIT] sym=" + symbol +
-               " | orderType=" + IntegerToString(orderType) +
-               " | volume=" + DoubleToString(volume, 4) +
-               " | entry=" + DoubleToString(entryPrice, _Digits) +
-               " | sl=" + DoubleToString(stopLoss, _Digits) +
-               " | rawProfit=" + DoubleToString(brokerLoss, 2) +
-               " | source=OrderCalcProfit", LOG_LEVEL_DEBUG);
-      if(brokerLoss < 0.0)
-         return MathAbs(brokerLoss);
-      return 0.0;
-   }
-
-   LogPrint("[LOT_CALCPROFIT] OrderCalcProfit failed | sym=" + symbol +
-            " | orderType=" + IntegerToString(orderType) +
-            " | volume=" + DoubleToString(volume, 4) +
-            " | entry=" + DoubleToString(entryPrice, _Digits) +
-            " | sl=" + DoubleToString(stopLoss, _Digits) +
-            " | fallback=formula", LOG_LEVEL_WARN);
-
    SSymbolProfile sp = SY_GetProfile(symbol);
    if(!sp.isValid)
       return 0.0;
@@ -399,7 +378,7 @@ double SY_ComputeMaxLoss(
    double tickSz = sp.tickSize;
    double tickVal = sp.tickValue;
 
-   if(tickSz <= 0.0 || tickVal <= 0.0)
+   if(tickSz <= 0.0 || tickVal <= 0.0 || slDist <= 0.0)
       return 0.0;
 
    double ticks = slDist / tickSz;
@@ -408,10 +387,14 @@ double SY_ComputeMaxLoss(
    if(loss <= 0.0)
       return 0.0;
 
-   LogPrint("[LOT_CALCPROFIT] fallback formula | sym=" + symbol +
-            " | ticks=" + DoubleToString(ticks, 2) +
-            " | tickVal=" + DoubleToString(tickVal, 8) +
+   LogPrint("[LOT_CALCPROFIT] sym=" + symbol +
             " | volume=" + DoubleToString(volume, 4) +
+            " | entry=" + DoubleToString(entryPrice, _Digits) +
+            " | sl=" + DoubleToString(stopLoss, _Digits) +
+            " | slDist=" + DoubleToString(slDist, _Digits) +
+            " | tickSz=" + DoubleToString(tickSz, 8) +
+            " | tickVal=" + DoubleToString(tickVal, 8) +
+            " | ticks=" + DoubleToString(ticks, 2) +
             " | loss=" + DoubleToString(loss, 2) +
             " | source=formula", LOG_LEVEL_DEBUG);
    return loss;
@@ -506,25 +489,27 @@ bool SY_ValidateSymbol(
          return false;
       }
 
+      double tickSzVal = sp.tickSize;
+      double tickValVal = sp.tickValue;
+      double slDistVal = MathAbs(entryPrice - stopLoss);
       double brokerLoss = 0.0;
-      if(OrderCalcProfit((ENUM_ORDER_TYPE)orderType, symbol, volume, entryPrice, stopLoss, brokerLoss))
+      if(tickSzVal > 0.0 && tickValVal > 0.0 && slDistVal > 0.0)
       {
+         brokerLoss = -((slDistVal / tickSzVal) * tickValVal * volume);
          Print("[LOT_CALCPROFIT] validate | sym=" + symbol +
-               " | orderType=" + IntegerToString(orderType) +
                " | volume=" + DoubleToString(volume, 4) +
                " | entry=" + DoubleToString(entryPrice, _Digits) +
                " | sl=" + DoubleToString(stopLoss, _Digits) +
+               " | slDist=" + DoubleToString(slDistVal, _Digits) +
                " | rawProfit=" + DoubleToString(brokerLoss, 2) +
-               " | source=OrderCalcProfit");
+               " | source=formula");
       }
       else
       {
-         Print("[LOT_CALC_FAIL] OrderCalcProfit failed | sym=" + symbol +
-               " | orderType=" + IntegerToString(orderType) +
-               " | volume=" + DoubleToString(volume, 4) +
-               " | entry=" + DoubleToString(entryPrice, _Digits) +
-               " | sl=" + DoubleToString(stopLoss, _Digits) +
-               " | err=" + IntegerToString(GetLastError()));
+         Print("[LOT_CALC_FAIL] Manual calc failed | sym=" + symbol +
+               " | tickSz=" + DoubleToString(tickSzVal, 8) +
+               " | tickVal=" + DoubleToString(tickValVal, 8) +
+               " | slDist=" + DoubleToString(slDistVal, _Digits));
          failReason = "PROFIT_CALC_FAILED";
          return false;
       }

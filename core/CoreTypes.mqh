@@ -185,12 +185,38 @@ enum ENUM_LOG_LEVEL
 ENUM_LOG_LEVEL g_logLevel = LOG_LEVEL_INFO;
 
 //+------------------------------------------------------------------+
+//| SSE_CISDResult — CISD detection result with structural data      |
+//| Used by SSE_DetectCISD in StructuralStateEngine.mqh to return    |
+//| confirmation status plus the structural swing price for SL       |
+//| anchoring. Defined here (before StructuralStateEngine.mqh) so    |
+//| that all consumers (BranchEvaluator, ClosureEngine, ExitEngine)  |
+//| have access without include-order dependencies.                  |
+//+------------------------------------------------------------------+
+struct SSE_CISDResult
+{
+    bool   confirmed;         // true if CISD confirmed
+    double swingPrice;        // Protected swing price (low for buy, high for sell)
+    double seriesOpen;        // Open price of the initiating candle of the delivery series
+    int    swingIndex;        // Bar index of the swing point
+    int    seriesStartIndex;  // Bar index of the initiating candle
+
+    void Reset()
+    {
+        confirmed       = false;
+        swingPrice      = 0.0;
+        seriesOpen      = 0.0;
+        swingIndex      = -1;
+        seriesStartIndex = -1;
+    }
+};
+
+//+------------------------------------------------------------------+
 //| ENUM_CLOSURE_MODE — Closure Signal Decision Mode                 |
 //+------------------------------------------------------------------+
 enum ENUM_CLOSURE_MODE
 {
-   CLOSURE_MODE_CONFIRMATION = 0,
-   CLOSURE_MODE_ANTICIPATION = 1
+   CLOSURE_MODE_ANTICIPATION = 1, // Match EntryMode (MODE_ANTICIPATION = 1)
+   CLOSURE_MODE_CONFIRMATION = 2  // Match EntryMode (MODE_CONFIRMATION = 2)
 };
 
 //+------------------------------------------------------------------+
@@ -416,7 +442,7 @@ bool IsValidC3Setup(const SClosureSignal &signal)
     if(signal.type != CLOSURE_C3)
        return false;
 
-    // Per AGENTS.md §XVI Gate 4: T-Spot zone must be valid, entry_price mapped later via EE_MapC3POI
+    // Per AGENTS.md §XVI Gate 4: T-Spot zone must be valid (entry_price already mapped before Lock per §II)
     if(signal.tSpotMin <= 0.0 || signal.tSpotMax <= 0.0 || signal.tSpotMin >= signal.tSpotMax)
     {
        LogPrint("[C3_LOCK_FAILED] Invalid T-Spot zone | tSpotMin=" + DoubleToString(signal.tSpotMin, _Digits) +
@@ -435,11 +461,12 @@ bool IsValidC3Setup(const SClosureSignal &signal)
 //+------------------------------------------------------------------+
 bool SLockedSignal::Lock(SClosureSignal &signal, int id, ENUM_EXECUTION_BRANCH execBranch, ENUM_TIMEFRAMES tf)
 {
-   // [STATE_RESET] Force stage to STAGE_NONE at lock entry to eliminate garbage-stage [STATE_ILLEGAL] events
-   if(this.stage != STAGE_NONE)
+   // VERBATIM REPAIR: Zombie Guard & Lock Integrity (§III)
+   // Hard-reject terminal signals
+   if(this.stage == STAGE_EXPIRED)
    {
-       LogPrint("[STATE_RESET] Force-resetting stage from " + EnumToString(this.stage) + " to STAGE_NONE | GUID=" + IntegerToString(this.m_guid), LOG_LEVEL_WARN);
-       this.stage = STAGE_NONE;
+       LogPrint("[ZOMBIE_BLOCK] Lock rejected — signal is EXPIRED | GUID=" + IntegerToString(this.m_guid), LOG_LEVEL_ERROR);
+       return false;
    }
 
    // [LOCK_CALL] Log before any processing
@@ -459,9 +486,9 @@ bool SLockedSignal::Lock(SClosureSignal &signal, int id, ENUM_EXECUTION_BRANCH e
     LogPrint("[GUID_ASSIGNED] sole_authority | GUID=" + IntegerToString(this.m_guid) +
              " | closure=" + EnumToString(signal.type), LOG_LEVEL_INFO);
 
-// [ENTRY_PRICE_VALIDATION] - Per AGENTS.md §XVI Gate 4: C3 uses T-Spot zone, not fixed entry
-       // C2/C4 require entry_price > 0, C3 only requires valid tSpot zone
-       if(signal.type != CLOSURE_C3 && signal.entry_price <= 0)
+// [ENTRY_PRICE_VALIDATION] — Per §II Law of Synchronous Mapping
+// NO signal may be locked with entry_price=0.0. Mapping must occur before Lock.
+       if(signal.entry_price <= 0)
        {
           LogPrint("[ENTRY_CANDIDATE_INVALID] entry_price=0 blocked at Lock | GUID=" + IntegerToString(m_guid) +
                    " | type=" + EnumToString(signal.type), LOG_LEVEL_ERROR);
@@ -469,7 +496,7 @@ bool SLockedSignal::Lock(SClosureSignal &signal, int id, ENUM_EXECUTION_BRANCH e
        }
 
        // [C3_VALIDATE] C3-specific validation per Constitution §XVI
-       // Required at Lock: T-Spot zone validity (entry_price mapped later via EE_MapC3POI)
+       // Required at Lock: T-Spot zone validity (entry_price already mapped via EE_MapC3POI before Lock per §II)
        if(signal.type == CLOSURE_C3)
        {
           if(!IsValidC3Setup(signal))
@@ -497,9 +524,10 @@ bool SLockedSignal::Lock(SClosureSignal &signal, int id, ENUM_EXECUTION_BRANCH e
       }
 
     // P8 Fix: Removed duplicate [SIGNAL_LOCKED] - detailed log happens in ClosureEngine (C2/C3)
-   branchId = execBranch;
-   this.branch = execBranch;
-   symbol = _Symbol;
+    branchId = execBranch;
+    this.branch = execBranch;
+    entryTF = tf;
+    symbol = _Symbol;
    retraceAttempts = 0;
    lastAttemptTime = 0;
 
@@ -665,6 +693,24 @@ m_c3CisdConfirmed = false; // Will be set true after CISD check on LTF
     }
 
     return true;
+}
+
+// VERBATIM REPAIR: Pass-Through Lock (§IV)
+bool SLockedSignal::Lock(double scannerMin, double scannerMax) {
+    this.m_guid = GenerateSignalGUID();
+    LogPrint("[GUID_ASSIGNED] pass-through | GUID=" + IntegerToString(this.m_guid), LOG_LEVEL_INFO);
+    if(this.entry_price <= 0.0) {
+        LogPrint("[ENTRY_CANDIDATE_INVALID] pass-through Lock blocked | GUID=" + IntegerToString(this.m_guid), LOG_LEVEL_ERROR);
+        return false;
+    }
+    this.candidateEntryPrice = this.entry_price;
+    this.requestedEntryPrice = this.entry_price;
+    this.tSpotMin = scannerMin;
+    this.tSpotMax = scannerMax;
+    if(this.m_detectionTime <= 0)
+        this.m_detectionTime = TimeCurrent();
+    this.stage = STAGE_LOCKED;
+    return (this.tSpotMax > 0); 
 }
 
 //+------------------------------------------------------------------+
@@ -888,5 +934,14 @@ int g_continuationContextCount = 0;
 //| ClosureState — Per-branch C2/C3/C4 state (included AFTER SLockedSignal) |
 //+------------------------------------------------------------------+
 #include <OmakFxYO/core/ClosureState.mqh>
+
+//+------------------------------------------------------------------+
+//| IsSignalLiveForNextTick — Liveness check before MEM_SANITIZED     |
+//+------------------------------------------------------------------+
+bool IsSignalLiveForNextTick(const SLockedSignal &sig) {
+    // A signal is live if it is READY to execute or has already started attempts
+    if (sig.stage == STAGE_READY || sig.executionAttempts > 0) return true;
+    return false;
+}
 
 #endif // OMAK_CORETYPES_MQH

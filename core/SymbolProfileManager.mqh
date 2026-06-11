@@ -13,10 +13,17 @@
 
 static SSymbolProfile g_symbolProfile;
 
+// VERBATIM REPAIR: Symbol Persistence Guard (§4)
 bool SPM_InitSymbolProfile(const string symbol)
 {
+    // If symbol is lost, force-default to current chart context
+    string activeSymbol = (symbol == "" || symbol == NULL) ? _Symbol : symbol;
+
     // Delegate ALL broker profile building to SymbolIntelligence layer
-    SSymbolProfile profile = SY_BuildProfile(symbol);
+    SSymbolProfile profile = SY_BuildProfile(activeSymbol);
+    profile.symbol = activeSymbol;
+    profile.tickSize = SymbolInfoDouble(activeSymbol, SYMBOL_TRADE_TICK_SIZE);
+    profile.tickValue = SymbolInfoDouble(activeSymbol, SYMBOL_TRADE_TICK_VALUE);
     // preserve SY_BuildProfile's validity decision
 
     if(profile.volumeMin <= 0.0)
@@ -25,7 +32,7 @@ bool SPM_InitSymbolProfile(const string symbol)
        profile.volumeMin = 0.0;
     }
 
-    profile.spread = (int)SymbolInfoInteger(symbol, SYMBOL_SPREAD);
+    profile.spread = (int)SymbolInfoInteger(activeSymbol, SYMBOL_SPREAD);
 
     // Derive classification-boolean helpers from authoritative SymbolIntelligence classification
     ENUM_SYM_CLASSIFICATION cl = profile.classification;
@@ -34,15 +41,15 @@ bool SPM_InitSymbolProfile(const string symbol)
     profile.isMetal     = (cl == SYM_CLASS_METAL_SPOT);
     profile.isForex     = (cl == SYM_CLASS_FOREX_MAJOR || cl == SYM_CLASS_FOREX_MINOR || cl == SYM_CLASS_FOREX_EXOTIC);
 
-    profile.sessionsExist = SPM_CheckSessionsExist(symbol);
+    profile.sessionsExist = SPM_CheckSessionsExist(activeSymbol);
     if(profile.sessionsExist)
     {
-        SPM_ComputeNextSessionTimes(symbol, profile);
+        SPM_ComputeNextSessionTimes(activeSymbol, profile);
     }
 
     g_symbolProfile = profile;
 
-    LogPrint("[SYM_CLASSIFIED] symbol=" + symbol + " | class=" + EnumToString(cl) + " | owner=SPM_InitSymbolProfile", LOG_LEVEL_INFO);
+    LogPrint("[SYM_CLASSIFIED] symbol=" + activeSymbol + " | class=" + EnumToString(cl) + " | owner=SPM_InitSymbolProfile", LOG_LEVEL_INFO);
     LogPrint("[SYMBOL_PROFILE] class=" + EnumToString(cl) +
              " | ticksize=" + DoubleToString(profile.tickSize, 8) +
              " | tickvalue=" + DoubleToString(profile.tickValue, 8) +
@@ -54,7 +61,7 @@ bool SPM_InitSymbolProfile(const string symbol)
              " | digits=" + IntegerToString(profile.digits) +
              " | spread=" + IntegerToString(profile.spread) +
              " | sessions=" + (profile.sessionsExist ? "YES" : "NO (24/7)") +
-             " | sym=" + symbol +
+             " | sym=" + activeSymbol +
              " | calcMode=" + IntegerToString(profile.calcMode) +
              " | marginCurrency=" + profile.marginCurrency +
              " | profitCurrency=" + profile.profitCurrency,

@@ -71,7 +71,7 @@ struct SLogBudgetConfig
     void SetDefaults()
     {
         maxLogsPerTick = 5;
-        maxLogsPerBar = 50;
+        maxLogsPerBar = 5000;
         maxLogsPerModule = 20;
         maxLogsPerSession = 500000;  // Increased from 100K: sufficient for DEBUG logs across full backtest (e.g., 3+ months M5)
 
@@ -84,6 +84,12 @@ struct SLogBudgetConfig
         enableStructured = false;
         enableTraceChannel = false;
         perBarControl = true;
+    }
+
+    void SetBacktestMode()
+    {
+        this.maxLogsPerBar = 5000;
+        this.perBarControl = true;
     }
 };
 
@@ -237,7 +243,7 @@ struct SLogPerBarControl
     {
         lastBarTime = 0;
         logsThisBar = 0;
-        maxLogsPerBar = 50;
+        maxLogsPerBar = 5000;
     }
 
     bool CanEmit(datetime barTime)

@@ -108,196 +108,208 @@ bool InZone(double price, const STSpotZone &zone)
 }
 
 //+------------------------------------------------------------------+
-//| EE_ScanPDArray — Scan entry TF bars for PD Array inside zone    |
+//| ScanForOB — Scan entry TF for Order Block inside zone            |
 //|                                                                  |
-//| Scans bars [1 .. scanBars-1] on the entry TF, looking for       |
-//| Breaker Blocks, Fair Value Gaps, Order Blocks, and Inversion     |
-//| FVGs whose reference price falls within the T-Spot zone.         |
-//|                                                                  |
-//| PD Array priority:                                                |
-//|   1. Breaker Block (last candle before a significant move)       |
-//|   2. Fair Value Gap (three-candle imbalance)                     |
-//|   3. Order Block (last down/up candle before reversal)           |
-//|   4. Inversion FVG (FVG that was traded through and reclaimed)   |
-//|                                                                  |
-//| If multiple PD Arrays found, selects the one closest to          |
-//| Equilibrium (per AGENTS.md §XVII).                               |
-//|                                                                  |
-//| @param symbol        Trading symbol                              |
-//| @param entryTf       Entry timeframe (M5 for Branch A, M15 for B)|
-//| @param zone          Pre-computed T-Spot zone                    |
-//| @param scanBars      Number of bars to scan (default 50)         |
-//| @param bullish       True for BUY, false for SELL                |
-//| @param result        Output: found PD Array details              |
+//| OB: Candle whose open is inside the zone.                        |
 //+------------------------------------------------------------------+
-void EE_ScanPDArray(
-   const string symbol,
-   ENUM_TIMEFRAMES entryTf,
-   const STSpotZone &zone,
-   int scanBars,
-   bool bullish,
-   SPDArrayResult &result
-)
+bool ScanForOB(const string symbol, ENUM_TIMEFRAMES entryTF, double zoneLow, double zoneHigh, double &outPrice)
 {
-   result.Reset();
-
-   if(scanBars < 3)
-      scanBars = 3;
-
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
-   ZeroMemory(rates);
+   int copied = CopyRates(symbol, entryTF, 0, 52, rates);
+   if(copied < 5) return false;
 
-   int copied = CopyRates(symbol, entryTf, 0, scanBars + 2, rates);
-   if(copied < 5)
-   {
-      LogPrint("[TSPOT_POI_MISSING] Insufficient bars on " + EnumToString(entryTf) +
-               " | copied=" + IntegerToString(copied), LOG_LEVEL_DEBUG);
-      return;
-   }
-
-   int maxBars = MathMin(scanBars, copied - 2); // reserve 2 bars for FVG scan
-
-   // Scan each bar for PD Arrays within the zone
+   int maxBars = MathMin(50, copied - 1);
    for(int i = 1; i < maxBars; i++)
    {
-      // --- Breaker Block Detection (Priority 1) ---
-      // BB: The candle whose high/low was structurally broken by the next candle.
-      // For bullish: candle i+1 closes above candle i's high → candle i is the Breaker Block.
-      // For bearish: candle i+1 closes below candle i's low → candle i is the Breaker Block.
-      // Entry price = open of the Breaker Block candle, if inside zone.
-      double bbOpen = rates[i].open;
-      if(InZone(bbOpen, zone) && i + 1 < maxBars)
-      {
-         bool isBreaker = false;
-         if(bullish)
-            isBreaker = (rates[i+1].close > rates[i].high);
-         else
-            isBreaker = (rates[i+1].close < rates[i].low);
-
-         if(isBreaker)
-         {
-            double dist = MathAbs(bbOpen - zone.equilibrium);
-            if(!result.found ||
-               dist < result.distanceFromEq ||
-               (dist == result.distanceFromEq && result.type > PD_BREAKER_BLOCK))
-            {
-               result.found = true;
-               result.price = bbOpen;
-               result.type = PD_BREAKER_BLOCK;
-               result.barIndex = i;
-               result.distanceFromEq = dist;
-            }
-         }
-      }
-
-      // --- Order Block Detection (Priority 3) ---
-      // OB: The last candle before a significant move in the target direction.
-      // For bullish: look for down-close candle (close < open) that precedes up moves.
-      // For bearish: look for up-close candle (close > open) that precedes down moves.
       double obOpen = rates[i].open;
-      if(InZone(obOpen, zone))
-      {
-         // Check if this is a meaningful OB (has a clear close direction)
-         bool isDownClose = (rates[i].close < rates[i].open);
-         bool isUpClose   = (rates[i].close > rates[i].open);
+      if(obOpen < zoneLow || obOpen > zoneHigh) continue;
 
-         if(isDownClose || isUpClose)
-         {
-            double dist = MathAbs(obOpen - zone.equilibrium);
+      bool isDownClose = (rates[i].close < rates[i].open);
+      bool isUpClose   = (rates[i].close > rates[i].open);
+      if(!isDownClose && !isUpClose) continue;
 
-            // Accept as OB if no better candidate exists
-            if(!result.found ||
-               dist < result.distanceFromEq ||
-               (dist == result.distanceFromEq && result.type > PD_ORDER_BLOCK))
-            {
-               result.found = true;
-               result.price = obOpen;
-               result.type = PD_ORDER_BLOCK;
-               result.barIndex = i;
-               result.distanceFromEq = dist;
-            }
-         }
-      }
+      outPrice = obOpen;
+      return true;
+   }
+   return false;
+}
 
-      // --- Fair Value Gap Detection ---
-      // FVG: Three-candle pattern where candle i+1 high < candle i low (bullish)
-      // or candle i+1 low > candle i high (bearish), leaving an imbalance.
-      double fvgRef = 0.0;
-      ENUM_PD_ARRAY_TYPE fvgType = PD_NONE;
-      bool isBullishGap = false;
-      bool isBearishGap = false;
+//+------------------------------------------------------------------+
+//| ScanForFVG — Scan entry TF for Fair Value Gap (0.5 midpoint)     |
+//|                                                                  |
+//| FVG: Three-candle imbalance. Entry price = gap midpoint (0.5).   |
+//+------------------------------------------------------------------+
+bool ScanForFVG(const string symbol, ENUM_TIMEFRAMES entryTF, double zoneLow, double zoneHigh, double &outPrice)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(symbol, entryTF, 0, 52, rates);
+   if(copied < 5) return false;
 
+   int maxBars = MathMin(50, copied - 2);
+   for(int i = 1; i < maxBars; i++)
+   {
       double gapHigh = MathMin(rates[i+1].high, rates[i-1].high);
       double gapLow  = MathMax(rates[i+1].low,  rates[i-1].low);
+      if(gapHigh >= gapLow) continue;
 
-      if(gapHigh < gapLow) // gap exists
+      bool isBullishGap = (rates[i+1].high < rates[i-1].low);
+      bool isBearishGap = (rates[i+1].low  > rates[i-1].high);
+      if(!isBullishGap && !isBearishGap) continue;
+
+      double fvgMid = (gapHigh + gapLow) / 2.0;
+      if(fvgMid < zoneLow || fvgMid > zoneHigh) continue;
+
+      outPrice = fvgMid;
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| ScanForIFVG — Scan entry TF for Inversion FVG                    |
+//|                                                                  |
+//| IFVG: A gap that price has aggressively closed through.          |
+//+------------------------------------------------------------------+
+bool ScanForIFVG(const string symbol, ENUM_TIMEFRAMES entryTF, double zoneLow, double zoneHigh, double &outPrice)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(symbol, entryTF, 0, 52, rates);
+   if(copied < 5) return false;
+
+   int maxBars = MathMin(50, copied - 2);
+   for(int i = 1; i < maxBars; i++)
+   {
+      double gapHigh = MathMin(rates[i+1].high, rates[i-1].high);
+      double gapLow  = MathMax(rates[i+1].low,  rates[i-1].low);
+      if(gapHigh >= gapLow) continue;
+
+      bool isBullishGap = (rates[i+1].high < rates[i-1].low);
+      bool isBearishGap = (rates[i+1].low  > rates[i-1].high);
+      if(!isBullishGap && !isBearishGap) continue;
+
+      // Zone overlap check (not strict midpoint containment)
+      if(gapHigh <= zoneLow || gapLow >= zoneHigh) continue;
+
+      // Check reclamation: price closed through the gap
+      for(int j = i - 1; j >= 0; j--)
       {
-         // Bullish FVG: low of candle i (the gap's lower boundary)
-         // Bearish FVG: high of candle i (the gap's upper boundary)
-         isBullishGap = (rates[i+1].high < rates[i-1].low);
-         isBearishGap = (rates[i+1].low  > rates[i-1].high);
+         bool reclaimed = false;
+         if(isBullishGap)
+            reclaimed = (rates[j].close < gapLow);
+         else if(isBearishGap)
+            reclaimed = (rates[j].close > gapHigh);
 
-         if(isBullishGap || isBearishGap)
+         if(reclaimed)
          {
-            // Use the gap midpoint as reference for zone check
-            fvgRef = (gapHigh + gapLow) / 2.0;
-            fvgType = PD_FVG;
-
-            if(InZone(fvgRef, zone))
-            {
-               double dist = MathAbs(fvgRef - zone.equilibrium);
-
-               if(!result.found ||
-                  dist < result.distanceFromEq ||
-                  (dist == result.distanceFromEq && result.type > PD_FVG))
-               {
-                  // Entry price = 0.5 level of the gap
-                  result.found = true;
-                  result.price = fvgRef;
-                  result.type = PD_FVG;
-                  result.barIndex = i;
-                  result.distanceFromEq = dist;
-               }
-            }
-         }
-      }
-
-      // --- Inversion FVG Detection ---
-      // InvFVG: A previously unfilled FVG that was traded through and reclaimed.
-      // Simplified: look for a FVG where price later returned into the gap
-      // and closed beyond the opposite side.
-      // For now, detected as FVG where subsequent bars show reclamation.
-      if(fvgType == PD_FVG && InZone(fvgRef, zone))
-      {
-         // Check if price reclaimed the FVG (traded through and closed beyond)
-         for(int j = i - 1; j >= 0; j--)
-         {
-            bool reclaimed = false;
-            if(isBullishGap)
-               reclaimed = (rates[j].close < gapLow); // closed below the gap
-            else if(isBearishGap)
-               reclaimed = (rates[j].close > gapHigh); // closed above the gap
-
-            if(reclaimed)
-            {
-               double dist = MathAbs(fvgRef - zone.equilibrium);
-
-               if(!result.found ||
-                  dist < result.distanceFromEq ||
-                  (dist == result.distanceFromEq && result.type > PD_INVERSION_FVG))
-               {
-                  result.found = true;
-                  result.price = fvgRef;
-                  result.type = PD_INVERSION_FVG;
-                  result.barIndex = i;
-                  result.distanceFromEq = dist;
-               }
-               break;
-            }
+            outPrice = (gapHigh + gapLow) / 2.0;
+            return true;
          }
       }
    }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| CheckBreakerCondition — Check if a bar forms a Breaker Block     |
+//|                                                                  |
+//| A Breaker Block is a structural swing that was broken (swept)    |
+//| and now serves as support/resistance. Entry price = swing        |
+//| point open within the T-Spot zone.                              |
+//+------------------------------------------------------------------+
+bool CheckBreakerCondition(const string symbol, ENUM_TIMEFRAMES tf, int bar, double low, double high, double &outEntry)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(symbol, tf, 0, 52, rates);
+   if(copied < 5) return false;
+
+   if(bar < 2 || bar >= copied - 2) return false;
+
+   // Bearish Breaker Block: swing high broken, level acts as resistance
+   if(rates[bar].high > rates[bar-1].high && rates[bar].high > rates[bar-2].high &&
+      rates[bar].high >= rates[bar+1].high && rates[bar].high >= rates[bar+2].high)
+   {
+      bool broken = false;
+      for(int j = bar - 1; j >= 0; j--)
+      {
+         if(rates[j].high > rates[bar].high + 0.5 * _Point)
+         {
+            broken = true;
+            break;
+         }
+      }
+      if(!broken) return false;
+
+      double level = rates[bar].open;
+      if(level >= low - 0.5 * _Point && level <= high + 0.5 * _Point)
+      {
+         outEntry = level;
+         return true;
+      }
+   }
+
+   // Bullish Breaker Block: swing low broken, level acts as support
+   if(rates[bar].low < rates[bar-1].low && rates[bar].low < rates[bar-2].low &&
+      rates[bar].low <= rates[bar+1].low && rates[bar].low <= rates[bar+2].low)
+   {
+      bool broken = false;
+      for(int j = bar - 1; j >= 0; j--)
+      {
+         if(rates[j].low < rates[bar].low - 0.5 * _Point)
+         {
+            broken = true;
+            break;
+         }
+      }
+      if(!broken) return false;
+
+      double level = rates[bar].open;
+      if(level >= low - 0.5 * _Point && level <= high + 0.5 * _Point)
+      {
+         outEntry = level;
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| ScanForBreakerBlock — Mechanical BK detection (highest priority) |
+//|                                                                  |
+//| VERBATIM REPAIR: Investigation VIII - Breaker Block Priority     |
+//| Scans the last 20 bars on the entry TF for a Breaker Block       |
+//| within the T-Spot zone. BK is the highest-priority PD Array.     |
+//+------------------------------------------------------------------+
+bool ScanForBreakerBlock(const string symbol, ENUM_TIMEFRAMES tf, double low, double high, double &outEntry)
+{
+   int total = iBars(symbol, tf);
+   for(int i = 1; i < 20 && i < total; i++)
+   {
+      if(CheckBreakerCondition(symbol, tf, i, low, high, outEntry)) return true;
+   }
+   return false;
+}
+
+// VERBATIM REPAIR: Trinity Scanner Sequence (§3)
+bool EE_ScanPDArray(const string symbol, ENUM_TIMEFRAMES tf, double low, double high, double &outEntry) {
+    // Priority 1: Breaker Block (BK)
+    if (ScanForBreakerBlock(symbol, tf, low, high, outEntry)) return true;
+    
+    // Priority 2: Order Block (OB)
+    if (ScanForOB(symbol, tf, low, high, outEntry)) return true;
+    
+    // Priority 3: FVG (0.5 Midpoint)
+    if (ScanForFVG(symbol, tf, low, high, outEntry)) return true;
+    
+    // Priority 4: Inversion FVG (IFVG)
+    if (ScanForIFVG(symbol, tf, low, high, outEntry)) return true;
+
+    outEntry = 0.0;
+    return false; // Hard Reject: No PD Array Oxygen found
 }
 
 //+------------------------------------------------------------------+
@@ -333,11 +345,11 @@ ENUM_POI_STATUS EE_MapPOI(
    STSpotZone zone;
    zone.Compute(htfHigh, htfLow, bullish);
 
-   // Step 2: Scan for PD Array
-   SPDArrayResult result;
-   EE_ScanPDArray(symbol, entryTf, zone, 50, bullish, result);
+   // Step 2: Scan for PD Array using Trinity scanner
+   double outEntry = 0.0;
+   bool found = EE_ScanPDArray(symbol, entryTf, zone.low, zone.high, outEntry);
 
-   if(!result.found)
+   if(!found)
    {
       candidateEntryPrice = 0.0;
       mappedPrice = 0.0;
@@ -352,25 +364,13 @@ ENUM_POI_STATUS EE_MapPOI(
    }
 
    // Step 3: Assign entry price
-   candidateEntryPrice = result.price;
-   mappedPrice = result.price;
-   mappedType = result.type;
+   candidateEntryPrice = outEntry;
+   mappedPrice = outEntry;
+   mappedType = PD_NONE;
 
    // Step 4: Log the mapping
-   string typeStr = "";
-   switch(result.type)
-   {
-      case PD_BREAKER_BLOCK:  typeStr = "BREAKER_BLOCK";  break;
-      case PD_FVG:            typeStr = "FVG";            break;
-      case PD_ORDER_BLOCK:    typeStr = "ORDER_BLOCK";    break;
-      case PD_INVERSION_FVG:  typeStr = "INVERSION_FVG";  break;
-      default:                typeStr = "UNKNOWN";         break;
-   }
-
    LogPrint("[TSPOT_POI_MAPPED] on " + EnumToString(entryTf) +
-            " | type=" + typeStr +
-            " | price=" + DoubleToString(result.price, _Digits) +
-            " | bar=" + IntegerToString(result.barIndex) +
+            " | price=" + DoubleToString(outEntry, _Digits) +
             " | zone=[" + DoubleToString(zone.low, _Digits) + ", " +
             DoubleToString(zone.high, _Digits) + "]" +
             " | eq=" + DoubleToString(zone.equilibrium, _Digits) +
@@ -479,61 +479,105 @@ bool EE_CheckZoneOverlap(
 }
 
 //+------------------------------------------------------------------+
+//| ScanForPDArray — Unified PD Array scanner wrapper                |
+//|                                                                  |
+//| Per Prompt 6 / §XVII Gate 4: Scans the T-Spot zone for OB or FVG |
+//| and returns the POI price. Returns 0.0 if no POI found.          |
+//|                                                                  |
+//| @param tSpotMin  Zone lower bound                                 |
+//| @param tSpotMax  Zone upper bound                                 |
+//| @param bullish   True for BUY, false for SELL                     |
+//| @param symbol    Trading symbol                                   |
+//| @param entryTf   Entry timeframe                                  |
+//| @return POI price, or 0.0 if no PD Array found                   |
+//+------------------------------------------------------------------+
+double ScanForPDArray(double tSpotMin, double tSpotMax, bool bullish, const string symbol, ENUM_TIMEFRAMES entryTf)
+{
+   double zoneLow = MathMin(tSpotMin, tSpotMax);
+   double zoneHigh = MathMax(tSpotMin, tSpotMax);
+
+   if(zoneLow <= 0.0 || zoneHigh <= 0.0 || zoneLow >= zoneHigh)
+      return 0.0;
+
+   double outPrice = 0.0;
+   if(!EE_ScanPDArray(symbol, entryTf, zoneLow, zoneHigh, outPrice))
+      return 0.0;
+
+   return outPrice;
+}
+
+//+------------------------------------------------------------------+
 //| EE_MapC3POI — Gate 4 for C3 signals (zone via tSpotMin/Max)     |
 //|                                                                  |
-//| C3-specific function that scans Entry TF for PD Array within      |
-//| the T-Spot zone (tSpotMin/Max) and sets requestedEntryPrice.     |
-//|                                                                  |
-//| Delegates to EE_ScanPDArray for consistent PD Array detection     |
-//| across all closure types. Sets requestedEntryPrice on the signal. |
-//|                                                                  |
-//| Per AGENTS.md §XVI: T-Spot is a ZONE, not midpoint.              |
-//| If no POI found → signal.requestedEntryPrice = 0.0               |
+//| SURGICAL LOGIC: No midpoints allowed. Strict PD Array scan per   |
+//| Prompt 6 / §XVII Gate 4. Sets signal.entry_price directly.       |
 //+------------------------------------------------------------------+
-void EE_MapC3POI(SLockedSignal &signal)
+void EE_MapC3POI(SLockedSignal &sig) {
+    ENUM_TIMEFRAMES entryTf = (sig.branchId == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
+    bool bullish = (sig.direction == DIRECTION_BUY);
+    double mappedPrice = ScanForPDArray(sig.tSpotMin, sig.tSpotMax, bullish, sig.symbol, entryTf);
+    if (mappedPrice > 0) {
+        sig.entry_price = mappedPrice;
+        sig.requestedEntryPrice = mappedPrice; // CRITICAL: Pipeline check
+        sig.candidateEntryPrice = mappedPrice;
+        LogPrint("[TSPOT_POI_MAPPED] C3 | Price: " + DoubleToString(mappedPrice, _Digits) + " | Branch " + IntegerToString(g_activeBranch), LOG_LEVEL_INFO);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| EE_MapTSpotPOI — Gate 4 POI mapper (PD Array Supremacy)         |
+//|                                                                  |
+//| VERBATIM REPAIR: Gate 4 PD Array Supremacy (§XVII)              |
+//| Entry MUST be a real Order Block or FVG. Midpoint fallbacks      |
+//| are prohibited.                                                  |
+//+------------------------------------------------------------------+
+bool EE_MapTSpotPOI(SLockedSignal &sig)
 {
-   double zoneLow = MathMin(signal.tSpotMin, signal.tSpotMax);
-   double zoneHigh = MathMax(signal.tSpotMin, signal.tSpotMax);
+   ENUM_TIMEFRAMES entryTf = (sig.branch == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
+   bool bullish = (sig.direction == DIRECTION_BUY);
 
-   ENUM_TIMEFRAMES entryTf = (signal.branch == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
+   // VERBATIM REPAIR: T-Spot Boundary Law (§II)
+   // Bullish: Equilibrium to HTF Low | Bearish: Equilibrium to HTF High
+   ENUM_TIMEFRAMES anchorTF = (sig.branch == BRANCH_INTRADAY) ? PERIOD_D1 : PERIOD_W1;
+   double htfHigh = iHigh(_Symbol, anchorTF, 1);
+   double htfLow  = iLow(_Symbol, anchorTF, 1);
+   double htfRange = MathAbs(htfHigh - htfLow);
+   double equilibrium = htfLow + (htfRange * 0.5);
 
-   bool bullish = (signal.direction == DIRECTION_BUY);
-
-   // Build zone from tSpotMin/tSpotMax
-   STSpotZone zone;
-   zone.low = zoneLow;
-   zone.high = zoneHigh;
-   zone.equilibrium = (zoneLow + zoneHigh) / 2.0;
-
-   SPDArrayResult result;
-   EE_ScanPDArray(signal.symbol, entryTf, zone, 50, bullish, result);
-
-   if(!result.found)
-   {
-      signal.requestedEntryPrice = 0.0;
-      LogPrint("[TSPOT_POI_MISSING] C3 | No POI in zone [" +
-               DoubleToString(zoneLow, _Digits) + ", " + DoubleToString(zoneHigh, _Digits) + "]" +
-               " | branch=" + (signal.branch == BRANCH_INTRADAY ? "INTRADAY" : "SWING") +
-               " | entryTf=" + EnumToString(entryTf), LOG_LEVEL_INFO);
-      return;
+   if (bullish) {
+       sig.tSpotMin = htfLow;        // HTF Extreme
+       sig.tSpotMax = equilibrium;   // Midpoint
+   } else {
+       sig.tSpotMin = equilibrium;   // Midpoint
+       sig.tSpotMax = htfHigh;       // HTF Extreme
    }
 
-   signal.requestedEntryPrice = result.price;
-
-   string typeStr = "";
-   switch(result.type)
+   double zoneLow  = MathMin(sig.tSpotMin, sig.tSpotMax);
+   double zoneHigh = MathMax(sig.tSpotMin, sig.tSpotMax);
+   if(zoneLow <= 0.0 || zoneHigh <= 0.0 || zoneLow >= zoneHigh)
    {
-      case PD_BREAKER_BLOCK:  typeStr = "BREAKER_BLOCK";  break;
-      case PD_FVG:            typeStr = "FVG";            break;
-      case PD_ORDER_BLOCK:    typeStr = "ORDER_BLOCK";    break;
-      case PD_INVERSION_FVG:  typeStr = "INVERSION_FVG";  break;
-      default:                typeStr = "UNKNOWN";         break;
+      sig.entry_price = 0.0;
+      sig.requestedEntryPrice = 0.0;
+      sig.candidateEntryPrice = 0.0;
+      LogPrint("[GATE_4_REJECT] Invalid zone bounds.", LOG_LEVEL_INFO);
+      return false;
    }
 
-   LogPrint("[TSPOT_POI_MAPPED] C3 | type=" + typeStr +
-            " | price=" + DoubleToString(result.price, _Digits) +
-            " | zone=[" + DoubleToString(zoneLow, _Digits) + ", " + DoubleToString(zoneHigh, _Digits) + "]" +
-            " | entryTf=" + EnumToString(entryTf), LOG_LEVEL_INFO);
+   double mappedPrice = 0.0;
+   if(!EE_ScanPDArray(sig.symbol, entryTf, zoneLow, zoneHigh, mappedPrice))
+   {
+      sig.entry_price = 0.0;
+      sig.requestedEntryPrice = 0.0;
+      sig.candidateEntryPrice = 0.0;
+      LogPrint("[GATE_4_REJECT] T-Spot zone empty. Entry denied.", LOG_LEVEL_INFO);
+      return false;
+   }
+
+   sig.entry_price = mappedPrice;
+   sig.requestedEntryPrice = mappedPrice;
+   sig.candidateEntryPrice = mappedPrice;
+   LogPrint("[TSPOT_POI_MAPPED] Trinity scan | Price=" + DoubleToString(mappedPrice, _Digits), LOG_LEVEL_INFO);
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -549,9 +593,11 @@ bool EE_IsStageWaitingForPOI(const SLockedSignal &signal, int currentBar, int ma
 {
    if(signal.stage != STAGE_WAITING_FOR_POI)
       return false;
-   if(signal.poiWaitBarStart <= 0)
+   if(signal.m_detectionTime <= 0)
       return false;
-   int barsWaited = currentBar - signal.poiWaitBarStart;
+   ENUM_TIMEFRAMES _entryTfWait = (signal.branchId == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
+   int secondsSinceDetection = (int)(TimeCurrent() - signal.m_detectionTime);
+   int barsWaited = secondsSinceDetection / PeriodSeconds(_entryTfWait);
    if(barsWaited > maxWaitBars)
    {
       LogPrint("[POI_WAIT_EXPIRED] GUID=" + IntegerToString(signal.m_guid) +
@@ -593,28 +639,32 @@ ENUM_POI_STATUS EE_ResolvePOIWait(
    STSpotZone zone;
    zone.Compute(htfHigh, htfLow, bullish);
 
-   SPDArrayResult result;
-   EE_ScanPDArray(signal.symbol, entryTf, zone, 50, bullish, result);
+   double outPrice = 0.0;
+   bool found = EE_ScanPDArray(signal.symbol, entryTf, zone.low, zone.high, outPrice);
 
-   if(result.found)
+   if(found)
    {
-      signal.requestedEntryPrice = result.price;
+      signal.requestedEntryPrice = outPrice;
       LogPrint("[TSPOT_POI_MAPPED] Resolved from WAITING | GUID=" + IntegerToString(signal.m_guid) +
-               " | price=" + DoubleToString(result.price, _Digits) +
-               " | type=" + EnumToString(result.type) +
+               " | price=" + DoubleToString(outPrice, _Digits) +
                " | zone=[L:" + DoubleToString(zone.low, _Digits) +
                ", H:" + DoubleToString(zone.high, _Digits) + "]" +
                " | bar=" + IntegerToString(currentBar), LOG_LEVEL_INFO);
       return POI_MAPPED;
    }
 
-   if(signal.poiWaitBarStart > 0 && (currentBar - signal.poiWaitBarStart) % 5 == 0)
+   if(signal.m_detectionTime > 0)
    {
-      LogPrint("[TSPOT_POI_MISSING] Still waiting | GUID=" + IntegerToString(signal.m_guid) +
-               " | bar=" + IntegerToString(currentBar) +
-               " | waited=" + IntegerToString(currentBar - signal.poiWaitBarStart) +
-               " | zone=[L:" + DoubleToString(zone.low, _Digits) +
-               ", H:" + DoubleToString(zone.high, _Digits) + "]", LOG_LEVEL_DEBUG);
+      int secondsWaited = (int)(TimeCurrent() - signal.m_detectionTime);
+      int barsWaited = secondsWaited / PeriodSeconds(entryTf);
+      if(barsWaited > 0 && barsWaited % 5 == 0)
+      {
+         LogPrint("[TSPOT_POI_MISSING] Still waiting | GUID=" + IntegerToString(signal.m_guid) +
+                  " | barsWaited=" + IntegerToString(barsWaited) +
+                  " | secondsWaited=" + IntegerToString(secondsWaited) +
+                  " | zone=[L:" + DoubleToString(zone.low, _Digits) +
+                  ", H:" + DoubleToString(zone.high, _Digits) + "]", LOG_LEVEL_DEBUG);
+      }
    }
 
    return POI_MISSING;

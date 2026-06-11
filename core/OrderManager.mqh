@@ -682,746 +682,91 @@ string GetRetcodeDescription(uint retcode)
 }
 
 //+------------------------------------------------------------------+
-//| ExecutionGatePass — Final pre-execution validation gate           |
+//| ResolveRiskPctForBranch — Mode-aware risk percentage resolution   |
 //+------------------------------------------------------------------+
-bool ExecutionGatePass(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch)
+double ResolveRiskPctForBranch(const int mode, double baseRisk, ENUM_EXECUTION_BRANCH branch) {
+    double modeFactor = (mode == MODE_ANTICIPATION) ? 0.6 : 1.0;
+    return baseRisk * modeFactor; 
+}
+
+//+------------------------------------------------------------------+
+//| DetermineOrderType — Mode-based order type selection (§V)        |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE DetermineOrderType(const SLockedSignal &sig)
 {
-    // === PHASE 4: Enhanced Execution Gate Entrance Telemetry ===
-    string modeStr = (signal.executionMode == MODE_ANTICIPATION) ? "ANTICIPATION" :
-                    (signal.executionMode == MODE_CONFIRMATION) ? "CONFIRMATION" : "NONE";
-    
-    // [EXEC_TRIGGER] Execution gate triggered
-    LogPrint("[EXEC_TRIGGER] GUID=" + IntegerToString(signal.m_guid) +
-             " | closure=" + EnumToString(signal.closureType) +
-             " | candidateEntry=" + DoubleToString(signal.candidateEntryPrice, _Digits) +
-             " | stopLoss=" + DoubleToString(signal.stop_loss, _Digits), LOG_LEVEL_INFO);
+    if(sig.executionMode == MODE_ANTICIPATION)
+    {
+        if(sig.direction == DIRECTION_BUY)
+        {
+            double ask = SymbolInfoDouble(sig.symbol, SYMBOL_ASK);
+            return (sig.entry_price >= ask) ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_BUY_LIMIT;
+        }
+        else
+        {
+            double bid = SymbolInfoDouble(sig.symbol, SYMBOL_BID);
+            return (sig.entry_price <= bid) ? ORDER_TYPE_SELL_STOP : ORDER_TYPE_SELL_LIMIT;
+        }
+    }
+    else
+    {
+        return (sig.direction == DIRECTION_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+    }
+}
 
-    // Log incoming state at the final gate to confirm if the Store is holding the data
-    LGovPrint("[EXEC_GATE] ENTER | guid=" + IntegerToString(signal.m_guid) +
-             " | mode=" + modeStr + "[" + IntegerToString(signal.executionMode) + "]" +
-             " | closure=" + EnumToString(signal.closureType) +
-             " | stage=" + EnumToString(signal.stage) +
-             " | isCommitted=" + (signal.isCommitted ? "TRUE" : "FALSE") +
-             " | entry_price=" + DoubleToString(signal.entry_price, _Digits),
-             LOG_LEVEL_INFO);
-    
-    Print("[GATE_ENTRY] GUID:", signal.m_guid, " | Mode:", modeStr, " | Closure:", EnumToString(signal.closureType), " | Stage:", EnumToString(signal.stage));
+//+------------------------------------------------------------------+
+//| ExecutionGatePass — Final pre-execution validation gate           |
+//| VERBATIM REPAIR: Findings 1 & 3 - Protected Delivery & GUID      |
+//+------------------------------------------------------------------+
+bool ExecutionGatePass(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, double lot) {
+    g_current_signal_guid = signal.m_guid;
+    LogPrint(StringFormat("[EXEC_GATE] ENTER | GUID:%I64u | Mode:%s | lot:%.2f", signal.m_guid, MR_ModeToString((EntryMode)signal.executionMode), lot), LOG_LEVEL_INFO);
 
-    // [RG_GATE] At RG gate evaluation entry
-    LogPrint("[RG_GATE] Evaluating | GUID=" + IntegerToString(signal.m_guid) +
-             " | stage=" + EnumToString(signal.stage) +
-             " | mode=" + modeStr, LOG_LEVEL_DEBUG);
-
-    // REGRESSION GUARD: Log EXECUTION_GATE mode evaluation
-    LogPrint("[EXEC_GATE_EVAL] GUID:" + IntegerToString(signal.m_guid) +
-            " | executionMode=" + modeStr + "[" + IntegerToString(signal.executionMode) + "]" +
-            " | closure=" + EnumToString(signal.closureType) +
-            " | stage=" + EnumToString(signal.stage), LOG_LEVEL_DEBUG);
-
-    // Declare local execution variables (compilation fix — undeclared identifiers)
-    // REGRESSION_GUARD_V52.5_ORDERMANAGER_LOCALS
-    double minLot = 0.0, maxLot = 0.0, lotStep = 0.0;
-    string symbol = _Symbol;
-    double lot = 0.0;
-    double entryPrice = signal.entry_price;
-    double stopLoss = signal.stop_loss;
-    double takeProfit = signal.tp;
-    ENUM_SIGNAL_DIRECTION direction = (signal.direction == DIRECTION_BUY) ? SIGNAL_BULLISH :
-                                      (signal.direction == DIRECTION_SELL) ? SIGNAL_BEARISH : SIGNAL_NONE;
-    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
     MqlTradeRequest request = {};
-
-    // REGRESSION INVARIANT: Mode must not be zero after lock
-    if(signal.stage == STAGE_READY && signal.executionMode == MODE_NONE)
-    {
-        LogPrint("[ASSERTION_FAIL] INVARIANT_BROKEN: Mode=MODE_NONE on READY signal | GUID:" + IntegerToString(signal.m_guid), LOG_LEVEL_ERROR);
-    }
-
-    // REGRESSION INVARIANT: entry_price must be valid at execution gate
-    if(signal.entry_price <= 0.0)
-    {
-        LogPrint("[ASSERTION_FAIL] INVARIANT_BROKEN: entry_price=0 at EXECUTION_GATE | GUID:" + IntegerToString(signal.m_guid), LOG_LEVEL_ERROR);
-    }
-
-    // STRICT VALIDATION: Source of truth enforcement
-    if(signal.m_guid == 0 || !signal.isCommitted)
-    {
-        LogPrint("[EXEC_GATE_FAIL] reason=INVALID_SIGNAL_STATE | guid=" + IntegerToString(signal.m_guid), LOG_LEVEL_ERROR);
-        return false;
-    }
-
-    bool execResult = true;
-
-    // Gate 1: Signal stage must be READY
-    if(signal.stage != STAGE_READY)
-    {
-        LogPrint("[EXEC_GATE_FAIL] reason=STAGE_NOT_READY | guid=" + IntegerToString(signal.m_guid) +
-                " | stage=" + EnumToString(signal.stage), LOG_LEVEL_ERROR);
-        execResult = false;
-    }
-    else
-    // Gate 2: Signal must be committed
-    if(!signal.isCommitted)
-    {
-        LogPrint("[EXEC_GATE_FAIL] reason=NOT_COMMITTED | guid=" + IntegerToString(signal.m_guid), LOG_LEVEL_ERROR);
-        execResult = false;
-    }
-    else
-    // Gate 3: Signal must not be expired
-    if(signal.IsExpired())
-    {
-        LogPrint("[EXEC_GATE_FAIL] reason=SIGNAL_EXPIRED | guid=" + IntegerToString(signal.m_guid), LOG_LEVEL_ERROR);
-        execResult = false;
-    }
-    else
-    // Gate 4: Signal must not be already executed
-    if(signal.stage == STAGE_EXECUTED)
-    {
-        LogPrint("[EXEC_GATE_FAIL] reason=ALREADY_EXECUTED | guid=" + IntegerToString(signal.m_guid), LOG_LEVEL_ERROR);
-        execResult = false;
-    }
-    else
-    // Gate 5: Retry cap check - prevent excessive execution attempts
-    if(signal.IsRetryCapReached())
-    {
-        LogPrint("[EXEC_GATE_FAIL] reason=RETRY_CAP_REACHED | guid=" + IntegerToString(signal.m_guid) +
-                " | attempts=" + IntegerToString(signal.executionAttempts), LOG_LEVEL_ERROR);
-        execResult = false;
-    }
-    else
-    // Gate 6: Signal direction must be valid (BUY or SELL)
-    if(signal.direction != DIRECTION_BUY && signal.direction != DIRECTION_SELL)
-    {
-        LogPrint("[EXEC_GATE_FAIL] reason=INVALID_DIRECTION | guid=" + IntegerToString(signal.m_guid) +
-                " | dir=" + EnumToString(signal.direction), LOG_LEVEL_ERROR);
-        execResult = false;
-    }
-    else
-    // Gate 7: Execution mode must be valid (not MODE_NONE)
-    // FIXED: Enhanced diagnostics + mode inference as last resort
-    // [MODE_BLOCKED] Signal rejected - executionMode not set by pipeline
-    // Mode must be resolved by ModeResolver before reaching OrderManager
-    if(signal.executionMode == MODE_NONE)
-    {
-        // Mode was not set by the pipeline - reject signal, do not infer from closureType
-        string modeDebug = "[EXEC_GATE_FAIL] reason=MODE_NOT_RESOLVED | guid=" + IntegerToString(signal.m_guid)
-                         + " | stage=" + EnumToString(signal.stage)
-                         + " | closure=" + EnumToString(signal.closureType)
-                         + " | committed=" + (signal.isCommitted ? "Y" : "N")
-                         + " | entry=" + DoubleToString(signal.entry_price, _Digits)
-                         + " | sl=" + DoubleToString(signal.stop_loss, _Digits);
-        LogPrint(modeDebug, LOG_LEVEL_WARN);
-        execResult = false;
-    }
-    else
-    {
-        // Fallback to snapshot values - gate already validated these
-SSignalSnapshotRisk snap = RG_GetSnapshot();
-    minLot = snap.minLot;
-    maxLot = snap.maxLot;
-    lotStep = snap.lotStep;
-    lot = snap.baseLot; // REGRESSION_GUARD_V52.5_SNAPSHOT_LOT
-    }
-
-    // Snapshot validation: values must be valid (validated at gate)
-    if(minLot <= 0.0 || lotStep <= 0.0 || maxLot <= 0.0)
-    {
-        Print("[SNAPSHOT_FALLBACK] Invalid snapshot — querying profile");
-        SSymbolProfile spSnap = SY_GetProfile(symbol);
-        minLot = spSnap.volumeMin;
-        maxLot = spSnap.volumeMax;
-        lotStep = spSnap.volumeStep;
-        
-        Print("[SNAPSHOT_FALLBACK] minLot=", DoubleToString(minLot, 4),
-              " maxLot=", DoubleToString(maxLot, 4),
-              " step=", DoubleToString(lotStep, 4),
-              " tickVal=", DoubleToString(spSnap.tickValue, 6),
-              " tickSz=", DoubleToString(spSnap.tickSize, 6));
-        
-        // If still invalid after live query, then hard fail with RISK_FLOOR_BLOCK
-        if(minLot <= 0.0)
-        {
-            LogPrint("[RISK_FLOOR_BLOCK] GUID=" + IntegerToString(signal.m_guid) +
-                     " | reason=SNAPSHOT_MINLOT_ZERO" +
-                     " | equity=" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) +
-                     " | calculatedLot=0.0" +
-                     " | rejectionOwner=OrderManager.ExecutionGatePass" +
-                     " | minLot=" + DoubleToString(minLot, 4) +
-                     " | maxLot=" + DoubleToString(maxLot, 4) +
-                     " | step=" + DoubleToString(lotStep, 4), LOG_LEVEL_ERROR);
-            LogError("[ORDER] INVALID_SNAPSHOT_CTX | minLot=" + DoubleToString(minLot, 4) + " maxLot=" + DoubleToString(maxLot, 4) + " step=" + DoubleToString(lotStep, 4));
-            if(TC_IsValid())
-                TC_MarkFailed("SNAPSHOT_INVALID");
-            return false;
-        }
-    }
-
-    // CONTRACT: invalid lot must remain invalid - NO upward clamp
-    if(lot < minLot || lot <= 0.0)
-    {
-        LogPrint("[RISK_FLOOR_BLOCK] GUID=" + IntegerToString(signal.m_guid) +
-                 " | reason=LOT_BELOW_MINLOT_PRE_STAB" +
-                 " | lot=" + DoubleToString(lot, 8) +
-                 " | minLot=" + DoubleToString(minLot, 8) +
-                 " | closure=" + EnumToString(signal.closureType), LOG_LEVEL_WARN);
-        LogPrint("[RISK_NOT_TRADEABLE] lot=" + DoubleToString(lot, 8) + " < minLot=" + DoubleToString(minLot, 8) +
-                 " | maxLot=" + DoubleToString(maxLot, 8) +
-                 " | step=" + DoubleToString(lotStep, 8) +
-                 " | equity=" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) +
-                 " | entry=" + DoubleToString(entryPrice, _Digits) +
-                 " | sl=" + DoubleToString(stopLoss, _Digits) +
-                 " | closure=" + EnumToString(signal.closureType), LOG_LEVEL_WARN);
-        LogWarn("[ORDER] LOT_REJECTED | LOT=" + DoubleToString(lot, 8) + " MIN=" + DoubleToString(minLot, 8));
-        return false;
-    }
-
-    LogPrint("[RISK_TRADEABLE] lot=" + DoubleToString(lot, 8) + " >= minLot=" + DoubleToString(minLot, 8), LOG_LEVEL_DEBUG);
-
-    // STABILISATION GATE — enforce cap only and align to step
-    lot = StabiliseLot(lot, minLot, maxLot, lotStep, symbol);
-
-    // Post-stabilisation minLot check — StabiliseLot can round below minLot
-    if(lot <= 0.0 || lot < minLot)
-    {
-        LogPrint("[RISK_FLOOR_BLOCK] GUID=" + IntegerToString(signal.m_guid) +
-                 " | reason=LOT_BELOW_MINLOT_POST_STAB" +
-                 " | lot=" + DoubleToString(lot, 8) +
-                 " | minLot=" + DoubleToString(minLot, 8) +
-                 " | closure=" + EnumToString(signal.closureType), LOG_LEVEL_WARN);
-        LogPrint("[RISK_NOT_TRADEABLE] Post-stab lot=" + DoubleToString(lot, 8) +
-                 " < minLot=" + DoubleToString(minLot, 8) +
-                 " | maxLot=" + DoubleToString(maxLot, 8) +
-                 " | step=" + DoubleToString(lotStep, 8) +
-                 " | equity=" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) +
-                 " | entry=" + DoubleToString(entryPrice, _Digits) +
-                 " | sl=" + DoubleToString(stopLoss, _Digits), LOG_LEVEL_WARN);
-        LogWarn("[ORDER] LOT_REJECTED | POST_STAB | LOT=" + DoubleToString(lot, 8) + " MIN=" + DoubleToString(minLot, 8));
-        return false;
-    }
-
-    if(TC_IsValid())
-    {
-        TraceLot("FINAL");
-    }
-
-// Validate SL distance against BOTH stopsLevel and freezeLevel (from profile)
-    SSymbolProfile spExec = SY_GetProfile(symbol);
-    double slDistance = 0.0;
-    if(stopLoss > 0.0 && entryPrice > 0.0)
-       slDistance = MathAbs(entryPrice - stopLoss);
-
-    long stopsLevel = spExec.stopsLevel;
-    long freezeLevel = spExec.freezeLevel;
-    int minLevel = (int)MathMax(stopsLevel, freezeLevel);
-    double minSLDistance = minLevel * spExec.point;
-    double safeMinDistance = minSLDistance + spExec.point;
-
-    if(slDistance > 0.0 && slDistance < safeMinDistance)
-    {
-LogPrint("[EXEC_ORDER] SL dist=" + DoubleToString(slDistance, 5) + " below safe min=" + DoubleToString(safeMinDistance, 5) + " (stops=" + IntegerToString(stopsLevel) + ", freeze=" + IntegerToString(freezeLevel) + ") — adjusting...", LOG_LEVEL_WARN);
-
-        ENUM_ORDER_TYPE orderType = (direction == SIGNAL_BULLISH) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-        AdjustStopsToValidDistance(stopLoss, takeProfit, orderType, symbol, entryPrice);
-        request.sl = stopLoss;
-        request.tp = takeProfit;
-        LogPrint("[EXEC_ORDER] Stops adjusted | SL=" + DoubleToString(stopLoss, 5) + " | TP=" + DoubleToString(takeProfit, 5), LOG_LEVEL_INFO);
-    }
-
-request.volume = lot;
-
-    string fillingStr = "";
-    if(request.type_filling == ORDER_FILLING_FOK) fillingStr = "FOK";
-    else if(request.type_filling == ORDER_FILLING_IOC) fillingStr = "IOC";
-    else fillingStr = "UNKNOWN";
-
-    LogInfo("[EXEC] Status=READY | Symbol=" + symbol + " | Filling=" + fillingStr +
-            " | Lot=" + DoubleToString(lot, 8) + " | SL=" + DoubleToString(stopLoss, digits) +
-            " | TP=" + DoubleToString(takeProfit, digits));
-
-    // PHASE 6: OrderCheck pre-flight (MANDATORY per B7.8 contract)
-    string fillingModeStr = "N/A";
-    if(!MQLInfoInteger(MQL_TESTER))
-    {
-    MqlTradeCheckResult check;
-    if(!OrderCheck(request, check))
-    {
-        // CRITICAL: check.retcode may be garbage if OrderCheck() itself failed - use GetLastError()
-        uint lastErr = GetLastError();
-        uint correctedRetcode = (check.retcode > 0) ? check.retcode : lastErr;
-        // If still 0, force to generic failure code to avoid misleading "success" code
-        if(correctedRetcode == 0) correctedRetcode = 10000;
-        LogPrint("[EXEC_ORDER_FAIL] reason=ORDERCHECK_FAIL | guid=" + IntegerToString(g_current_signal_guid) +
-                " | retcode=" + IntegerToString(correctedRetcode), LOG_LEVEL_INFO);
-        LogError("[ORDER_CHECK_FAIL] GUID=" + IntegerToString(g_current_signal_guid) +
-                " | Status=FAIL" +
-                " | CorrectedCode=" + IntegerToString(correctedRetcode) +
-                " | RawRetcode=" + IntegerToString(check.retcode) +
-                " | LastError=" + IntegerToString(lastErr) +
-                " | Volume=" + DoubleToString(request.volume, 8) +
-                " | Price=" + DoubleToString(request.price, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                " | SL=" + DoubleToString(request.sl, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                " | TP=" + DoubleToString(request.tp, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)));
-        if(TC_IsValid())
-            TC_MarkFailed("ORDERCHECK_FAIL");
-        return false;
-    }
-
-    // Compute corrected retcode for all subsequent logic
-    uint correctedRetcode = check.retcode;
-    if(correctedRetcode == 0) correctedRetcode = 10000;
+    MqlTradeResult result = {};
     
-    // Standardized execution log for OrderCheck rejection
-    fillingModeStr = (request.type_filling == ORDER_FILLING_FOK) ? "FOK" : "IOC";
-    LogError("[ORDER_CHECK_REJECT] GUID=" + IntegerToString(g_current_signal_guid) +
-            " | Status=FAIL" +
-            " | CorrectedCode=" + IntegerToString(correctedRetcode) +
-            " | Desc=" + GetRetcodeDescription(correctedRetcode) +
-            " | FillingAttempted=" + fillingModeStr +
-            " | BrokerModes=" + GetBrokerFillingModes(symbol) +
-            " | Volume=" + DoubleToString(request.volume, 8) +
-            " | Price=" + DoubleToString(request.price, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-            " | SL=" + DoubleToString(request.sl, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-            " | TP=" + DoubleToString(request.tp, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)));
+    string sym   = signal.symbol;
+    int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+    double bid   = SymbolInfoDouble(sym, SYMBOL_BID);
+    double ask   = SymbolInfoDouble(sym, SYMBOL_ASK);
+    ulong  fill  = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
     
-    // === ROBUSTNESS MATRIX: Extended retcode handling ===
-    // OPERATES ON CORRECTED CODE variable, not raw struct field
-    switch(correctedRetcode)
-    {
-        case TRADE_RETCODE_DONE:        // 10009 — OrderCheck passed, proceed to send
-            break;
-        case TRADE_RETCODE_INVALID_FILL:
-        {
-            ENUM_ORDER_TYPE_FILLING altFilling = (request.type_filling == ORDER_FILLING_FOK) ? ORDER_FILLING_IOC : ORDER_FILLING_FOK;
-            string altModeStr = (altFilling == ORDER_FILLING_FOK) ? "FOK" : "IOC";
-            LogWarn("[ORDER_CHECK_RETRY] GUID=" + IntegerToString(g_current_signal_guid) +
-                   " | Switching from " + fillingModeStr + " to " + altModeStr);
-            request.type_filling = altFilling;
-            
-            MqlTradeCheckResult check2;
-            if(OrderCheck(request, check2) && check2.retcode == TRADE_RETCODE_DONE)
-            {
-               LogInfo("[ORDER_CHECK_RETRY] GUID=" + IntegerToString(g_current_signal_guid) + " | Success with alternate filling mode");
-               request.type_filling = altFilling;
-            }
-            else
-            {
-               string altModeStr2 = (request.type_filling == ORDER_FILLING_FOK) ? "FOK" : "IOC";
-               uint correctedRetcode2 = check2.retcode;
-               if(correctedRetcode2 == 0) correctedRetcode2 = 10000;
-               LogError("[ORDER_CHECK_RETRY] GUID=" + IntegerToString(g_current_signal_guid) +
-                       " | Alternate mode(" + altModeStr2 + ") also failed: CorrectedCode=" + IntegerToString(correctedRetcode2) +
-                       " | Desc=" + GetRetcodeDescription(correctedRetcode2) +
-                       " | Volume=" + DoubleToString(request.volume, 8) +
-                       " | Price=" + DoubleToString(request.price, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                       " | SL=" + DoubleToString(request.sl, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                       " | TP=" + DoubleToString(request.tp, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)));
-               if(TC_IsValid())
-                   TC_MarkFailed("ORDERCHECK_REJECT");
-               return false;
-            }
-            break;
-        }
-        
-        case 10006:  // NO_CONNECTION - network issue, retry once after brief pause
-        {
-            // CAP RETRIES: Check if we've exceeded retry limit for this signal
-            g_retry_count++;
-            if(g_retry_count > MAX_SIGNAL_RETRIES)
-            {
-                LogError("[ORDER_CHECK_REJECT] GUID=" + IntegerToString(g_current_signal_guid) +
-                        " | Code=" + IntegerToString(correctedRetcode) +
-                        " | Desc=NO_CONNECTION | RETRY_LIMIT_EXCEEDED (max=" + IntegerToString(MAX_SIGNAL_RETRIES) + ")");
-                if(TC_IsValid())
-                    TC_MarkFailed("ORDERCHECK_RETRY_LIMIT");
-                g_retry_count = 0; // Reset for next signal
-                return false;
-            }
-            // Signal timeout check
-            if(g_signal_start_time > 0 && (GetTickCount() - g_signal_start_time) > SIGNAL_TIMEOUT_MS)
-            {
-                LogError("[ORDER_CHECK_REJECT] GUID=" + IntegerToString(g_current_signal_guid) +
-                        " | Code=" + IntegerToString(correctedRetcode) +
-                        " | Desc=NO_CONNECTION | SIGNAL_TIMEOUT_EXCEEDED");
-                if(TC_IsValid())
-                    TC_MarkFailed("ORDERCHECK_TIMEOUT");
-                g_retry_count = 0;
-                return false;
-            }
-            LogWarn("[ORDER_CHECK_RETRY] GUID=" + IntegerToString(g_current_signal_guid) +
-                   " | Retry: NO_CONNECTION (10006) - network pause | Attempt=" + IntegerToString(g_retry_count));
-            Sleep(500);  // 500ms network pause
-            
-            // Retry OrderCheck once
-            MqlTradeCheckResult checkNet;
-            if(OrderCheck(request, checkNet) && checkNet.retcode == TRADE_RETCODE_DONE)
-            {
-               LogInfo("[ORDER_CHECK_RETRY] GUID=" + IntegerToString(g_current_signal_guid) + " | Success after network recovery");
-               g_retry_count = 0;
-            }
-            else
-            {
-               uint correctedNetRetcode = checkNet.retcode;
-               if(correctedNetRetcode == 0) correctedNetRetcode = 10000;
-               LogError("[ORDER_CHECK_UNRECOVERABLE] GUID=" + IntegerToString(g_current_signal_guid) +
-                       " | CorrectedCode=" + IntegerToString(correctedNetRetcode) +
-                       " | Desc=NO_CONNECTION | Network retry exhausted | Volume=" + DoubleToString(request.volume, 8) +
-                       " | Price=" + DoubleToString(request.price, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                       " | SL=" + DoubleToString(request.sl, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                       " | TP=" + DoubleToString(request.tp, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)));
-               if(TC_IsValid())
-                   TC_MarkFailed("ORDERCHECK_FAIL");
-               g_retry_count = 0;
-               return false;
-            }
-            break;
-        }
-        
-        case 10027:  // AUTO_TRADING_DISABLED - terminal broker setting issue
-        {
-            LogError("[ORDER_CHECK_CRITICAL] GUID=" + IntegerToString(g_current_signal_guid) +
-                    " | CorrectedCode=" + IntegerToString(correctedRetcode) +
-                    " | Desc=AUTO_TRADING_DISABLED | broker settings issue - NOT a code bug");
-            if(TC_IsValid())
-                TC_MarkFailed("BROKER_SETTING");
-            g_retry_count = 0;
-            return false;
-        }
-
-        case 10011:  // INVALID_STOPS - attempt recovery via stop adjustment
-        {
-            LogWarn("[ORDER_CHECK_10011] GUID=" + IntegerToString(g_current_signal_guid) +
-                    " | Attempting stop adjustment recovery...");
-
-            double adjSL = request.sl;
-            double adjTP = request.tp;
-            if(AdjustStopsToValidDistance(adjSL, adjTP, request.type, request.symbol, request.price))
-            {
-               request.sl = adjSL;
-               request.tp = adjTP;
-
-               MqlTradeCheckResult checkAdj;
-               ZeroMemory(checkAdj);
-               if(OrderCheck(request, checkAdj))
-               {
-                  LogPrint("[ORDER_CHECK_10011] OrderCheck passed after stop adjustment. Retrying OrderSend...", LOG_LEVEL_INFO);
-                  break;
-               }
-               else
-               {
-                  uint adjRetcode = checkAdj.retcode;
-                  if(adjRetcode == 0) adjRetcode = 10000;
-                  LogError("[ORDER_CHECK_10011] OrderCheck still fails after adjustment: " +
-                           IntegerToString(adjRetcode) + " (" + checkAdj.comment + ")");
-                  if(TC_IsValid())
-                     TC_MarkFailed("ORDERCHECK_ADJUST_FAILED");
-                  return false;
-               }
-            }
-            else
-            {
-               LogError("[ORDER_CHECK_10011] AdjustStopsToValidDistance failed — cannot recover");
-               if(TC_IsValid())
-                  TC_MarkFailed("STOP_ADJUST_UNRECOVERABLE");
-               return false;
-            }
-        }
-
-        case 10016:  // INVALID_VOLUME_LIMIT - may also indicate stop distance issue
-        {
-            LogWarn("[ORDER_CHECK_10016] GUID=" + IntegerToString(g_current_signal_guid) +
-                    " | Attempting stop adjustment recovery...");
-
-            double adjSL = request.sl;
-            double adjTP = request.tp;
-            if(AdjustStopsToValidDistance(adjSL, adjTP, request.type, request.symbol, request.price))
-            {
-               request.sl = adjSL;
-               request.tp = adjTP;
-
-               MqlTradeCheckResult checkAdj;
-               ZeroMemory(checkAdj);
-               if(OrderCheck(request, checkAdj))
-               {
-                  LogPrint("[ORDER_CHECK_10016] OrderCheck passed after stop adjustment. Retrying OrderSend...", LOG_LEVEL_INFO);
-                  break;
-               }
-                else
-                {
-                   uint adjRetcode = checkAdj.retcode;
-                   if(adjRetcode == 0) adjRetcode = 10000;
-                   LogError("[ORDER_CHECK_10016] OrderCheck still fails after adjustment: " +
-                            IntegerToString(adjRetcode) + " (" + checkAdj.comment + ")");
-
-                   int digits = (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS);
-                   double point = SymbolInfoDouble(request.symbol, SYMBOL_POINT);
-                   int stopsLevel = (int)SymbolInfoInteger(request.symbol, SYMBOL_TRADE_STOPS_LEVEL);
-                   int freezeLevel = (int)SymbolInfoInteger(request.symbol, SYMBOL_TRADE_FREEZE_LEVEL);
-                   int minLevel = MathMax(stopsLevel, freezeLevel);
-                   double expandedDist = minLevel * point * 1.5;
-                   request.sl = NormalizeDouble((request.type == ORDER_TYPE_BUY) ? request.price - expandedDist : request.price + expandedDist, digits);
-                   request.tp = NormalizeDouble((request.type == ORDER_TYPE_BUY) ? request.price + expandedDist : request.price - expandedDist, digits);
-                   LogPrint("[ORDER_CHECK_10016] RETRY with expanded buffer | dist=" + DoubleToString(expandedDist, digits) + " | SL=" + DoubleToString(request.sl, digits), LOG_LEVEL_WARN);
-
-                   MqlTradeCheckResult checkRetry;
-                   ZeroMemory(checkRetry);
-                   if(OrderCheck(request, checkRetry))
-                   {
-                      LogPrint("[ORDER_CHECK_10016] OrderCheck passed after buffer expansion. Retrying...", LOG_LEVEL_INFO);
-                   }
-                   else
-                   {
-                      if(TC_IsValid())
-                         TC_MarkFailed("ORDERCHECK_ADJUST_FAILED");
-                      return false;
-                   }
-                }
-             }
-             else
-             {
-                LogError("[ORDER_CHECK_10016] AdjustStopsToValidDistance failed — cannot recover");
-                if(TC_IsValid())
-                   TC_MarkFailed("STOP_ADJUST_UNRECOVERABLE");
-                return false;
-             }
-         }
-
-        default:
-        {
-            if(correctedRetcode == 10000)
-            {
-                LogError("[ORDER_CHECK_ABORT] GUID=" + IntegerToString(g_current_signal_guid) +
-                        " | Retcode=10000 | No server connection in tester — aborting signal");
-                ClearSignalByGUID(g_activeBranch, g_current_signal_guid, "RETCODE_10000_ABORT");
-                return false;
-            }
-            // Unhandled retcode - log with GUID for forensic tracking
-            LogError("[ORDER_CHECK_UNHANDLED] GUID=" + IntegerToString(g_current_signal_guid) +
-                    " | CorrectedCode=" + IntegerToString(correctedRetcode) +
-                    " | Desc=" + GetRetcodeDescription(correctedRetcode) +
-                    " | Filling=" + fillingModeStr +
-                    " | Volume=" + DoubleToString(request.volume, 8) +
-                    " | Price=" + DoubleToString(request.price, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                    " | SL=" + DoubleToString(request.sl, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                    " | TP=" + DoubleToString(request.tp, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)));
-            if(TC_IsValid())
-                TC_MarkFailed("ORDERCHECK_REJECT");
-            g_retry_count = 0;
-            return false;
-        }
-    }
-    }
-
-   // First execution attempt — strong pre-send SL/TP validation
-        {
-            int d = (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS);
-            double ep = request.price;
-            LogPrint("[PRE_SEND] GUID=" + IntegerToString(g_current_signal_guid) +
-                     " | ENTRY=" + DoubleToString(ep, d) +
-                     " | SL=" + DoubleToString(request.sl, d) +
-                     " | TP=" + DoubleToString(request.tp, d) +
-                     " | TYPE=" + EnumToString(request.type) +
-                     " | VOL=" + DoubleToString(request.volume, 2), LOG_LEVEL_INFO);
-            if(request.type == ORDER_TYPE_BUY && request.sl > 0 && request.sl >= ep)
-            {
-               LogError("[EXEC_GATE_FAIL] SL_DIRECTION_INVALID | Dir=" + EnumToString(direction) +
-                        " | Entry=" + DoubleToString(ep, 5) +
-                        " | SL=" + DoubleToString(request.sl, 5));
-               return false;
-            }
-            if(request.type == ORDER_TYPE_SELL && request.sl > 0 && request.sl <= ep)
-            {
-               LogError("[EXEC_GATE_FAIL] SL_DIRECTION_INVALID | Dir=" + EnumToString(direction) +
-                        " | Entry=" + DoubleToString(ep, 5) +
-                        " | SL=" + DoubleToString(request.sl, 5));
-               return false;
-            }
-        }
-
-        // P2 Fix: Validate stops immediately before send
-        string guidStr = IntegerToString(g_current_signal_guid);
-        if(!RG_ValidateAndAdjustStops(request.symbol, request.type, request.sl, request.tp, request.price, guidStr))
-        {
-            LogPrint("[EXEC_REJECTED] GUID=" + guidStr + " | Reason=STOP_VALIDATION_FAILED", LOG_LEVEL_WARN);
-            LogWarn("[ORDER_SEND_ABORT] GUID=" + guidStr + " | Reason=STOP_VALIDATION_FAILED");
-            return false;
-        }
-
-        // P2 Fix: OrderCheck before OrderSend
-        if(!MQLInfoInteger(MQL_TESTER))
-        {
-        MqlTradeCheckResult checkResult = {};
-        if(!OrderCheck(request, checkResult))
-        {
-            LogPrint("[EXEC_REJECTED] GUID=" + guidStr + " | Reason=ORDERCHECK_FAIL | retcode=" + IntegerToString(checkResult.retcode), LOG_LEVEL_WARN);
-            LogWarn("[ORDER_CHECK_FAIL] GUID=" + guidStr + " | retcode=" + IntegerToString(checkResult.retcode) +
-                    " | comment=" + checkResult.comment);
-            if(checkResult.retcode == 10016)
-            {
-                RG_ValidateAndAdjustStops(request.symbol, request.type, request.sl, request.tp, request.price, guidStr);
-                if(!OrderCheck(request, checkResult))
-                {
-                    LogPrint("[EXEC_REJECTED] GUID=" + guidStr + " | Reason=STOP_ADJUST_UNRECOVERABLE", LOG_LEVEL_WARN);
-                    LogWarn("[ORDER_CHECK_FAIL_2ND] GUID=" + guidStr + " | Aborting order");
-                    return false;
-                }
-                LogPrint("[ORDER_CHECK_10016] OrderCheck passed after stop adjustment. Retrying OrderSend...", LOG_LEVEL_INFO);
-            }
-            else
-            {
-                return false;
-            }
-        }
-        }
-
-        // REGRESSION_GUARD_FILL: Prevent ghosts — fully symbol/broker agnostic
-        if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
-        {
-            LogPrint("[EXEC_REJECTED] GUID=" + IntegerToString(g_current_signal_guid) + " | Reason=TRADE_DISABLED", LOG_LEVEL_WARN);
-            LogPrint("[ORDER_FILL_FAIL] Trade not allowed - market closed or restricted | GUID=" + IntegerToString(g_current_signal_guid), LOG_LEVEL_ERROR);
-            if(g_current_signal_guid != 0)
-               OM_ClearSlot(g_current_signal_guid);
-            if(TC_IsValid())
-               TC_MarkFailed("TRADE_NOT_ALLOWED");
-            return false;
-        }
-
-        // [ORDER_REQUESTED] Capture requested price before send
-        signal.requestedEntryPrice = entryPrice;
-        signal.fillStatus = 1;  // FILL_REQUESTED
-        LogPrint("[ORDER_REQUESTED] GUID=" + IntegerToString(signal.m_guid) +
-                 " | requestedEntry=" + DoubleToString(entryPrice, _Digits) +
-                 " | lot=" + DoubleToString(request.volume, 2), LOG_LEVEL_INFO);
-
-        // REGRESSION_GUARD_V54_3: Retry loop for NOT_ENOUGH_MONEY — reduce lot by 50%
-         int orderRetryCount = 0;
-         const int orderMaxRetries = 3;
-         bool sent = false;
-         bool orderSuccess = false;
-         MqlTradeResult result = {};
-
-         while(orderRetryCount < orderMaxRetries)
-         {
-             sent = OrderSend(request, result);
-
-            PrintFormat("[ORDER_FILL_ATTEMPT] GUID=%I64u symbol=%s retcode=%u deal=%I64u fill_type=%d deviation=%d attempt=%d",
-                        g_current_signal_guid, request.symbol, result.retcode, result.deal,
-                        request.type_filling, request.deviation, orderRetryCount);
-
-            if(sent && (result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_DONE_PARTIAL || result.retcode == TRADE_RETCODE_PLACED))
-            {
-                LogPrint("[ORDER_SUBMITTED] GUID=" + IntegerToString(g_current_signal_guid) +
-                          " | Ticket=" + IntegerToString(result.order) +
-                          " | RequestID=" + IntegerToString(result.request_id), LOG_LEVEL_INFO);
-
-                PrintFormat("[ORDER_FILL_SUCCESS] GUID=%I64u ticket=%I64u deal=%I64u price=%.5f",
-                            g_current_signal_guid, result.order, result.deal, result.price);
-
-                g_totalOrdersSent++;
-                g_lastTradeOpenTime = TimeCurrent();
-
-                ulong execGuid = g_current_signal_guid;
-                if(execGuid != 0 && result.request_id > 0)
-                {
-                   int idx = ArraySize(g_pendingLinks);
-                   ArrayResize(g_pendingLinks, idx + 1, idx + 10);
-                   g_pendingLinks[idx].request_id = result.request_id;
-                   g_pendingLinks[idx].guid       = execGuid;
-                   g_pendingLinks[idx].created    = TimeCurrent();
-                   PrintFormat("[PENDING_LINK] request_id=%u guid=%I64u", result.request_id, execGuid);
-                }
-
-                LogInfo("[EXEC_RESULT] GUID=" + IntegerToString(g_current_signal_guid) +
-                        " | Status=SUCCESS" +
-                        " | Ticket=" + IntegerToString(result.order) +
-                        " | Deal=" + IntegerToString(result.deal) +
-                        " | Filling=" + (request.type_filling == ORDER_FILLING_IOC ? "IOC" : request.type_filling == ORDER_FILLING_FOK ? "FOK" : "RETURN") +
-                        " | Volume=" + DoubleToString(result.price > 0 ? request.volume : request.volume, 8) +
-                        " | Price=" + DoubleToString(result.price, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                        " | SL=" + DoubleToString(request.sl, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                        " | TP=" + DoubleToString(request.tp, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)));
-
-                LogPrint("[ORDER_FILLED] GUID=" + IntegerToString(g_current_signal_guid) +
-                          " | Ticket=" + IntegerToString(result.order) +
-                          " | Deal=" + IntegerToString(result.deal) +
-                          " | FillPrice=" + DoubleToString(result.price, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)), LOG_LEVEL_INFO);
-
-                // [ENTRY_TRUTH] Set fill price on the signal — actual broker fill becomes the truth
-                signal.actualFillPrice = result.price;
-                signal.fillStatus = 3;  // FILL_COMPLETE
-                signal.fillTime = TimeCurrent();
-                signal.entry_price = result.price;  // Override signal entry with actual fill price
-                LogPrint("[ORDER_FILLED] GUID=" + IntegerToString(g_current_signal_guid) +
-                          " | fillPrice=" + DoubleToString(result.price, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                          " | requestedPrice=" + DoubleToString(entryPrice, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                          " | entryTruthReconciled=true", LOG_LEVEL_INFO);
-
-                LogPrint("[FILL_PRICE_SYNCED] GUID=" + IntegerToString(g_current_signal_guid) +
-                          " | FilledPrice=" + DoubleToString(result.price, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                          " | RequestedPrice=" + DoubleToString(request.price, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)), LOG_LEVEL_INFO);
-
-                if(TC_IsValid())
-                    TC_LockExecuted();
-
-                if(request.sl > 0 && request.tp > 0)
-                {
-                    if((request.type == ORDER_TYPE_BUY && request.sl >= request.tp) ||
-                       (request.type == ORDER_TYPE_SELL && request.sl <= request.tp))
-                    {
-                        LogPrint("[STOP_ADJUST] SL/TP relationship invalid after fill — order may be at risk", LOG_LEVEL_ERROR);
-                    }
-                }
-
-                orderSuccess = true;
-                break;
-            }
-
-            // NOT_ENOUGH_MONEY — clean rejection, no lot reduction (prohibited by AGENTS.md §VI)
-            if(result.retcode == 10019)
-            {
-                LogPrint("[RISK_NO_MONEY_REJECT] NOT_ENOUGH_MONEY | lot=" + DoubleToString(request.volume, 2) +
-                         " | symbol=" + request.symbol +
-                         " | GUID=" + IntegerToString(g_current_signal_guid), LOG_LEVEL_ERROR);
-                break;
-            }
-
-            // Non-retryable error or retries exhausted
-            break;
-        }
-
-        if(orderSuccess)
-            return true;
-
-        // Final failure - terminate signal
-        PrintFormat("[ORDER_FILL_FAIL] GUID=%I64u reason=%u retcode_desc=%s",
-                    g_current_signal_guid, result.retcode, GetRetcodeDescription(result.retcode));
-        LogError("[EXEC_RESULT] GUID=" + IntegerToString(g_current_signal_guid) +
-                " | Status=FAILED" +
-                " | Retcode=" + IntegerToString(result.retcode) +
-                " | Desc=" + GetRetcodeDescription(result.retcode) +
-                " | Error=" + IntegerToString(GetLastError()) +
-                " | Volume=" + DoubleToString(request.volume, 8) +
-                " | Price=" + DoubleToString(request.price, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                " | SL=" + DoubleToString(request.sl, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)) +
-                " | TP=" + DoubleToString(request.tp, (int)SymbolInfoInteger(request.symbol, SYMBOL_DIGITS)));
-
-        LogPrint("[ORDER_FAILED] GUID=" + IntegerToString(g_current_signal_guid) +
-                  " | Retcode=" + IntegerToString(result.retcode) +
-                  " | Desc=" + GetRetcodeDescription(result.retcode), LOG_LEVEL_ERROR);
-
-        if(g_current_signal_guid != 0)
-        {
-            LogPrint("[SLOT] ROLLBACK on failure | GUID=" + IntegerToString(g_current_signal_guid), LOG_LEVEL_DEBUG);
-            OM_ClearSlot(g_current_signal_guid);
-        }
-
-        if(TC_IsValid())
-            TC_MarkFailed("EXEC_FAILED");
-
-        SL_TerminateSignal(g_current_signal_guid, SIGNAL_TERM_EXEC_FAILED,
-                        "Execution failed: " + GetRetcodeDescription(result.retcode), 0);
-
+    request.action   = (signal.executionMode == MODE_ANTICIPATION) ? TRADE_ACTION_PENDING : TRADE_ACTION_DEAL;
+    request.symbol   = sym;
+    request.volume   = NormalizeDouble(lot, 2);
+    request.magic    = InpMagicNumber;
+    request.deviation = (signal.executionMode == MODE_CONFIRMATION) ? 10 : 0;
+    request.type_filling = ((fill & SYMBOL_FILLING_FOK) != 0) ? ORDER_FILLING_FOK :
+                           ((fill & SYMBOL_FILLING_IOC) != 0) ? ORDER_FILLING_IOC :
+                           ORDER_FILLING_RETURN;
+    
+    request.type = DetermineOrderType(signal);
+    
+    request.price = NormalizeDouble(signal.entry_price, digits);
+    request.sl    = NormalizeDouble(signal.stop_loss, digits);
+    request.tp    = NormalizeDouble(signal.tp, digits);
+    
+    if(!RG_ValidateAndAdjustStops(request, signal)) {
+        LogPrint(StringFormat("[RG_STOPS_REJECT] GUID:%I64u | SL:%.5f", signal.m_guid, request.sl), LOG_LEVEL_ERROR);
         return false;
     }
+    
+    MqlTradeCheckResult checkResult = {};
+    if(!OrderCheck(request, checkResult)) {
+        LogPrint(StringFormat("[ORDERCHECK_FAIL] GUID:%I64u | retcode=%d | comment=%s",
+                 signal.m_guid, checkResult.retcode, checkResult.comment), LOG_LEVEL_ERROR);
+        return false;
+    }
+    
+    if(!OrderSend(request, result)) {
+        LogPrint(StringFormat("[ORDER_FAILED] GUID:%I64u | Error:%d", signal.m_guid, GetLastError()), LOG_LEVEL_ERROR);
+        return false;
+    }
+    
+    LogPrint(StringFormat("[ORDER_SENT] GUID:%I64u | type=%s | price=%.5f | sl=%.5f | tp=%.5f | vol=%.2f",
+             signal.m_guid, EnumToString(request.type), request.price, request.sl, request.tp, request.volume), LOG_LEVEL_INFO);
+    
+    return true;
+}
 
 //+------------------------------------------------------------------+
  //| ExecuteLimitOrder — Execute a pending limit order at specified price  |

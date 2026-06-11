@@ -55,10 +55,10 @@ double StabiliseLot(double rawLot, double minLot, double maxLot, double step, st
 
 //+------------------------------------------------------------------+
 //| IsLotTradeable — Check if broker minimum is affordable            |
-//| Uses OrderCalcProfit() for broker-real risk projection (not       |
-//| simplified slPoints*tickValue) to support all calc modes:         |
-//| forex, crypto, synthetic, index CFDs, cent/micro/nano accounts.   |
-//| Returns true if minLot risk is within account risk budget.        |
+//| VERBATIM REPAIR: Universal Risk Sincerity (§V)                   |
+//| Uses tickValue/tickSize formula instead of OrderCalcProfit to     |
+//| avoid 100x 'pips mode' inflation in the MT5 tester. Computes      |
+//| minLot risk in account currency via structural SL distance.      |
 //+------------------------------------------------------------------+
 bool IsLotTradeable(double slPoints, double tickValue, double minLot,
                     double accountEquity, double riskPercent, const string symbol,
@@ -72,28 +72,16 @@ bool IsLotTradeable(double slPoints, double tickValue, double minLot,
        return false;
 
     double minRisk = 0.0;
+    double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
 
-    // Use OrderCalcProfit for broker-real loss projection when we have prices
-    if(entryPrice > 0.0 && slPrice > 0.0 && symbol != "")
+    // VERBATIM REPAIR: Use tickValue/tickSize formula — no OrderCalcProfit
+    if(entryPrice > 0.0 && slPrice > 0.0 && tickSize > 0.0 && tickValue > 0.0)
     {
-        ENUM_ORDER_TYPE orderType = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-        double profit = 0.0;
-        if(OrderCalcProfit(orderType, symbol, minLot, entryPrice, slPrice, profit))
-        {
-            minRisk = MathAbs(profit);
-        }
-        else
-        {
-            // OrderCalcProfit failed — fall back to simplified formula
-            if(slPoints > 0.0 && tickValue > 0.0)
-                minRisk = minLot * slPoints * tickValue;
-            else
-                return false;
-        }
+        double slDist = MathAbs(entryPrice - slPrice);
+        minRisk = (slDist / tickSize) * tickValue * minLot;
     }
     else
     {
-        // No prices available — use simplified formula as approximate check
         if(slPoints <= 0.0 || tickValue <= 0.0)
             return false;
         minRisk = minLot * slPoints * tickValue;
@@ -107,16 +95,15 @@ bool IsLotTradeable(double slPoints, double tickValue, double minLot,
        LogPrint("[RISK_TRADEABLE] minLotRisk=" + DoubleToString(minRisk, 2) +
                 " <= riskAmount=" + DoubleToString(riskAmount, 4) +
                 " | symbol=" + symbol +
-                " | method=" + (entryPrice > 0.0 ? "OrderCalcProfit" : "formula"),
+                " | method=formula",
                 LOG_LEVEL_DEBUG);
        return true;
     }
 
-    string methodStr = (entryPrice > 0.0 && slPrice > 0.0 && symbol != "") ? "OrderCalcProfit" : "formula";
     LogPrint("[RISK_NOT_TRADEABLE] minLot risk=" + DoubleToString(minRisk, 2) +
              " exceeds allocated risk=" + DoubleToString(riskAmount, 4) +
              " | symbol=" + symbol +
-             " | method=" + methodStr, LOG_LEVEL_WARN);
+             " | method=formula", LOG_LEVEL_WARN);
     return false;
 }
 

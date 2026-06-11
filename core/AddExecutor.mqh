@@ -550,29 +550,17 @@ double AE_GetSwingAddLot(ENUM_EXECUTION_BRANCH branch)
    if(!spAdd.isValid)
       return 0.0;
 
-   // Use OrderCalcProfit-based methodology (consistent with CalculateLotSize)
-   double lossPerLot = 0.0;
-   ENUM_ORDER_TYPE orderType = (camp.direction == DIRECTION_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   if(!OrderCalcProfit(orderType, _Symbol, spAdd.volumeMax, camp.seedPrice,
-                       camp.campaignSL, lossPerLot))
+   // VERBATIM REPAIR: Manual tickValue/tickSize formula — no OrderCalcProfit
+   double slDistAdd = MathAbs(camp.seedPrice - camp.campaignSL);
+   double lossPerLot = (slDistAdd / spAdd.tickSize) * spAdd.tickValue;
+   if(lossPerLot <= 0.0)
    {
-       LogPrint("[LOT_CALC_FAIL] OrderCalcProfit failed for add lot | sym=" + _Symbol +
-                " | orderType=" + IntegerToString(orderType) +
-                " | volume=" + DoubleToString(spAdd.volumeMax, 4) +
-                " | entry=" + DoubleToString(camp.seedPrice, _Digits) +
-                " | sl=" + DoubleToString(camp.campaignSL, _Digits), LOG_LEVEL_WARN);
+       LogPrint("[LOT_CALC_FAIL] Manual formula -> lossPerLot <= 0 | sym=" + _Symbol +
+                " | slDist=" + DoubleToString(slDistAdd, _Digits) +
+                " | tickSize=" + DoubleToString(spAdd.tickSize, 8) +
+                " | tickValue=" + DoubleToString(spAdd.tickValue, 8), LOG_LEVEL_WARN);
        return 0.0;
    }
-   LogPrint("[LOT_CALCPROFIT] add lot | sym=" + _Symbol +
-            " | orderType=" + IntegerToString(orderType) +
-            " | volume=" + DoubleToString(spAdd.volumeMax, 4) +
-            " | entry=" + DoubleToString(camp.seedPrice, _Digits) +
-            " | sl=" + DoubleToString(camp.campaignSL, _Digits) +
-            " | rawProfit=" + DoubleToString(lossPerLot, 2) +
-            " | source=OrderCalcProfit", LOG_LEVEL_DEBUG);
-   lossPerLot = MathAbs(lossPerLot) / spAdd.volumeMax;
-   if(lossPerLot <= 0.0)
-      return 0.0;
 
    double lot = layerRiskAmount / lossPerLot;
 
@@ -609,6 +597,7 @@ double AE_GetSwingAddLot(ENUM_EXECUTION_BRANCH branch)
 
     // Margin feasibility check — same as primary entry path
     double marginRequired = 0.0;
+    ENUM_ORDER_TYPE orderType = (camp.direction == DIRECTION_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
     if(!OrderCalcMargin(orderType, _Symbol, lot, camp.seedPrice, marginRequired))
     {
         LogPrint("[AE_LOT] OrderCalcMargin failed | sym=" + _Symbol, LOG_LEVEL_WARN);
@@ -727,20 +716,14 @@ SSymbolProfile spAdd2 = SY_GetProfile(_Symbol);
        ((spAdd2.tickAsk > 0.0) ? spAdd2.tickAsk : SymbolInfoDouble(_Symbol, SYMBOL_ASK))
        : ((spAdd2.tickBid > 0.0) ? spAdd2.tickBid : SymbolInfoDouble(_Symbol, SYMBOL_BID));
     double addSL = camp.campaignSL;
+    // VERBATIM REPAIR: Manual formula — no OrderCalcProfit (avoids 100x pips mode inflation)
     double riskAmount = MathAbs(currentPrice - addSL) * addLot * spAdd2.tickValue;
-    ENUM_ORDER_TYPE addOrderType = (direction == DIRECTION_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-    double addProfitCheck = 0.0;
-    if(OrderCalcProfit(addOrderType, _Symbol, addLot, currentPrice, addSL, addProfitCheck))
-    {
-        LogPrint("[LOT_CALCPROFIT] pyramid heat | sym=" + _Symbol +
-                 " | orderType=" + IntegerToString(addOrderType) +
-                 " | volume=" + DoubleToString(addLot, 4) +
-                 " | entry=" + DoubleToString(currentPrice, _Digits) +
-                 " | sl=" + DoubleToString(addSL, _Digits) +
-                 " | rawProfit=" + DoubleToString(addProfitCheck, 2) +
-                 " | source=OrderCalcProfit", LOG_LEVEL_DEBUG);
-        riskAmount = MathAbs(addProfitCheck);
-    }
+    LogPrint("[LOT_CALCPROFIT] pyramid heat | sym=" + _Symbol +
+             " | volume=" + DoubleToString(addLot, 4) +
+             " | entry=" + DoubleToString(currentPrice, _Digits) +
+             " | sl=" + DoubleToString(addSL, _Digits) +
+             " | rawProfit=" + DoubleToString(riskAmount, 2) +
+             " | source=formula", LOG_LEVEL_DEBUG);
 
    if(!IsPyramidHeatCapSafe(riskAmount))
    {

@@ -98,12 +98,26 @@ bool HasSMTDivergence(string corrSym, ENUM_TIMEFRAMES tf, bool bullish)
  */
 string GetCorrelatedSymbol(string primarySymbol)
 {
-   if(primarySymbol == "EURUSD") return "GBPUSD";
-   if(primarySymbol == "GBPUSD") return "EURUSD";
-   if(primarySymbol == "USDJPY") return "USDCHF";
-   if(primarySymbol == "USDCHF") return "USDJPY";
-   if(primarySymbol == "XAUUSD") return "XAGUSD";
-   if(primarySymbol == "XAGUSD") return "XAUUSD";
+   string sym = primarySymbol;
+   StringToUpper(sym);
+
+   // Generic base-pair matching: strip broker suffixes (micro, mini, .m, etc.)
+   // by checking if the input contains any known base pair.
+   struct SPairMap { string base; string correlate; };
+   SPairMap pairs[] = {
+      {"EURUSD", "GBPUSD"},
+      {"GBPUSD", "EURUSD"},
+      {"USDJPY", "USDCHF"},
+      {"USDCHF", "USDJPY"},
+      {"XAUUSD", "XAGUSD"},
+      {"XAGUSD", "XAUUSD"}
+   };
+
+   for(int i = 0; i < ArraySize(pairs); i++)
+   {
+      if(StringFind(sym, pairs[i].base) >= 0)
+         return pairs[i].correlate;
+   }
 
    return "";
 }

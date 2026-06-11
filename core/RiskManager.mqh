@@ -11,9 +11,11 @@
  #include <OmakFxYO/core/CoreTypes.mqh>
  #include <OmakFxYO/core/LogGovernor.mqh>
 #include <OmakFxYO/core/RiskGate.mqh>
+#include <OmakFxYO/core/RiskCore.mqh>
 
 extern double g_symbolRiskFloor;
    extern double g_minSLPoints;
+   extern ENUM_EXECUTION_BRANCH g_activeBranch;
 
   //+------------------------------------------------------------------+
  //| GetCurrencyConversionRate — Get conversion rate for currency pair |
@@ -58,9 +60,10 @@ extern double g_symbolRiskFloor;
  }
 
  //+------------------------------------------------------------------+
- //| ProjectedSLProfit — OrderCalcProfit() validation of SL risk      |
- //| Returns projected loss in account currency. Returns 0.0 on        |
- //| failure. Uses ORDER_TYPE_BUY/SELL based on direction.            |
+ //| ProjectedSLProfit — Manual risk calculation in account currency   |
+ //| VERBATIM REPAIR: Universal Risk Sincerity (§V)                   |
+ //| Bypasses 100x 'pips mode' inflation by calculating risk via      |
+ //| (slDist / tickSize) * tickValue * lots — no OrderCalcProfit.     |
  //+------------------------------------------------------------------+
  double ProjectedSLProfit(
      const string symbol,
@@ -73,84 +76,121 @@ extern double g_symbolRiskFloor;
      if(lots <= 0.0 || entryPrice <= 0.0 || slPrice <= 0.0)
          return 0.0;
 
-     ENUM_ORDER_TYPE orderType = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+     double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+     double tickSize  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+     double slDist    = MathAbs(entryPrice - slPrice);
 
-     double profit = 0.0;
-     if(!OrderCalcProfit(orderType, symbol, lots, entryPrice, slPrice, profit))
+     if(tickValue <= 0.0 || tickSize <= 0.0 || slDist <= 0.0)
      {
-         LogPrint("[PROFIT_PROJ_FAIL] OrderCalcProfit failed | sym=" + symbol +
+         LogPrint("[PROFIT_PROJ_FAIL] Invalid params for manual calc | sym=" + symbol +
                   " | lots=" + DoubleToString(lots, 2) +
-                  " | entry=" + DoubleToString(entryPrice, _Digits) +
-                  " | sl=" + DoubleToString(slPrice, _Digits), LOG_LEVEL_WARN);
+                  " | tickValue=" + DoubleToString(tickValue, 8) +
+                  " | tickSize=" + DoubleToString(tickSize, 8) +
+                  " | slDist=" + DoubleToString(slDist, _Digits), LOG_LEVEL_WARN);
          return 0.0;
      }
 
-      LogPrint("[LOT_CALCPROFIT] sym=" + symbol +
-               " | orderType=" + IntegerToString(orderType) +
-               " | lots=" + DoubleToString(lots, 2) +
-               " | entry=" + DoubleToString(entryPrice, _Digits) +
-               " | sl=" + DoubleToString(slPrice, _Digits) +
-               " | rawProfit=" + DoubleToString(profit, 2) +
-               " | source=OrderCalcProfit", LOG_LEVEL_DEBUG);
-      double projectedLoss = MathAbs(profit);
+     double projectedLoss = (slDist / tickSize) * tickValue * lots;
+
+     LogPrint("[LOT_CALCPROFIT] sym=" + symbol +
+              " | lots=" + DoubleToString(lots, 2) +
+              " | entry=" + DoubleToString(entryPrice, _Digits) +
+              " | sl=" + DoubleToString(slPrice, _Digits) +
+              " | slDist=" + DoubleToString(slDist, _Digits) +
+              " | tickValue=" + DoubleToString(tickValue, 8) +
+              " | tickSize=" + DoubleToString(tickSize, 8) +
+              " | rawProfit=" + DoubleToString(projectedLoss, 2) +
+              " | source=formula", LOG_LEVEL_DEBUG);
 
      return projectedLoss;
  }
 
 //+------------------------------------------------------------------+
-  //| Detect Symbol Minimum Risk Capability                             |
-   //| Returns: minimum $ risk for 1 minLot at the given test SL distance |
-   //| testSLPoints should reflect the max expected structural SL for    |
-   //| the symbol (e.g., ~250pt not minimum 50pt). Call once in OnInit().|
+//| RM_ComputeEntryTFSL — Compute Manipulation Leg SL on Entry TF   |
+//|                                                                  |
+//| VERBATIM REPAIR: Manipulation Leg SL (§V)                       |
+//| Finds the local extreme of the leg that swept liquidity on the   |
+//| Entry TF (M5/M15) in the window immediately preceding CISD.      |
+//| Returns the stop loss price.                                     |
+//+------------------------------------------------------------------+
+double RM_ComputeEntryTFSL(const string symbol, ENUM_EXECUTION_BRANCH branch, bool isBuy, double entryPrice)
+{
+   ENUM_TIMEFRAMES entryTF = (branch == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
+   int manipBars = 10;
+   double manipExtreme = (isBuy)
+      ? iLow(symbol, entryTF, iLowest(symbol, entryTF, MODE_LOW, manipBars, 1))
+      : iHigh(symbol, entryTF, iHighest(symbol, entryTF, MODE_HIGH, manipBars, 1));
+
+   if(manipExtreme <= 0.0)
+      return 0.0;
+
+   double buffer = InpMinSLPoints * SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double sl = (isBuy) ? manipExtreme - buffer : manipExtreme + buffer;
+
+   LogPrint("[SL_MANIP_LEG] " + (isBuy ? "BUY" : "SELL") +
+            " | entryTF=" + EnumToString(entryTF) +
+            " | manipExtreme=" + DoubleToString(manipExtreme, _Digits) +
+            " | entry=" + DoubleToString(entryPrice, _Digits) +
+            " | dist=" + DoubleToString(MathAbs(entryPrice - manipExtreme), _Digits) +
+            " | sl=" + DoubleToString(sl, _Digits), LOG_LEVEL_INFO);
+   return sl;
+}
+
+// VERBATIM REPAIR: Manipulation-Leg SL & Persistence Sync (§2)
+double GetManipulationLegExtreme(const string symbol, ENUM_TIMEFRAMES tf, bool isLong) {
+    int lookback = 10;
+    int extremeBar = isLong ? iLowest(symbol, tf, MODE_LOW, lookback, 1)
+                            : iHighest(symbol, tf, MODE_HIGH, lookback, 1);
+    return isLong ? iLow(symbol, tf, extremeBar) : iHigh(symbol, tf, extremeBar);
+}
+
+// VERBATIM REPAIR: Synchronous Sequence (§I) — Internal Risk SL tracking
+double g_internalRiskSL = 0.0;
+
+void SyncInternalSL(double sl)
+{
+    g_internalRiskSL = sl;
+    LogPrint("[SL_SYNC] Internal Risk SL synced to " + DoubleToString(sl, _Digits), LOG_LEVEL_INFO);
+}
+
+//+------------------------------------------------------------------+
+   //| Detect Symbol Minimum Risk Capability — ITF-anchored, Enum-safe  |
+   //| Structural SL via ITF swings (H1/H4), OrderCalcProfit.          |
    //+------------------------------------------------------------------+
-    double DetectSymbolRiskFloor(const string symbol, double testSLPoints = 250.0)
+   double DetectSymbolRiskFloor(const string symbol, ENUM_EXECUTION_BRANCH branch, bool isBuy = true)
    {
-       SSymbolProfile spFloor = SY_GetProfile(symbol);
-       if(!spFloor.isValid)
-       {
-           LogPrint("[RISK_FLOOR] Invalid profile for " + symbol, LOG_LEVEL_ERROR);
-           return -1.0;
-       }
+        // VERBATIM REPAIR: LTF Manipulation Leg SL (§V)
+        // Law: Invalidation must sit on the leg that swept liquidity on the Entry TF.
+        ENUM_TIMEFRAMES entryTF = (branch == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
+        int manipulationBars = 10; // Scan window for the leg preceding CISD
+        double manipulationExtreme = (isBuy) ? iLow(symbol, entryTF, iLowest(symbol, entryTF, MODE_LOW, manipulationBars, 1)) 
+                                             : iHigh(symbol, entryTF, iHighest(symbol, entryTF, MODE_HIGH, manipulationBars, 1));
 
-double minLot = spFloor.volumeMin;
-        double maxLot = spFloor.volumeMax;
-        if(minLot <= 0.0 || maxLot <= 0.0)
-        {
-            LogPrint("[RISK_FLOOR] Invalid lot limits | minLot=" + DoubleToString(minLot, 4) +
-                     " | maxLot=" + DoubleToString(maxLot, 4) + " | sym=" + symbol, LOG_LEVEL_ERROR);
-            return -1.0;
-        }
+        double currentPrice = (isBuy) ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
+        double structuralSLDist = MathAbs(currentPrice - manipulationExtreme);
 
-        double testPrice = (spFloor.tickBid > 0.0) ? spFloor.tickBid : ((spFloor.tickAsk > 0.0) ? spFloor.tickAsk : SymbolInfoDouble(symbol, SYMBOL_BID));
-        if(testPrice <= 0.0) testPrice = SymbolInfoDouble(symbol, SYMBOL_ASK);
-        if(testPrice <= 0.0)
-        {
-            LogPrint("[RISK_FLOOR] Invalid price for " + symbol, LOG_LEVEL_ERROR);
-            return -1.0;
-        }
+        // Idempotence Guard: Ensure SL is at least broker minimum
+        if (structuralSLDist <= 0) structuralSLDist = InpMinSLPoints * SymbolInfoDouble(symbol, SYMBOL_POINT);
 
-       // Use minLot for the OrderCalcProfit test (not 1.0 lot — which may exceed maxLot for some instruments)
-       double testSL = testPrice - (testSLPoints * spFloor.point);
-       double profit = 0.0;
+        // VERBATIM REPAIR: Manual Risk Calculation (§V)
+        double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+        double tickSize  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+        double minLot    = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
 
-       if(!OrderCalcProfit(ORDER_TYPE_BUY, symbol, minLot, testPrice, testSL, profit))
-       {
-           LogPrint("[RISK_FLOOR] OrderCalcProfit failed for minLot=" + DoubleToString(minLot, 4) +
-                    " test | sym=" + symbol, LOG_LEVEL_ERROR);
-           return -1.0;
-       }
+        double minLotRisk = (structuralSLDist / tickSize) * tickValue * minLot;
+        double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+        double riskPercent = (equity > 0) ? (minLotRisk / equity * 100.0) : 100.0;
 
-        double lossForMinLotAtTestSL = MathAbs(profit);
+       // VERBATIM REPAIR: The Affordability Bridge (§XIII)
+        // Determines structural permission at a wider band (g_riskPercentAffordMin, e.g. 20%) while
+        // sizing execution risk at a narrow band (g_riskPercentTrade, e.g. 1%).
+        bool isTradeable = (riskPercent <= g_riskPercentAffordMin);
+        g_symbolUntradeable = !isTradeable;
 
-        LogPrint("[RISK_FLOOR] symbol=" + symbol +
-                 " | calcMode=" + IntegerToString(spFloor.calcMode) +
-                 " | class=" + EnumToString(spFloor.classification) +
-                 " | minLot=" + DoubleToString(minLot, 4) +
-                 " | testSL=" + DoubleToString(testSLPoints, 0) + "pt" +
-                 " | minLotRiskAtTestSL=$" + DoubleToString(lossForMinLotAtTestSL, 2),
-                 LOG_LEVEL_WARN);
-
-        return lossForMinLotAtTestSL;
+        string rm_status = StringFormat("[RISK_FLOOR] %s | Risk=%.2f%% > Bridge=%.2f%% | Status=%s",
+                 symbol, riskPercent, g_riskPercentAffordMin, g_symbolUntradeable ? "UNTRADEABLE" : "TRADEABLE");
+        LogPrint(rm_status, g_symbolUntradeable ? LOG_LEVEL_WARN : LOG_LEVEL_INFO);
+       return minLotRisk;
    }
 
   //+------------------------------------------------------------------+
@@ -341,9 +381,6 @@ if(slPoints <= 0.0)
 
         maxLot = spLot.volumeMax;
 
-      double profit = 0;
-      ENUM_ORDER_TYPE orderType = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-
       if(entryPrice <= 0.0 || slPrice <= 0.0)
       {
           LogPrint("[RISK_FLOOR_BLOCK] reason=ENTRY_OR_SL_INVALID | entryPrice=" + DoubleToString(entryPrice, _Digits) +
@@ -355,73 +392,31 @@ if(slPoints <= 0.0)
           return 0.0;
       }
 
-      if(!OrderCalcProfit(orderType, symbol, maxLot, entryPrice, slPrice, profit))
+      // VERBATIM REPAIR: Universal Risk Sincerity (§V)
+      // Manual formula bypasses 100x 'pips mode' inflation from OrderCalcProfit.
+      double slDist = MathAbs(entryPrice - slPrice);
+      double lossPerLot = (slDist / tickSize) * tickValue;
+
+      if(lossPerLot <= 0.0)
       {
-          LogPrint("[RISK_FLOOR_BLOCK] reason=ORDER_CALC_PROFIT_FAILED | symbol=" + symbol +
-                   " | maxLot=" + DoubleToString(maxLot, 2) +
-                   " | entry=" + DoubleToString(entryPrice, _Digits) +
-                   " | sl=" + DoubleToString(slPrice, _Digits), LOG_LEVEL_ERROR);
-           LogPrint("[LOT_CALC_FAIL] OrderCalcProfit failed | sym=" + symbol, LOG_LEVEL_ERROR);
+          LogPrint("[RISK_FLOOR_BLOCK] reason=LOSS_PER_LOT_ZERO | lossPerLot=" + DoubleToString(lossPerLot, 5) +
+                   " | slDist=" + DoubleToString(slDist, _Digits) +
+                   " | tickSize=" + DoubleToString(tickSize, 8) +
+                   " | tickValue=" + DoubleToString(tickValue, 8) +
+                   " | symbol=" + symbol, LOG_LEVEL_ERROR);
           outFailCode = RG_FAIL_PROFIT_CALC;
           return 0.0;
       }
 
-      if(profit == 0)
-      {
-          LogPrint("[RISK_FLOOR_BLOCK] reason=ORDER_CALC_PROFIT_ZERO | symbol=" + symbol +
-                   " | maxLot=" + DoubleToString(maxLot, 2) +
-                   " | entry=" + DoubleToString(entryPrice, _Digits) +
-                   " | sl=" + DoubleToString(slPrice, _Digits), LOG_LEVEL_ERROR);
-           LogPrint("[LOT_CALC_FAIL] OrderCalcProfit returned zero | sym=" + symbol, LOG_LEVEL_ERROR);
-          outFailCode = RG_FAIL_PROFIT_ZERO;
-          return 0.0;
-      }
-
-       LogPrint("[LOT_CALCPROFIT] maxLot | sym=" + symbol +
-                " | orderType=" + IntegerToString(orderType) +
-                " | volume=" + DoubleToString(maxLot, 2) +
-                " | entry=" + DoubleToString(entryPrice, _Digits) +
-                " | sl=" + DoubleToString(slPrice, _Digits) +
-                " | rawProfit=" + DoubleToString(profit, 2) +
-                " | source=OrderCalcProfit", LOG_LEVEL_DEBUG);
-       double lossPerMaxLot = MathAbs(profit);
-       
-        if(lossPerMaxLot <= 0.0)
-       {
-           LogPrint("[RISK_FLOOR_BLOCK] reason=LOSS_PER_MAXLOT_ZERO | lossPerMaxLot=" + DoubleToString(lossPerMaxLot, 2) +
-                    " | maxLot=" + DoubleToString(maxLot, 2) +
-                    " | entry=" + DoubleToString(entryPrice, _Digits) +
-                    " | sl=" + DoubleToString(slPrice, _Digits) +
-                    " | symbol=" + symbol, LOG_LEVEL_ERROR);
-           LogPrint(StringFormat("[LOT_CALC_FAIL] OrderCalcProfit returned %.2f for maxLot %.2f — profit calculation failed. entry=%.5f, sl=%.5f, orderType=%s",
-                    lossPerMaxLot, maxLot, entryPrice, slPrice,
-                    EnumToString(orderType)), LOG_LEVEL_ERROR);
-          outFailCode = RG_FAIL_PROFIT_CALC;
-          return 0.0;
-      }
-      
-      double lossPerLot = lossPerMaxLot / maxLot;
-      
-       if(lossPerLot <= 0.0)
-       {
-           LogPrint("[RISK_FLOOR_BLOCK] reason=LOSS_PER_LOT_ZERO | lossPerLot=" + DoubleToString(lossPerLot, 5) +
-                    " | maxLot=" + DoubleToString(maxLot, 2) +
-                    " | lossPerMaxLot=" + DoubleToString(lossPerMaxLot, 2) +
-                    " | symbol=" + symbol, LOG_LEVEL_ERROR);
-           LogPrint(StringFormat("[LOT_CALC_FAIL] lossPerLot %.5f <= 0 (division error) — returning 0.0. maxLot=%.2f, lossPerMaxLot=%.2f, entry=%.5f, sl=%.5f",
-                    lossPerLot, maxLot, lossPerMaxLot, entryPrice, slPrice), LOG_LEVEL_ERROR);
-          outFailCode = RG_FAIL_PROFIT_CALC;
-          return 0.0;
-      }
-      
       double rawLot = riskAmount / lossPerLot;
 
-      LogPrint("[LOT_DIAG] OrderCalcProfit method | maxLot=" + DoubleToString(maxLot, 2) +
-               " | lossPerMaxLot=" + DoubleToString(lossPerMaxLot, 2) +
+      LogPrint("[LOT_DIAG] manual formula | slDist=" + DoubleToString(slDist, _Digits) +
+               " | tickSize=" + DoubleToString(tickSize, 8) +
+               " | tickValue=" + DoubleToString(tickValue, 8) +
                " | lossPerLot=" + DoubleToString(lossPerLot, 4) +
                " | rawLot=" + DoubleToString(rawLot, 6) +
                " | riskAmount=" + DoubleToString(riskAmount, 2),
-               LOG_LEVEL_DEBUG);  // P8 Fix: Reduced to DEBUG
+               LOG_LEVEL_DEBUG);
 
         if(rawLot <= 0.0)
         {
@@ -449,32 +444,18 @@ if(slPoints <= 0.0)
             return 0.0;
         }
 
-       double verifyProfit = 0;
-       if(OrderCalcProfit(orderType, symbol, rawLot, entryPrice, slPrice, verifyProfit))
-       {
-           LogPrint("[LOT_CALCPROFIT] verify | sym=" + symbol +
-                    " | orderType=" + IntegerToString(orderType) +
-                    " | volume=" + DoubleToString(rawLot, 6) +
-                    " | entry=" + DoubleToString(entryPrice, _Digits) +
-                    " | sl=" + DoubleToString(slPrice, _Digits) +
-                    " | rawProfit=" + DoubleToString(verifyProfit, 2) +
-                    " | source=OrderCalcProfit", LOG_LEVEL_DEBUG);
-           double verifyLoss = MathAbs(verifyProfit);
-           double overexposureRatio = verifyLoss / riskAmount;
-           if(overexposureRatio > 1.5)
-           {
-               LogPrint("[RISK_FLOOR_BLOCK] reason=OVEREXPOSURE | verifyLoss=" + DoubleToString(verifyLoss, 2) +
-                        " | intendedRisk=" + DoubleToString(riskAmount, 2) +
-                        " | ratio=" + DoubleToString(overexposureRatio, 2) +
-                        " | symbol=" + symbol, LOG_LEVEL_ERROR);
-                LogPrint("[LOT_CALC_FAIL] OVEREXPOSURE | verifyLoss=" + DoubleToString(verifyLoss, 2) +
-                         " | intendedRisk=" + DoubleToString(riskAmount, 2) +
-                         " | ratio=" + DoubleToString(overexposureRatio, 2) +
-                         " | symbol=" + symbol, LOG_LEVEL_ERROR);
-               outFailCode = RG_FAIL_LOT_ZERO;
-               return 0.0;
-           }
-       }
+        // VERBATIM REPAIR: Manual verification via tickValue/tickSize formula
+        double verifyLoss = (slDist / tickSize) * tickValue * rawLot;
+        double overexposureRatio = verifyLoss / riskAmount;
+        if(overexposureRatio > 1.5)
+        {
+            LogPrint("[RISK_FLOOR_BLOCK] reason=OVEREXPOSURE | verifyLoss=" + DoubleToString(verifyLoss, 2) +
+                     " | intendedRisk=" + DoubleToString(riskAmount, 2) +
+                     " | ratio=" + DoubleToString(overexposureRatio, 2) +
+                     " | symbol=" + symbol, LOG_LEVEL_ERROR);
+            outFailCode = RG_FAIL_LOT_ZERO;
+            return 0.0;
+        }
 
 double finalLot = rawLot;
 
@@ -518,35 +499,25 @@ double finalLot = rawLot;
             return 0.0;
         }
 
-        // P3 Fix: Risk cap - never exceed 5% of account per single trade — uses OrderCalcProfit for truth
+        // P3 Fix: Risk cap - never exceed 5% of account per single trade — uses manual formula
        double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
        if(entryPrice > 0 && slPrice > 0 && MathAbs(entryPrice - slPrice) > 0 && spLot.contractSize > 0)
        {
-           double lossPerMaxLotCheck = 0.0;
-           if(OrderCalcProfit(orderType, symbol, maxLot, entryPrice, slPrice, lossPerMaxLotCheck))
+           double slDistCap = MathAbs(entryPrice - slPrice);
+           double lossPerLotCheck = (slDistCap / tickSize) * tickValue;
+           if(lossPerLotCheck > 0)
            {
-               LogPrint("[LOT_CALCPROFIT] risk cap | sym=" + symbol +
-                        " | orderType=" + IntegerToString(orderType) +
-                        " | volume=" + DoubleToString(maxLot, 2) +
-                        " | entry=" + DoubleToString(entryPrice, _Digits) +
-                        " | sl=" + DoubleToString(slPrice, _Digits) +
-                        " | rawProfit=" + DoubleToString(lossPerMaxLotCheck, 2) +
-                        " | source=OrderCalcProfit", LOG_LEVEL_DEBUG);
-               double lossPerLotCheck = MathAbs(lossPerMaxLotCheck) / maxLot;
-               if(lossPerLotCheck > 0)
+               double maxRiskLot = (accountBalance * 0.05) / lossPerLotCheck;
+               if(finalLot > maxRiskLot && maxRiskLot > minLot)
                {
-                   double maxRiskLot = (accountBalance * 0.05) / lossPerLotCheck;
-                   if(finalLot > maxRiskLot && maxRiskLot > minLot)
-                   {
-LogPrint("[LOT_CAP] Risk cap applied | old=" + DoubleToString(finalLot, 5) +
+LogPrint("[LOT_CAP] Risk cap applied (manual formula) | old=" + DoubleToString(finalLot, 5) +
                               " | capped=" + DoubleToString(maxRiskLot, 5), LOG_LEVEL_DEBUG);
                        finalLot = MathFloor(maxRiskLot / lotStep + 0.5) * lotStep;
                    }
                }
-           }
-       }
+            }
 
-       LogPrint("[LOT_OK] finalLot=" + DoubleToString(finalLot, 4) +
+        LogPrint("[LOT_OK] finalLot=" + DoubleToString(finalLot, 4) +
                    " | min=" + DoubleToString(minLot, 4) +
                    " | max=" + DoubleToString(maxLot, 4) +
                    " | step=" + DoubleToString(lotStep, 4),
@@ -574,12 +545,10 @@ LogPrint("[LOT_CAP] Risk cap applied | old=" + DoubleToString(finalLot, 5) +
    }
 
 //+------------------------------------------------------------------+
-//| CalculateRiskLot — Authoritative lot sizing using OrderCalcProfit|
-//| Trusts broker OrderCalcProfit as ground truth for all calc modes: |
-//| forex, crypto, synthetic, index CFDs, cent/micro/nano accounts.  |
-//| No simplified formula fallback — only OrderCalcProfit.           |
-//| Logs all inputs/outputs per AGENTS.md §XI (OrderCalcProfit       |
-//| Instrumentation).                                                 |
+//| CalculateRiskLot — Manual lot sizing via tickValue/tickSize      |
+//| VERBATIM REPAIR: Universal Risk Sincerity (§V)                   |
+//| Replaces OrderCalcProfit (100x inflation in pips mode) with      |
+//| manual formula: risk / ((slDist/tickSize) * tickValue).          |
 //+------------------------------------------------------------------+
 double CalculateRiskLot(SLockedSignal &signal, double riskPct = 1.0)
 {
@@ -591,11 +560,12 @@ double CalculateRiskLot(SLockedSignal &signal, double riskPct = 1.0)
         return 0.0;
     }
 
-    double riskAmount = equity * (riskPct / 100.0);
+    double activeRiskPct = ResolveActiveRiskPct(signal.executionMode, InpRiskPercent);
+    double riskAmount = equity * (activeRiskPct / 100.0);
     if(riskAmount <= 0.0)
     {
         LogPrint("[LOT_CALC_FAIL] riskAmount <= 0 | equity=" + DoubleToString(equity, 2) +
-                 " | riskPct=" + DoubleToString(riskPct, 4) +
+                 " | riskPct=" + DoubleToString(activeRiskPct, 4) +
                  " | GUID=" + IntegerToString(guid), LOG_LEVEL_ERROR);
         return 0.0;
     }
@@ -611,47 +581,58 @@ double CalculateRiskLot(SLockedSignal &signal, double riskPct = 1.0)
         return 0.0;
     }
 
-    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-    if(minLot <= 0.0)
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tickValue <= 0.0 || tickSize <= 0.0)
     {
-        LogPrint("[LOT_CALC_FAIL] minLot <= 0 | GUID=" + IntegerToString(guid), LOG_LEVEL_ERROR);
+        LogPrint("[LOT_CALC_FAIL] Invalid tickValue/tickSize | GUID=" + IntegerToString(guid) +
+                 " | tickValue=" + DoubleToString(tickValue, 8) +
+                 " | tickSize=" + DoubleToString(tickSize, 8), LOG_LEVEL_ERROR);
         return 0.0;
     }
 
+    double lossPerLot = (slDist / tickSize) * tickValue;
+    if(lossPerLot <= 0.0)
+    {
+        LogPrint("[LOT_CALC_FAIL] lossPerLot <= 0 | GUID=" + IntegerToString(guid) +
+                 " | lossPerLot=" + DoubleToString(lossPerLot, 5), LOG_LEVEL_ERROR);
+        return 0.0;
+    }
+
+    double desiredLot = riskAmount / lossPerLot;
+
+    // === OrderCalcProfit API validation ===
+    double apiProfit = 0.0;
     ENUM_ORDER_TYPE orderType = (signal.direction == DIRECTION_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-    double projectedLoss = 0.0;
 
-    if(!OrderCalcProfit(orderType, _Symbol, minLot, entryPrice, slPrice, projectedLoss))
+    if(OrderCalcProfit(orderType, _Symbol, desiredLot, entryPrice, slPrice, apiProfit))
     {
-        LogPrint("[LOT_CALC_FAIL] OrderCalcProfit API failed | GUID=" + IntegerToString(guid) +
-                 " | orderType=" + IntegerToString(orderType) +
-                 " | symbol=" + _Symbol +
-                 " | minLot=" + DoubleToString(minLot, 4) +
-                 " | entryPrice=" + DoubleToString(entryPrice, _Digits) +
-                 " | stopLoss=" + DoubleToString(slPrice, _Digits), LOG_LEVEL_ERROR);
-        return 0.0;
+        double apiRisk = MathAbs(apiProfit);
+        double mismatchRatio = apiRisk / riskAmount;
+
+        LogPrint("[LOT_API_CHECK] GUID=" + IntegerToString(guid) +
+                 " | formulaRisk=" + DoubleToString(lossPerLot * desiredLot, 2) +
+                 " | apiRisk=" + DoubleToString(apiRisk, 2) +
+                 " | ratio=" + DoubleToString(mismatchRatio, 4) +
+                 " | desiredLot=" + DoubleToString(desiredLot, 4), LOG_LEVEL_INFO);
+
+        if(mismatchRatio > 1.10 || mismatchRatio < 0.90)
+        {
+            desiredLot = riskAmount / (apiRisk / desiredLot);
+
+            LogPrint("[LOT_RECALC_API] GUID=" + IntegerToString(guid) +
+                     " | Original=" + DoubleToString(riskAmount / lossPerLot, 4) +
+                     " | API-Corrected=" + DoubleToString(desiredLot, 4) +
+                     " | apiRisk=" + DoubleToString(apiRisk, 2), LOG_LEVEL_INFO);
+        }
+    }
+    else
+    {
+        LogPrint("[LOT_API_FAIL] OrderCalcProfit failed | GUID=" + IntegerToString(guid) +
+                 " | Error=" + IntegerToString(GetLastError()), LOG_LEVEL_WARN);
     }
 
-    double absLoss = MathAbs(projectedLoss);
-    LogPrint("[LOT_CALCPROFIT] GUID=" + IntegerToString(guid) +
-             " | orderType=" + IntegerToString(orderType) +
-             " | symbol=" + _Symbol +
-             " | minLot=" + DoubleToString(minLot, 4) +
-             " | entryPrice=" + DoubleToString(entryPrice, _Digits) +
-             " | stopLoss=" + DoubleToString(slPrice, _Digits) +
-             " | rawProfit=" + DoubleToString(projectedLoss, 2) +
-             " | projectedLoss=" + DoubleToString(absLoss, 2) +
-             " | slDist=" + DoubleToString(slDist, _Digits) +
-             " | source=OrderCalcProfit", LOG_LEVEL_INFO);
-
-    if(absLoss <= 0.0)
-    {
-        LogPrint("[LOT_CALC_FAIL] OrderCalcProfit returned zero loss | GUID=" + IntegerToString(guid), LOG_LEVEL_ERROR);
-        return 0.0;
-    }
-
-    double desiredLot = (riskAmount / absLoss) * minLot;
-
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
     double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
     if(step > 0.0)
         desiredLot = MathFloor(desiredLot / step) * step;
@@ -666,32 +647,24 @@ double CalculateRiskLot(SLockedSignal &signal, double riskPct = 1.0)
         desiredLot = maxLot;
     }
 
-    double verifyLoss = 0.0;
-    if(OrderCalcProfit(orderType, _Symbol, desiredLot, entryPrice, slPrice, verifyLoss))
+    // VERBATIM REPAIR: Manual verification
+    double verifyLoss = (slDist / tickSize) * tickValue * desiredLot;
+    if(verifyLoss > riskAmount * 1.2)
     {
-        double verifyAbs = MathAbs(verifyLoss);
-        if(verifyAbs > riskAmount * 1.2)
-        {
-            LogPrint("[RISK_FLOOR_BLOCK] GUID=" + IntegerToString(guid) +
-                     " | projectedRisk=" + DoubleToString(verifyAbs, 2) +
-                     " | exceedsBudget=" + DoubleToString(riskAmount, 2) +
-                     " | ratio=" + DoubleToString(verifyAbs / riskAmount, 2) +
-                     " | desiredLot=" + DoubleToString(desiredLot, 4) +
-                     " | source=OrderCalcProfit", LOG_LEVEL_WARN);
-            return 0.0;
-        }
-        LogPrint("[LOT_VERIFY] GUID=" + IntegerToString(guid) +
+        LogPrint("[RISK_FLOOR_BLOCK] GUID=" + IntegerToString(guid) +
+                 " | projectedRisk=" + DoubleToString(verifyLoss, 2) +
+                 " | exceedsBudget=" + DoubleToString(riskAmount, 2) +
+                 " | ratio=" + DoubleToString(verifyLoss / riskAmount, 2) +
                  " | desiredLot=" + DoubleToString(desiredLot, 4) +
-                 " | verifyLoss=" + DoubleToString(verifyAbs, 2) +
-                 " | riskAmount=" + DoubleToString(riskAmount, 2) +
-                 " | ratio=" + DoubleToString(verifyAbs / riskAmount, 2) +
-                 " | source=OrderCalcProfit", LOG_LEVEL_INFO);
+                 " | source=formula", LOG_LEVEL_WARN);
+        return 0.0;
     }
-    else
-    {
-        LogPrint("[LOT_VERIFY_FAIL] OrderCalcProfit verification failed | GUID=" + IntegerToString(guid) +
-                 " | desiredLot=" + DoubleToString(desiredLot, 4), LOG_LEVEL_WARN);
-    }
+    LogPrint("[LOT_VERIFY] GUID=" + IntegerToString(guid) +
+             " | desiredLot=" + DoubleToString(desiredLot, 4) +
+             " | verifyLoss=" + DoubleToString(verifyLoss, 2) +
+             " | riskAmount=" + DoubleToString(riskAmount, 2) +
+             " | ratio=" + DoubleToString(verifyLoss / riskAmount, 2) +
+             " | source=formula", LOG_LEVEL_INFO);
 
     LogPrint("[LOT_OK] GUID=" + IntegerToString(guid) +
              " | lot=" + DoubleToString(desiredLot, 4) +
@@ -699,7 +672,7 @@ double CalculateRiskLot(SLockedSignal &signal, double riskPct = 1.0)
              " | riskPct=" + DoubleToString(riskPct, 4) +
              " | riskAmount=" + DoubleToString(riskAmount, 2) +
              " | minLot=" + DoubleToString(minLot, 4) +
-             " | source=OrderCalcProfit", LOG_LEVEL_INFO);
+             " | source=formula", LOG_LEVEL_INFO);
 
     return desiredLot;
 }
@@ -728,38 +701,30 @@ double NormalizeLot(double rawLot)
 }
 
 //+------------------------------------------------------------------+
-//| CalculateAgnosticLot — Universal structural lot sizing           |
-//| Uses OrderCalcProfit for any instrument type:                    |
-//| Standard, Micro, Cent, Nano, Synthetic, Crypto, Index CFDs.     |
-//| Stop distance is structural (protected swing), NOT fixed pts.   |
+//| CalculateAgnosticLot — Universal structural lot sizing (manual)  |
+//| VERBATIM REPAIR: Universal Risk Sincerity (§V)                   |
+//| Uses tickValue/tickSize formula instead of OrderCalcProfit to    |
+//| avoid 100x inflation in tester pips mode.                        |
 //+------------------------------------------------------------------+
 double CalculateAgnosticLot(double entry, double sl, double riskPct)
 {
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double slDist    = MathAbs(entry - sl);
 
-   double lossPerMinLot = 0.0;
-   bool calcProfitOk = OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, minLot, entry, sl, lossPerMinLot);
+   if(tickValue <= 0.0 || tickSize <= 0.0 || slDist <= 0.0)
+   {
+      LogPrint("[LOT_CALC_FAIL] Agnostic: invalid params | tickValue=" +
+               DoubleToString(tickValue, 8) + " | tickSize=" + DoubleToString(tickSize, 8) +
+               " | slDist=" + DoubleToString(slDist, _Digits), LOG_LEVEL_ERROR);
+      return 0.0;
+   }
 
-   if(!calcProfitOk)
-     {
-      double tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-      double slPoints = MathAbs(entry - sl) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-      lossPerMinLot = slPoints * tickVal * minLot;
-      LogPrint("[LOT_CALCPROFIT] OrderCalcProfit failed | using formula | slPts=" +
-               DoubleToString(slPoints, 1) +
-               " | tickVal=" + DoubleToString(tickVal, 6) +
-               " | formulaLoss=" + DoubleToString(lossPerMinLot, 2) +
-               " | decision=formula", LOG_LEVEL_WARN);
-     }
-   else
-     {
-      LogPrint("[LOT_CALCPROFIT] OrderCalcProfit ok | rawReturn=" +
-               DoubleToString(lossPerMinLot, 2) +
-               " | decision=OrderCalcProfit", LOG_LEVEL_DEBUG);
-     }
+   double lossPerMinLot = (slDist / tickSize) * tickValue * minLot;
 
    double maxLoss = AccountInfoDouble(ACCOUNT_EQUITY) * (riskPct / 100.0);
-   double calculatedLot = (maxLoss / MathAbs(lossPerMinLot)) * minLot;
+   double calculatedLot = (maxLoss / lossPerMinLot) * minLot;
 
    LogPrint("[LOT_CALCPROFIT] Agnostic | sym=" + _Symbol +
             " | entry=" + DoubleToString(entry, _Digits) +
@@ -768,7 +733,7 @@ double CalculateAgnosticLot(double entry, double sl, double riskPct)
             " | lossPerMinLot=" + DoubleToString(lossPerMinLot, 2) +
             " | maxLoss=" + DoubleToString(maxLoss, 2) +
             " | calculatedLot=" + DoubleToString(calculatedLot, 6) +
-            " | source=OrderCalcProfit", LOG_LEVEL_INFO);
+            " | source=formula", LOG_LEVEL_INFO);
 
    return NormalizeLot(calculatedLot);
 }

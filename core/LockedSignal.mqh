@@ -50,6 +50,16 @@ bool IsRetiredGUID(ulong guid)
     return false;
 }
 
+// VERBATIM REPAIR: Finding 4 - Forward-Only State Guard (§III.A)
+bool ValidateStateTransition(ENUM_SIGNAL_STAGE current, ENUM_SIGNAL_STAGE next) {
+    // Rule 1: No regression from READY
+    if (current == STAGE_READY && next < STAGE_READY && next != STAGE_EXPIRED) {
+        return false; 
+    }
+    
+    return true;
+}
+
 //+------------------------------------------------------------------+
 //| PERSISTENT SIGNAL LOCK — State Machine across ticks              |
 //+------------------------------------------------------------------+
@@ -91,9 +101,10 @@ ENUM_HANDOVER_STATE handoverState;  // Handover ownership state machine
       ENUM_CLOSURE_TYPE closureType; // C2 or C3
  
        // Timestamps
-       datetime m_detectionTime; // Seeded when closure passes all filters (TTL anchor)
-       datetime lockTime;
-        datetime commitTime;      // FIX 1: When signal was committed (validated + ready)
+        datetime m_detectionTime; // Seeded when closure passes all filters (TTL anchor)
+        datetime lockTime;
+        ENUM_TIMEFRAMES entryTF;   // Entry timeframe for duration-based expiry (Set at Lock)
+         datetime commitTime;      // FIX 1: When signal was committed (validated + ready)
         datetime stageEntryTime;  // REGRESSION_GUARD_C3_EXPIRY: When signal entered current stage (for stage-specific expiry)
         int poiWaitBarStart;      // Bar count when entered STAGE_WAITING_FOR_POI (for timeout)
    
@@ -116,9 +127,12 @@ ENUM_HANDOVER_STATE handoverState;  // Handover ownership state machine
       int logRepeatCount;          // How many times the same marker was repeated
       
       // Tick counter for safety valve against infinite loops
-      int tickCount;                // Incremented every OnTick while locked
-      int resolveLockedCount;      // Tracks STAGE_WAITING_FOR_POI ticks
-      int maxTickCount;            // Safety valve (default 10000 ticks max)
+       int tickCount;                // Incremented every OnTick while locked
+       int resolveLockedCount;      // Tracks STAGE_WAITING_FOR_POI ticks
+       int maxTickCount;            // Safety valve (default 10000 ticks max)
+
+      // Idempotency gate: tick time of last evaluation for this signal slot
+      datetime m_lastEvaluationTick; // Prevents redundant per-tick processing when stage unchanged
      
      // Equilibrium (50% of C1 range) - TTrades POI
       double equilibrium;
@@ -171,6 +185,7 @@ ENUM_HANDOVER_STATE handoverState;  // Handover ownership state machine
         double cachedBufferPrice;
         double cachedTSpotWidth;
         bool poiWarningLogged;
+       bool m_orangeLogged;          // P7: Log idempotence — prevents repeated orange-state spam
 
 //+------------------------------------------------------------------+
 //| P10 Fix: RG pass flag - prevents duplicate RG_GATE_PASS logs for same signal
@@ -303,172 +318,19 @@ ENUM_HANDOVER_STATE handoverState;  // Handover ownership state machine
 
          static bool IsRetiredGUIDCheck(ulong guid) { return ::IsRetiredGUID(guid); }
 
-        //+------------------------------------------------------------------+
-         //| Reset — Reset signal to initial state                             |
          //+------------------------------------------------------------------+
-         void Reset()
-         {
-// Handover State Machine Guard:
-                 //   HANDOVER_ACQUIRED / HANDOVER_TRANSFERRED → block Reset
-                 //   HANDOVER_RELEASED / HANDOVER_NONE → allow Reset
-                 //   HANDOVER_FORCED_RELEASE → allow Reset (cleanup after force)
-                 // TIMEOUT: Auto-expire handover after 5 seconds to prevent ghost cascade
-                 if(IsHandoverActive())
-                 {
-                     if(handoverAcquiredTime > 0 && TimeCurrent() - handoverAcquiredTime < 5)
-                     {
-                         LogPrint("[STATE_GHOST_BLOCKED] Reset blocked by active handover" +
-                                  " | state=" + IntegerToString(handoverState) +
-                                  " | owner=" + IntegerToString(handoverOwnerId) +
-                                  " | GUID=" + IntegerToString(m_guid), LOG_LEVEL_WARN);
-                         return;
-                     }
-                     if(handoverAcquiredTime > 0)
-                     {
-                         LogPrint("[HANDOVER_TIMEOUT] Releasing stuck handover after 5s" +
-                                  " | state=" + IntegerToString(handoverState) +
-                                  " | owner=" + IntegerToString(handoverOwnerId) +
-                                  " | GUID=" + IntegerToString(m_guid), LOG_LEVEL_WARN);
-                         ForceReleaseHandover("RESET_TIMEOUT");
-                     }
-                 }
-
-// STAGE_READY Protection — Block Reset unless RG failed or structural invalid
-                  if(stage == STAGE_READY)
-                  {
-                      if(!hasFailedRG && !isStructurallyInvalid)
-                      {
-                          LogPrint("[STAGE_READY_PROTECTED] Reset blocked on protected READY signal | GUID=" + IntegerToString(m_guid), LOG_LEVEL_WARN);
-                          return;
-                      }
-                  }
-
-                 // Retire GUID before clearing to prevent reuse
-                if(m_guid != 0 && m_guid < GUID_SENTINEL_MIN)
-                {
-                    RetireGUID(m_guid);
-                }
-
-                // FIX A: Strong reset using ZeroMemory to prevent stage corruption
-               // CRITICAL: Full zeroing to catch garbage values (stage=14, 148887992, etc.)
-               ZeroMemory(this);
-                    
-            TransitionStage(STAGE_NONE);
-                m_guid = 0;
-                branchId = (ENUM_EXECUTION_BRANCH)-1;  // Invalid sentinel
-handoverState = HANDOVER_NONE;
-                handoverAcquiredTime = 0;
-                handoverOwnerId = HANDOVER_OWNER_NONE;
-                illegalTransitionCount = 0;
-               retraceAttempts = 0;
-              lastAttemptTime = 0;
-     
-            c1_high = 0.0;
-            c1_low = 0.0;
-            c1_close = 0.0;
- 
-            c2_high = 0.0;
-            c2_low = 0.0;
-            c2_open = 0.0;
-            c2_close = 0.0;
-            c2_barIndex = 0;
+          //| Reset — Reset signal to initial state                             |
+          //+------------------------------------------------------------------+
+           // VERBATIM REPAIR: Sanitized Reset (§V)
+          void Reset() {
+              // Wipe first to eliminate garbage-memory 'ghost' states
+              ZeroMemory(this); 
     
-            c3_high = 0.0;
-            c3_low = 0.0;
-            c3_open = 0.0;
-            c3_close = 0.0;
-    
-            entry_price = 0.0;
-            stop_loss = 0.0;
-            direction = DIRECTION_NONE;
-            closureType = CLOSURE_NONE;
-            executionMode = MODE_NONE;  // FIX A: Explicitly set to MODE_NONE, not 0
-              isAnticipation = false;
-    
-    m_detectionTime = 0;
-              lockTime = 0;
-               commitTime = 0;
-               stageEntryTime = 0;  // REGRESSION_GUARD_C3_EXPIRY
-               isCommitted = false;
-               isStored = false;
-              rr = 0.0;
-equilibrium = 0.0;
-             promoteFromSequenceId = 0;
-             originalClosureType = CLOSURE_NONE;
-             
-             // HTF T-Spot reset
-             htfTSpotHigh = 0.0;
-             htfTSpotLow = 0.0;
-             htfTSpotMid = 0.0;
-             
-              // LTF Entry Zone reset
-              ltfEntryHigh = 0.0;
-              ltfEntryLow = 0.0;
-              ltfEntryMid = 0.0;
-              
-// HTF CISD Range reset
-               htfCISDRange = 0.0;
-
-               // RecalculateSignalForC3 fields reset
-               symbol = "";
-               branch = BRANCH_INTRADAY;
-               poi = 0.0;
-               sl = 0.0;
-               tp = 0.0;
-
-// POI cache reset
-                 lastPOICalcTime = 0;
-                 lastPOIATR = 0.0;
-                 cachedBufferPrice = 0.0;
-                 cachedTSpotWidth = 0.0;
-                 poiWarningLogged = false;
-              executionAttempts = 0;
-              hasFailedRG = false;
-              isStructurallyInvalid = false;
-             lastExecutionAttempt = 0;
-              retryCapReached = false;
-              executionRetryCount = 0;
-              
-              // Tick counter reset
-             tickCount = 0;
-             resolveLockedCount = 0;
-             maxTickCount = 10000;
-             
-LogPrint("[STATE_CLEARED] GUID=" + IntegerToString(m_guid) +
-                 " | stage=" + EnumToString(stage) +
-                 " | closure=" + EnumToString(closureType), LOG_LEVEL_INFO);
-
-                // Setup-level metadata reset
-                m_setupStartTime = 0;
-                m_setupHtfCandleStart = 0;
-                m_setupInitialHigh = 0.0;
-                m_setupInitialLow = 0.0;
-                m_setupIsBullish = false;
-
-                // C2-specific metadata reset
-                m_c2CommitBarTime = 0;
-                m_c2HadSmallWick = false;
-                m_c2ClosureConfirmed = false;
-
-                 // C3-specific metadata reset
-                 m_c3CommitBarTime = 0;
-                 m_c3ParentC2Guid = 0;
-                 m_c3CisdConfirmed = false;
-                 m_c3EntryHigh = 0.0;
-                 m_c3EntryLow = 0.0;
-                 m_c3Equilibrium = 0.0;
-
-                 // Signal contract fields reset
-                  structuralBias = 0;
-                  continuationState = 0;
-                  invalidationState = 1;  // INVALID_VALID by default for new signals
-
-                 // Execution truth fields reset
-                 candidateEntryPrice = 0.0;
-                 requestedEntryPrice = 0.0;
-                 actualFillPrice = 0.0;
-                 fillTime = 0;
-                 fillStatus = 0;  // FILL_NONE
+              // Set explicit defaults after wipe
+              this.stage = STAGE_NONE;
+              this.handoverState = HANDOVER_NONE; 
+              this.m_guid = 0;
+              LogPrint("[MEM_SANITIZED] Signal slot cleared.", LOG_LEVEL_INFO);
           }
         
         //+------------------------------------------------------------------+
@@ -538,6 +400,7 @@ ulong GetGUID() { return m_guid; }
 
 // Lock declaration - implementation in CoreTypes.mqh after SClosureSignal definition
              bool Lock(SClosureSignal &signal, int id, ENUM_EXECUTION_BRANCH execBranch, ENUM_TIMEFRAMES tf = PERIOD_CURRENT);
+             bool Lock(double scannerMin, double scannerMax);
 
 // FIX 1: Check if signal expired (48 hour max)
            bool IsExpired() const
@@ -583,12 +446,27 @@ ulong GetGUID() { return m_guid; }
                 return (remaining < 0) ? 0 : remaining;
            }
         
-           // Stage transition with legal map — blocks illegal transitions
-           // REGRESSION_GUARD_V54_3_P0_2
-           void TransitionStage(ENUM_SIGNAL_STAGE newStage)
-           {
-               if(stage == newStage)
-                  return;
+            // Stage transition with legal map — blocks illegal transitions
+            // REGRESSION_GUARD_V54_3_P0_2
+            // BOOLEAN FSM (§III): Returns false to prevent zombie resurrection
+             bool TransitionStage(ENUM_SIGNAL_STAGE newStage)
+             {
+                 // VERBATIM REPAIR: Finding 4 - Forward-Only State Guard (§III.A)
+                 if(!ValidateStateTransition(stage, newStage))
+                 {
+                     LogPrint(StringFormat("[STATE_ILLEGAL] Blocked: %s -> %s | GUID:%I64u",
+                              EnumToString(stage), EnumToString(newStage), m_guid), LOG_LEVEL_ERROR);
+                     return false;
+                 }
+
+                 if(stage == STAGE_EXPIRED)
+                 {
+                     LogPrint("[ZOMBIE_RESURRECT_BLOCKED] GUID:" + IntegerToString(m_guid), LOG_LEVEL_ERROR);
+                     return false;
+                 }
+
+                if(stage == newStage)
+                   return true;
 
                // ========================================================
                // LEGAL TRANSITION MAP — every edge enumerated explicitly
@@ -616,11 +494,12 @@ ulong GetGUID() { return m_guid; }
                        if(!legal) reason = "AWAITING_C2 -> " + EnumToString(newStage) + " illegal; must go to WAITING_FOR_POI or EXPIRED";
                        break;
 
-                   case STAGE_AWAITING_C3_CLOSURE:
-                       legal = (newStage == STAGE_WAITING_FOR_POI ||
-                                newStage == STAGE_EXPIRED);
-                       if(!legal) reason = "AWAITING_C3 -> " + EnumToString(newStage) + " illegal; must go to WAITING_FOR_POI or EXPIRED";
-                       break;
+               case STAGE_AWAITING_C3_CLOSURE:
+                    legal = (newStage == STAGE_WAITING_FOR_POI ||
+                             newStage == STAGE_WAITING_FOR_CISD ||
+                             newStage == STAGE_EXPIRED);
+                    if(!legal) reason = "AWAITING_C3 -> " + EnumToString(newStage) + " illegal; must go to WAITING_FOR_POI, WAITING_FOR_CISD, or EXPIRED";
+                    break;
 
                    case STAGE_WAITING_FOR_POI:
                        legal = (newStage == STAGE_READY ||
@@ -630,11 +509,12 @@ ulong GetGUID() { return m_guid; }
                        if(!legal) reason = "WAITING_FOR_POI -> " + EnumToString(newStage) + " illegal; must go to READY, EXPIRED, AWAITING_C3, or WAITING_FOR_CISD";
                        break;
 
-                   case STAGE_WAITING_FOR_CISD:
-                       legal = (newStage == STAGE_READY ||
-                                newStage == STAGE_EXPIRED);
-                       if(!legal) reason = "WAITING_FOR_CISD -> " + EnumToString(newStage) + " illegal; must go to READY or EXPIRED";
-                       break;
+                    case STAGE_WAITING_FOR_CISD:
+                        legal = (newStage == STAGE_READY ||
+                                 newStage == STAGE_EXPIRED ||
+                                 newStage == STAGE_WAITING_FOR_POI);
+                        if(!legal) reason = "WAITING_FOR_CISD -> " + EnumToString(newStage) + " illegal; must go to READY, WAITING_FOR_POI, or EXPIRED";
+                        break;
 
                    case STAGE_READY:
                        legal = (newStage == STAGE_EXECUTED ||
@@ -668,7 +548,7 @@ ulong GetGUID() { return m_guid; }
                              m_guid, EnumToString(stage), EnumToString(newStage),
                              minutesInOldStage, EnumToString(stage), illegalTransitionCount, reason),
                              LOG_LEVEL_ERROR);
-                    return;
+                    return false;
                 }
 
                LogPrint(StringFormat("[STATE_TRANSITION_OK] GUID=%I64u %s -> %s (spent %d min in %s)",
@@ -677,7 +557,8 @@ ulong GetGUID() { return m_guid; }
                         LOG_LEVEL_INFO);
                stage = newStage;
                stageEntryTime = now;
-           }
+               return true;
+            }
 
          // FIX 1: Mark as executed
           void MarkExecuted()

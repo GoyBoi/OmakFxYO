@@ -247,9 +247,9 @@ bool EE_EvaluateCISDReversal(ulong guid, ENUM_DIRECTION positionDir, ENUM_EXECUT
    ENUM_TIMEFRAMES ltf = (branch == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
    ENUM_DIRECTION targetDir = (positionDir == DIRECTION_BUY) ? DIRECTION_SELL : DIRECTION_BUY;
 
-   bool reversalDetected = SSE_DetectCISD(_Symbol, ltf, targetDir);
+   SSE_CISDResult reversalCisd = SSE_DetectCISD(_Symbol, ltf, targetDir);
 
-   if(reversalDetected)
+   if(reversalCisd.confirmed)
    {
       string dirStr = (positionDir == DIRECTION_BUY) ? "BUY" : "SELL";
       PrintFormat("[EXIT_CISD_REVERSAL] GUID=%I64u position=%s detected opposite CISD on %s branch=%s",
@@ -257,7 +257,7 @@ bool EE_EvaluateCISDReversal(ulong guid, ENUM_DIRECTION positionDir, ENUM_EXECUT
                   (branch == BRANCH_INTRADAY) ? "A" : "B");
    }
 
-   return reversalDetected;
+   return reversalCisd.confirmed;
 }
 
 //+------------------------------------------------------------------+
