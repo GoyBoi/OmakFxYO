@@ -1078,7 +1078,7 @@ datetime lastWarmup = g_sseContext.warmupTimestamp;
             LogPrint("[MODE_RUNTIME] GUID=" + IntegerToString(activeSignal.m_guid) +
                      " | executionMode=" + runtimeModeStr + "[" + IntegerToString(activeSignal.executionMode) + "]" +
                      " | closure=" + EnumToString(activeSignal.closureType), LOG_LEVEL_DEBUG);
-            PrintFormat("[C2_MODE] %s upgraded=%s", runtimeModeStr, IsC2UpgradedToC3(activeSignal.m_guid)?"true":"false");
+            LogPrint(StringFormat("[C2_MODE] %s upgraded=%s", runtimeModeStr, IsC2UpgradedToC3(activeSignal.m_guid)?"true":"false"), LOG_LEVEL_DEBUG);
             
             // [BRANCH_MODE_MISMATCH] Runtime check: log if executionMode contradicts closure type
             if(activeSignal.executionMode != MODE_NONE)
@@ -1838,6 +1838,12 @@ bool ValidateTopDownContext(BranchContext &ctx, const string symbol)
       if((g_activeC2[i].stage == STAGE_WAITING_FOR_POI || g_activeC2[i].stage == STAGE_WAITING_FOR_CISD)
          && tier1Pass && tier2Pass && tier3Pass)
       {
+         // C2 sincerity gate (SMT for correlated assets, V-Shape for solo)
+         if(!ValidateC2ReversalSincerity(sig))
+         {
+            LogPrint("[C2_REJECT] sincerity gate failed | GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_INFO);
+            return false;
+         }
          g_activeC2[i].TransitionStage(STAGE_READY);
          LogPrint(StringFormat("[STAGE_READY] C2 | GUID=%I64u branch=%s", sig.m_guid,
                   (branch==BRANCH_INTRADAY)?"A (D1-H1-M5)":"B (D1-H4-M15)"), LOG_LEVEL_INFO);
@@ -1888,34 +1894,13 @@ bool ValidateTopDownContext(BranchContext &ctx, const string symbol)
                " checking D1 bias=" + EnumToString(d1Bias) +
                " signal_dir=" + (isBullish ? "BUY" : "SELL"), LOG_LEVEL_INFO);
 
-      if(!tier1ModeCheck)
+      // C3 D1 bias check: mandatory alignment per Tiered Confirmation
+      if(!IsBiasAligned(isBullish, ctx.bias))
       {
-         // Grace period: allow C3 signal to wait for D1 bias alignment
-         // before expiring. Uses TimeCurrent()-m_detectionTime anchored to
-         // structure TF bars (Law of Single-Clock Synchronization §XII).
-         int graceBars = (ctx.entryTF == PERIOD_M15)
-             ? MathMax(3, InpGraceBarsConfirmation / 3)
-             : InpGraceBarsConfirmation;
-         int structTFSeconds = PeriodSeconds(ctx.structureTF);
-         int ageBars = (structTFSeconds > 0 && sig.m_detectionTime > 0)
-             ? (int)((TimeCurrent() - sig.m_detectionTime) / structTFSeconds)
-             : 0;
-         if(ageBars < graceBars)
-         {
-            LogPrint("[C3_TIER1_GRACE] GUID=" + IntegerToString(sig.m_guid) +
-                     " | ageBars=" + IntegerToString(ageBars) +
-                     " | graceBars=" + IntegerToString(graceBars) +
-                     " | D1 bias mismatch, within grace period", LOG_LEVEL_INFO);
-            continue;
-         }
-
-         LogPrint("[C3_REJECT] D1_BIAS_MISMATCH | GUID=" + IntegerToString(sig.m_guid) +
-                  " D1=" + EnumToString(d1Bias) +
-                  " signal=" + (isBullish ? "BUY" : "SELL"), LOG_LEVEL_WARN);
-         g_activeC3[i].TransitionStage(STAGE_EXPIRED);
-         LogPrint("[CONTEXT_EXPIRED] GUID=" + IntegerToString(sig.m_guid) +
-                  " | reason=C3_Tier1_FAIL | signal=" + (isBullish ? "BULL" : "BEAR"), LOG_LEVEL_INFO);
-         continue;
+         LogPrint("[C3_REJECT] D1 bias mismatch | GUID=" + IntegerToString(sig.m_guid) +
+                  " | direction=" + (isBullish ? "BUY" : "SELL") +
+                  " | d1Bias=" + EnumToString(ctx.bias.bias), LOG_LEVEL_INFO);
+         return false;
       }
       LogPrint("[C3_BIAS_ALIGN_PASS] GUID=" + IntegerToString(sig.m_guid) +
                " | signal=" + (isBullish ? "BULL" : "BEAR") +

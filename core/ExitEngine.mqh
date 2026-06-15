@@ -115,8 +115,8 @@ bool EE_EvaluateCRTTarget(const PositionGUIDMap &mapEntry, SECRTResult &outResul
    if(mapEntry.c1_high <= 0.0 || mapEntry.c1_low <= 0.0)
    {
       outResult.result = CRT_TARGET_INVALID;
-      PrintFormat("[CRT_TARGET_INVALID] GUID=%I64u reason=NULL_C1_VALUES c1_high=%.5f c1_low=%.5f",
-                  mapEntry.signalGUID, mapEntry.c1_high, mapEntry.c1_low);
+      LogPrint(StringFormat("[CRT_TARGET_INVALID] GUID=%I64u reason=NULL_C1_VALUES c1_high=%.5f c1_low=%.5f",
+                  mapEntry.signalGUID, mapEntry.c1_high, mapEntry.c1_low), LOG_LEVEL_WARN);
       return false;
    }
 
@@ -136,9 +136,9 @@ bool EE_EvaluateCRTTarget(const PositionGUIDMap &mapEntry, SECRTResult &outResul
          outResult.result = CRT_TARGET_VALID;
          outResult.exitReady = (bid >= mapEntry.c1_high);
 
-         PrintFormat("[CRT_TARGET_VALID] GUID=%I64u BUY c1_high=%.5f entry=%.5f bid=%.5f ready=%s branch=%s",
+         LogPrint(StringFormat("[CRT_TARGET_VALID] GUID=%I64u BUY c1_high=%.5f entry=%.5f bid=%.5f ready=%s branch=%s",
                      mapEntry.signalGUID, mapEntry.c1_high, mapEntry.entryPrice, bid,
-                     outResult.exitReady ? "YES" : "NO", branchLabel);
+                     outResult.exitReady ? "YES" : "NO", branchLabel), LOG_LEVEL_INFO);
          return true;
       }
 
@@ -160,9 +160,9 @@ bool EE_EvaluateCRTTarget(const PositionGUIDMap &mapEntry, SECRTResult &outResul
                outResult.result = CRT_TARGET_ESCALATED;
                outResult.exitReady = (bid >= highs[i]);
 
-               PrintFormat("[CRT_TARGET_ESCALATED] GUID=%I64u BUY c1_high=%.5f<=entry escalated_to=%.5f on %s ready=%s branch=%s",
+               LogPrint(StringFormat("[CRT_TARGET_ESCALATED] GUID=%I64u BUY c1_high=%.5f<=entry escalated_to=%.5f on %s ready=%s branch=%s",
                            mapEntry.signalGUID, mapEntry.c1_high, highs[i], EnumToString(htf),
-                           outResult.exitReady ? "YES" : "NO", branchLabel);
+                           outResult.exitReady ? "YES" : "NO", branchLabel), LOG_LEVEL_INFO);
                return true;
             }
          }
@@ -171,8 +171,8 @@ bool EE_EvaluateCRTTarget(const PositionGUIDMap &mapEntry, SECRTResult &outResul
       // No valid target found — explicit rejection
       outResult.result = CRT_TARGET_INVALID;
       outResult.branchLabel = branchLabel;
-      PrintFormat("[CRT_TARGET_INVALID] GUID=%I64u BUY c1_high=%.5f entry=%.5f no HTF swing above entry branch=%s",
-                  mapEntry.signalGUID, mapEntry.c1_high, mapEntry.entryPrice, branchLabel);
+      LogPrint(StringFormat("[CRT_TARGET_INVALID] GUID=%I64u BUY c1_high=%.5f entry=%.5f no HTF swing above entry branch=%s",
+                  mapEntry.signalGUID, mapEntry.c1_high, mapEntry.entryPrice, branchLabel), LOG_LEVEL_WARN);
       return false;
    }
    else if(mapEntry.direction == DIRECTION_SELL)
@@ -186,9 +186,9 @@ bool EE_EvaluateCRTTarget(const PositionGUIDMap &mapEntry, SECRTResult &outResul
          outResult.result = CRT_TARGET_VALID;
          outResult.exitReady = (ask <= mapEntry.c1_low);
 
-         PrintFormat("[CRT_TARGET_VALID] GUID=%I64u SELL c1_low=%.5f entry=%.5f ask=%.5f ready=%s branch=%s",
+         LogPrint(StringFormat("[CRT_TARGET_VALID] GUID=%I64u SELL c1_low=%.5f entry=%.5f ask=%.5f ready=%s branch=%s",
                      mapEntry.signalGUID, mapEntry.c1_low, mapEntry.entryPrice, ask,
-                     outResult.exitReady ? "YES" : "NO", branchLabel);
+                     outResult.exitReady ? "YES" : "NO", branchLabel), LOG_LEVEL_INFO);
          return true;
       }
 
@@ -210,9 +210,9 @@ bool EE_EvaluateCRTTarget(const PositionGUIDMap &mapEntry, SECRTResult &outResul
                outResult.result = CRT_TARGET_ESCALATED;
                outResult.exitReady = (ask <= lows[i]);
 
-               PrintFormat("[CRT_TARGET_ESCALATED] GUID=%I64u SELL c1_low=%.5f>=entry escalated_to=%.5f on %s ready=%s branch=%s",
+               LogPrint(StringFormat("[CRT_TARGET_ESCALATED] GUID=%I64u SELL c1_low=%.5f>=entry escalated_to=%.5f on %s ready=%s branch=%s",
                            mapEntry.signalGUID, mapEntry.c1_low, lows[i], EnumToString(htf),
-                           outResult.exitReady ? "YES" : "NO", branchLabel);
+                           outResult.exitReady ? "YES" : "NO", branchLabel), LOG_LEVEL_INFO);
                return true;
             }
          }
@@ -221,14 +221,14 @@ bool EE_EvaluateCRTTarget(const PositionGUIDMap &mapEntry, SECRTResult &outResul
       // No valid target found — explicit rejection
       outResult.result = CRT_TARGET_INVALID;
       outResult.branchLabel = branchLabel;
-      PrintFormat("[CRT_TARGET_INVALID] GUID=%I64u SELL c1_low=%.5f entry=%.5f no HTF swing below entry branch=%s",
-                  mapEntry.signalGUID, mapEntry.c1_low, mapEntry.entryPrice, branchLabel);
+      LogPrint(StringFormat("[CRT_TARGET_INVALID] GUID=%I64u SELL c1_low=%.5f entry=%.5f no HTF swing below entry branch=%s",
+                  mapEntry.signalGUID, mapEntry.c1_low, mapEntry.entryPrice, branchLabel), LOG_LEVEL_WARN);
       return false;
    }
 
    outResult.result = CRT_TARGET_INVALID;
-   PrintFormat("[CRT_TARGET_INVALID] GUID=%I64u reason=INVALID_DIRECTION dir=%d",
-               mapEntry.signalGUID, mapEntry.direction);
+   LogPrint(StringFormat("[CRT_TARGET_INVALID] GUID=%I64u reason=INVALID_DIRECTION dir=%d",
+               mapEntry.signalGUID, mapEntry.direction), LOG_LEVEL_WARN);
    return false;
 }
 
@@ -251,10 +251,9 @@ bool EE_EvaluateCISDReversal(ulong guid, ENUM_DIRECTION positionDir, ENUM_EXECUT
 
    if(reversalCisd.confirmed)
    {
-      string dirStr = (positionDir == DIRECTION_BUY) ? "BUY" : "SELL";
-      PrintFormat("[EXIT_CISD_REVERSAL] GUID=%I64u position=%s detected opposite CISD on %s branch=%s",
-                  guid, dirStr, EnumToString(ltf),
-                  (branch == BRANCH_INTRADAY) ? "A" : "B");
+      LogPrint(StringFormat("[EXIT_CISD_REVERSAL] GUID=%I64u position=%s detected opposite CISD on %s branch=%s",
+                  guid, (positionDir == DIRECTION_BUY) ? "BUY" : "SELL", EnumToString(ltf),
+                  (branch == BRANCH_INTRADAY) ? "A" : "B"), LOG_LEVEL_INFO);
    }
 
    return reversalCisd.confirmed;
@@ -292,10 +291,9 @@ bool EE_EvaluateDowBOS(ulong guid, ENUM_DIRECTION positionDir, ENUM_EXECUTION_BR
          s_lastChochA = currentBarTime;
       else
          s_lastChochB = currentBarTime;
-      string dirStr = (positionDir == DIRECTION_BUY) ? "BUY" : "SELL";
-      PrintFormat("[EXIT_DOW_BOS] GUID=%I64u position=%s new CHoCH on %s branch=%s",
-                  guid, dirStr, EnumToString(htf),
-                  (branch == BRANCH_INTRADAY) ? "A" : "B");
+      LogPrint(StringFormat("[EXIT_DOW_BOS] GUID=%I64u position=%s new CHoCH on %s branch=%s",
+                  guid, (positionDir == DIRECTION_BUY) ? "BUY" : "SELL", EnumToString(htf),
+                  (branch == BRANCH_INTRADAY) ? "A" : "B"), LOG_LEVEL_INFO);
       return true;
    }
 
@@ -348,7 +346,6 @@ void EE_ManageStructuralTrail(ENUM_EXECUTION_BRANCH branch)
       double c2_low = 0.0, c2_high = 0.0;
       if(!GetProtectedSwingByTicket(ticket, c2_low, c2_high))
       {
-         PrintFormat("[TRAIL_SKIP] ticket=%I64u branch=%s reason=NO_CANONICAL_DATA", ticket, branchLabel);
          continue;
       }
 
@@ -356,8 +353,6 @@ void EE_ManageStructuralTrail(ENUM_EXECUTION_BRANCH branch)
       {
          if(c2_low <= 0.0)
          {
-            LogPrint("[TRAIL_SKIP] BUY c2_low=0 | ticket=" + IntegerToString(ticket) +
-                     " | branch=" + branchLabel, LOG_LEVEL_DEBUG);
             continue;
          }
 
@@ -393,16 +388,14 @@ void EE_ManageStructuralTrail(ENUM_EXECUTION_BRANCH branch)
          if(OrderSend(req, res) && res.retcode == TRADE_RETCODE_DONE)
          {
             ulong guid = GetGUIDFromPositionMap(ticket);
-            PrintFormat("[TRAIL_PSL] GUID=%I64u new_sl=%.5f swing=%.5f c2_low=%.5f branch=%s",
-                        guid, newSL, swingLow, c2_low, branchLabel);
+            LogPrint(StringFormat("[TRAIL_PSL] GUID=%I64u new_sl=%.5f swing=%.5f c2_low=%.5f branch=%s",
+                        guid, newSL, swingLow, c2_low, branchLabel), LOG_LEVEL_INFO);
          }
       }
       else if(posType == POSITION_TYPE_SELL)
       {
          if(c2_high <= 0.0)
          {
-            LogPrint("[TRAIL_SKIP] SELL c2_high=0 | ticket=" + IntegerToString(ticket) +
-                     " | branch=" + branchLabel, LOG_LEVEL_DEBUG);
             continue;
          }
 
@@ -438,8 +431,8 @@ void EE_ManageStructuralTrail(ENUM_EXECUTION_BRANCH branch)
          if(OrderSend(req, res) && res.retcode == TRADE_RETCODE_DONE)
          {
             ulong guid = GetGUIDFromPositionMap(ticket);
-            PrintFormat("[TRAIL_PSH] GUID=%I64u new_sl=%.5f swing=%.5f c2_high=%.5f branch=%s",
-                        guid, newSL, swingHigh, c2_high, branchLabel);
+            LogPrint(StringFormat("[TRAIL_PSH] GUID=%I64u new_sl=%.5f swing=%.5f c2_high=%.5f branch=%s",
+                        guid, newSL, swingHigh, c2_high, branchLabel), LOG_LEVEL_INFO);
          }
       }
    }
@@ -479,8 +472,8 @@ void EE_ClosePositionAndLog(ulong ticket, ulong guid, ENUM_EXIT_TYPE exitType)
          default:                  exitStr = "UNKNOWN";         break;
       }
 
-      PrintFormat("[SLOT_RELEASED] ManagedExit=%s position=%I64u guid=%I64u pnl=%.2f",
-                  exitStr, ticket, guid, pnl);
+      LogPrint(StringFormat("[SLOT_RELEASED] ManagedExit=%s position=%I64u guid=%I64u pnl=%.2f",
+                  exitStr, ticket, guid, pnl), LOG_LEVEL_INFO);
    }
    else
    {
@@ -505,8 +498,8 @@ bool EE_EvaluateAndExit(ulong ticket, const PositionGUIDMap &mapEntry,
    SECanonicalCheck canonicalCheck;
    if(!canonicalCheck.Evaluate(mapEntry))
    {
-      PrintFormat("[EXIT_BLOCKED_NO_VALID_TARGET] GUID=%I64u reason=ORPHANED_MAP_DATA fail=%s ticket=%I64u",
-                  mapEntry.signalGUID, canonicalCheck.failReason, ticket);
+      LogPrint(StringFormat("[EXIT_BLOCKED_NO_VALID_TARGET] GUID=%I64u reason=ORPHANED_MAP_DATA fail=%s ticket=%I64u",
+                  mapEntry.signalGUID, canonicalCheck.failReason, ticket), LOG_LEVEL_WARN);
       return false;
    }
 

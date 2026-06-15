@@ -204,14 +204,19 @@ bool CalculateLotSize(double riskPercent,         // % of balance to risk (1.0 =
 //| CalculateRiskLot — Backward-compat wrapper (signal-based)        |
 //| Delegates to CalculateLotSize → CalculateUnifiedLotSize          |
 //+------------------------------------------------------------------+
-double CalculateRiskLot(SLockedSignal &signal, double riskPct = 1.0)
+bool CalculateRiskLot(SLockedSignal &signal, double riskPct, double &lot)
 {
+   if(riskPct <= 0.0)
+   {
+      LogPrint("[RISK_GATE_FAIL] positionSizeFactor <= 0.0 | value=" + DoubleToString(riskPct, 2), LOG_LEVEL_ERROR);
+      return false;
+   }
    double entryPrice = signal.entry_price;
    double slPrice = signal.stop_loss;
    if(entryPrice <= 0.0 || slPrice <= 0.0)
    {
       LogPrint("[RISK_GATE_FAIL] CalculateRiskLot: invalid entry/sl | GUID="+IntegerToString(signal.m_guid), LOG_LEVEL_ERROR);
-      return 0.0;
+      return false;
    }
 
    double slDist = MathAbs(entryPrice - slPrice);
@@ -219,14 +224,13 @@ double CalculateRiskLot(SLockedSignal &signal, double riskPct = 1.0)
    if(!prof.isValid)
    {
       LogPrint("[RISK_GATE_FAIL] CalculateRiskLot: invalid profile", LOG_LEVEL_ERROR);
-      return 0.0;
+      return false;
    }
 
    double slPoints = slDist / prof.point;
-   double lot;
    if(!CalculateLotSize(riskPct, slPoints, lot))
-      return 0.0;
-   return lot;
+      return false;
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -400,16 +404,23 @@ double C3_SL_Calculator(int direction, double entryPrice,
          }
       }
       
-      double finalSL = protectedSwing - buffer;
-      if(finalSL >= entryPrice)
-      {
-         LogPrint("[C3_SL] BUY SL on wrong side, rejecting", LOG_LEVEL_ERROR);
-         return 0.0;
-      }
-      return finalSL;
-   }
-   else // SELL continuation - stop above protected high
-   {
+       double finalSL = protectedSwing - buffer;
+       if(finalSL >= entryPrice)
+       {
+          LogPrint("[C3_SL] BUY SL on wrong side, rejecting", LOG_LEVEL_ERROR);
+          return 0.0;
+       }
+        // Enforce broker minimum stop distance
+        {
+           long sl = prof.stopsLevel; if(sl <= 0) sl = 10;
+           double minDist = sl * prof.point * InpMinStopBuffer;
+           if(entryPrice - finalSL < minDist)
+              finalSL = entryPrice - minDist;
+        }
+        return finalSL;
+     }
+     else // SELL continuation - stop above protected high
+    {
       int highestIdx = iHighest(_Symbol, structureTF, MODE_HIGH, swingBars, 1);
       if(highestIdx != -1)
          protectedSwing = iHigh(_Symbol, structureTF, highestIdx);
@@ -429,14 +440,21 @@ double C3_SL_Calculator(int direction, double entryPrice,
          }
       }
       
-      double finalSL = protectedSwing + buffer;
-      if(finalSL <= entryPrice)
-      {
-         LogPrint("[C3_SL] SELL SL on wrong side, rejecting", LOG_LEVEL_ERROR);
-         return 0.0;
-      }
-      return finalSL;
-   }
+       double finalSL = protectedSwing + buffer;
+       if(finalSL <= entryPrice)
+       {
+          LogPrint("[C3_SL] SELL SL on wrong side, rejecting", LOG_LEVEL_ERROR);
+          return 0.0;
+       }
+        // Enforce broker minimum stop distance
+        {
+           long sl = prof.stopsLevel; if(sl <= 0) sl = 10;
+           double minDist = sl * prof.point * InpMinStopBuffer;
+           if(finalSL - entryPrice < minDist)
+              finalSL = entryPrice + minDist;
+        }
+        return finalSL;
+     }
 }
 
 //+------------------------------------------------------------------+
@@ -484,16 +502,23 @@ double C2_SL_Calculator(int direction, double entryPrice,
          }
       }
       
-      double finalSL = sweptExtreme - buffer;
-      if(finalSL >= entryPrice)
-      {
-         LogPrint("[C2_SL] BUY SL on wrong side, rejecting", LOG_LEVEL_ERROR);
-         return 0.0;
-      }
-      return finalSL;
-   }
-   else // SELL reversal - swept high
-   {
+       double finalSL = sweptExtreme - buffer;
+       if(finalSL >= entryPrice)
+       {
+          LogPrint("[C2_SL] BUY SL on wrong side, rejecting", LOG_LEVEL_ERROR);
+          return 0.0;
+       }
+        // Enforce broker minimum stop distance
+        {
+           long sl = prof.stopsLevel; if(sl <= 0) sl = 10;
+           double minDist = sl * prof.point * InpMinStopBuffer;
+           if(entryPrice - finalSL < minDist)
+              finalSL = entryPrice - minDist;
+        }
+        return finalSL;
+     }
+     else // SELL reversal - swept high
+    {
       int highestIdx = iHighest(_Symbol, structureTF, MODE_HIGH, lookback, 1);
       if(highestIdx != -1)
          sweptExtreme = iHigh(_Symbol, structureTF, highestIdx);
@@ -513,14 +538,21 @@ double C2_SL_Calculator(int direction, double entryPrice,
          }
       }
       
-      double finalSL = sweptExtreme + buffer;
-      if(finalSL <= entryPrice)
-      {
-         LogPrint("[C2_SL] SELL SL on wrong side, rejecting", LOG_LEVEL_ERROR);
-         return 0.0;
-      }
-      return finalSL;
-   }
+       double finalSL = sweptExtreme + buffer;
+       if(finalSL <= entryPrice)
+       {
+          LogPrint("[C2_SL] SELL SL on wrong side, rejecting", LOG_LEVEL_ERROR);
+          return 0.0;
+       }
+       // Enforce broker minimum stop distance
+       {
+           long sl = prof.stopsLevel; if(sl <= 0) sl = 10;
+           double minDist = sl * prof.point * InpMinStopBuffer;
+           if(finalSL - entryPrice < minDist)
+              finalSL = entryPrice + minDist;
+        }
+        return finalSL;
+     }
 }
 
 //+------------------------------------------------------------------+

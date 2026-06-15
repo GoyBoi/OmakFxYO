@@ -79,6 +79,31 @@ void TickRouter(BranchContext &ctx)
 {
     DispatchRegistry(g_activeC2, MODE_ANTICIPATION, ctx);
     DispatchRegistry(g_activeC3, MODE_CONFIRMATION, ctx);
+    DispatchC4Registry(g_activeC4, ctx);
+}
+
+//+------------------------------------------------------------------+
+//| DispatchC4Registry — Route C4 continuation signals independently  |
+//| C4 starts at STAGE_C4_WAITING and advances to STAGE_C4_DETECTED   |
+//| after one entry TF bar. CISD evaluation occurs downstream in the  |
+//| pipeline (ProcessPipelineSignal).                                 |
+//+------------------------------------------------------------------+
+void DispatchC4Registry(SLockedSignal &pool[], BranchContext &ctx)
+{
+    for (int idx = 0; idx < MAX_C4_SLOTS; idx++)
+    {
+        if (pool[idx].m_guid == 0 || pool[idx].stage == STAGE_NONE) continue;
+        if (pool[idx].stage == STAGE_EXPIRED || pool[idx].isCommitted) continue;
+
+        // C4: STAGE_C4_WAITING -> STAGE_C4_DETECTED after 1 bar
+        if (pool[idx].stage == STAGE_C4_WAITING)
+        {
+            uint secondsSinceLock = (uint)(TimeCurrent() - pool[idx].lockTime);
+            if (secondsSinceLock < (uint)PeriodSeconds(pool[idx].entryTF)) continue;
+            if (!pool[idx].TransitionStage(STAGE_C4_DETECTED)) continue;
+            LogPrint(StringFormat("[DISPATCH_C4] GUID=%I64u | C4_WAITING -> C4_DETECTED | slot=%d", pool[idx].m_guid, idx), LOG_LEVEL_DEBUG);
+        }
+    }
 }
 
 #endif // OMAK_ROUTER_MQH

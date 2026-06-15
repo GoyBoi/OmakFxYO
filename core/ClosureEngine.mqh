@@ -1508,11 +1508,13 @@ int closeAboveCount = 0;
                   " | relevantCandles=" + IntegerToString(relevantCandles), LOG_LEVEL_DEBUG);
    }
    
-   if(!cisDetected)
-   {
-      LogPrint("[CISD_FAILED] No change in state of delivery on LTF — setup invalid | GUID=" + 
-               IntegerToString(signal.m_guid), LOG_LEVEL_DEBUG);
-   }
+     if(!cisDetected)
+     {
+        LogPrint("[CISD_FAILED] No change in state of delivery on LTF — setup invalid | GUID=" + 
+                 IntegerToString(signal.m_guid), LOG_LEVEL_INFO);
+        LogPrint("[CISD_FAILED] reason=close_not_beyond_key_level | direction=" + EnumToString(signal.direction) +
+                 " | keyLevel=" + DoubleToString(swingPoint, _Digits), LOG_LEVEL_DEBUG);
+     }
    
    return cisDetected;
 }
@@ -1531,7 +1533,7 @@ bool ConfirmBranchCISD(const string symbol, ENUM_TIMEFRAMES structTF, ENUM_EXECU
     if (dir == DIRECTION_NONE)
     {
         LogPrint("[CISD_FAILED] ConfirmBranchCISD: no bias direction for branch=" +
-                 IntegerToString(branch), LOG_LEVEL_DEBUG);
+                 IntegerToString(branch), LOG_LEVEL_INFO);
         return false;
     }
     SSE_CISDResult result = SSE_DetectCISD(symbol, structTF, dir, 20);
@@ -1549,7 +1551,7 @@ bool ConfirmBranchCISD(const string symbol, ENUM_TIMEFRAMES structTF, ENUM_EXECU
     else
     {
         LogPrint(StringFormat("[CISD_FAILED] Branch %d | structTF=%s | dir=%s | No mechanical CISD on Structure TF",
-                 branch, EnumToString(structTF), EnumToString(dir)), LOG_LEVEL_DEBUG);
+                 branch, EnumToString(structTF), EnumToString(dir)), LOG_LEVEL_INFO);
     }
     return result.confirmed;
 }
@@ -2292,7 +2294,7 @@ void ProcessC3Pipeline(SLockedSignal &sig) {
         }
         sig.Commit();
         string speciesLabel = (sig.closureType == CLOSURE_C4) ? "C4" : "C3";
-        LogPrint("[SIGNAL_LOCKED] GUID:" + IntegerToString(sig.m_guid) +
+        LogPrint("[SIGNAL_LOCKED] GUID=" + IntegerToString(sig.m_guid) +
                  " | species:" + speciesLabel +
                  " | entry:" + DoubleToString(sig.entry_price, _Digits) +
                  " | sl:" + DoubleToString(sig.stop_loss, _Digits) +
@@ -2901,6 +2903,22 @@ if(InpUseDisplacementEngine && c3_displacement_valid)
        narrativeIdx = FN_FindActiveNarrative(g_branchBNarratives, ctx.branch);
     bool hasActiveNarrative = (narrativeIdx >= 0);
 
+    // Ensure narrative exists for C4 detection
+    if(!hasActiveNarrative)
+    {
+        ENUM_DIRECTION narDir = (c1_close > c1_open) ? DIRECTION_BUY : DIRECTION_SELL;
+        int newIdx = -1;
+        if(ctx.branch == BRANCH_INTRADAY)
+           newIdx = FN_FindOrCreateNarrative(g_branchANarratives, ctx.branch, narDir, c1_high, c1_low, c1_open, c1_close, times[3]);
+        else
+           newIdx = FN_FindOrCreateNarrative(g_branchBNarratives, ctx.branch, narDir, c1_high, c1_low, c1_open, c1_close, times[3]);
+        if(newIdx != -1)
+        {
+            narrativeIdx = newIdx;
+            hasActiveNarrative = true;
+        }
+    }
+
     // Attempt delayed C3 scan if:
     // 1. No C3 was found in the 4-bar window
     // 2. An active narrative exists with open continuation window
@@ -3101,6 +3119,25 @@ signal_c3.c2_wick_ratio = c2WickRatio;
                         && ((_c4IsBrA ? (int)g_branchANarratives[_c4NIdx].c4EventCount : (int)g_branchBNarratives[_c4NIdx].c4EventCount) < 3);
         bool c4FromC3 = ((_c4IsBrA ? (int)g_branchANarratives[_c4NIdx].c3EventCount : (int)g_branchBNarratives[_c4NIdx].c3EventCount) > 0);
 
+        static datetime s_lastC4BlockedLog[2] = {0, 0};
+        int c4BlockedBranchIdx = (ctx.branch == BRANCH_INTRADAY) ? 0 : 1;
+        if(!c4Permitted)
+        {
+            if(TimeCurrent() - s_lastC4BlockedLog[c4BlockedBranchIdx] >= 60)
+            {
+                LogPrint("[C4_BLOCKED] reason=permission_false", LOG_LEVEL_DEBUG);
+                s_lastC4BlockedLog[c4BlockedBranchIdx] = TimeCurrent();
+            }
+        }
+        else if(!c4FromC3)
+        {
+            if(TimeCurrent() - s_lastC4BlockedLog[c4BlockedBranchIdx] >= 60)
+            {
+                LogPrint("[C4_BLOCKED] reason=no_c3_parent", LOG_LEVEL_DEBUG);
+                s_lastC4BlockedLog[c4BlockedBranchIdx] = TimeCurrent();
+            }
+        }
+
         // CONSTITUTION: C4 requires parent C3 signal to be confirmed (stage >= STAGE_READY)
         if(c4FromC3)
         {
@@ -3194,39 +3231,74 @@ if(c4Permitted && c4FromC3)
 
                 c4Evaluated = true;
 
-              LogPrint("[C4_CONTINUATION_CANDIDATE] narrativeGUID=" + IntegerToString(c4NarGUID) +
-                       " | entry=" + DoubleToString(cur_open, _Digits) +
-                       " | reference=C3", LOG_LEVEL_INFO);
-
-               SSequenceLineage lineage;
-               lineage.Reset();
-               lineage.closureKind = CLOSURE_C4;
-               lineage.branchId = ctx.branch;
-               lineage.anchorBarTime = c4NarC1BarTime;
-               lineage.detectionTime = TimeCurrent();
-
-               SClosureEvent c4Event = SFractalNarrative::BuildEvent(
-                  CLOSURE_C4, c4NarDir,
-                  c4NarC2High, c4NarC2Low, c4NarC2Open, c4NarC2Close,
-                  cur_high, cur_low, cur_open, cur_close,
-                  cur_open,
-                  c4NarDir == DIRECTION_BUY ? c4NarC2Low : c4NarC2High,
-                  0.0,
-                  ComputeWickRatio(cur_open, cur_close, cur_high, cur_low),
-                  c4NarCisdConfirmed, true, 0, lineage
-               );
-               if(_c4IsBrA)
-                  g_branchANarratives[_c4NIdx].RegisterC4Event(c4Event);
-               else
-                  g_branchBNarratives[_c4NIdx].RegisterC4Event(c4Event);
-
-               signal_c3 = signal_c4;
-               LogPrint("[C4_EVENT] narrativeGUID=" + IntegerToString(c4NarGUID) +
-                        " | dir=" + EnumToString(c4NarDir) +
+               LogPrint("[C4_CONTINUATION_CANDIDATE] narrativeGUID=" + IntegerToString(c4NarGUID) +
                         " | entry=" + DoubleToString(cur_open, _Digits) +
                         " | reference=C3", LOG_LEVEL_INFO);
+
+                SSequenceLineage lineage;
+                lineage.Reset();
+                lineage.closureKind = CLOSURE_C4;
+                lineage.branchId = ctx.branch;
+                lineage.anchorBarTime = c4NarC1BarTime;
+                lineage.detectionTime = TimeCurrent();
+
+                SClosureEvent c4Event = SFractalNarrative::BuildEvent(
+                   CLOSURE_C4, c4NarDir,
+                   c4NarC2High, c4NarC2Low, c4NarC2Open, c4NarC2Close,
+                   cur_high, cur_low, cur_open, cur_close,
+                   cur_open,
+                   c4NarDir == DIRECTION_BUY ? c4NarC2Low : c4NarC2High,
+                   0.0,
+                   ComputeWickRatio(cur_open, cur_close, cur_high, cur_low),
+                   c4NarCisdConfirmed, true, 0, lineage
+                );
+                if(_c4IsBrA)
+                   g_branchANarratives[_c4NIdx].RegisterC4Event(c4Event);
+                else
+                   g_branchBNarratives[_c4NIdx].RegisterC4Event(c4Event);
+
+                // ── STANDALONE C4 LOCK + COMMIT (decoupled from C3 pipeline) ──
+                SLockedSignal c4Signal;
+                c4Signal.Reset();
+                c4Signal.symbol = _Symbol;
+                c4Signal.direction = signal_c4.is_bullish ? DIRECTION_BUY : DIRECTION_SELL;
+                c4Signal.branch = g_activeBranch;
+                c4Signal.branchId = g_activeBranch;
+                c4Signal.closureType = CLOSURE_C4;
+                c4Signal.entryTF = (g_activeBranch == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
+                c4Signal.entry_price = signal_c4.entry_price;
+                c4Signal.c3_high = signal_c4.c3_high;
+                c4Signal.c3_low = signal_c4.c3_low;
+                c4Signal.tSpotMin = signal_c4.tSpotMin;
+                c4Signal.tSpotMax = signal_c4.tSpotMax;
+                c4Signal.lockTime = TimeCurrent();
+                c4Signal.m_detectionTime = signal_c4.m_detectionTime;
+                c4Signal.stop_loss = signal_c4.stop_loss;
+                c4Signal.equilibrium = signal_c4.equilibrium;
+                c4Signal.m_setupStartTime = signal_c4.setupStartTime;
+                c4Signal.m_setupHtfCandleStart = signal_c4.setupHtfCandleStart;
+
+                c4Signal.candidateEntryPrice = signal_c4.entry_price;
+                
+                // Run through ProcessC3Pipeline which calls Lock() internally.
+                // For CLOSURE_C4, Lock() sets stage to STAGE_C4_WAITING.
+                ProcessC3Pipeline(c4Signal);
+
+                if(c4Signal.stage == STAGE_C4_WAITING)
+                {
+                    CommitSignalToStore(c4Signal, g_activeBranch, CLOSURE_C4);
+                    LogPrint("[C4_EVENT] narrativeGUID=" + IntegerToString(c4NarGUID) +
+                             " | dir=" + EnumToString(c4NarDir) +
+                             " | entry=" + DoubleToString(cur_open, _Digits) +
+                             " | reference=C3 (standalone)", LOG_LEVEL_INFO);
                 }
-           }
+                else
+                {
+                    LogPrint("[C4_LOCK_REJECTED] GUID:" + IntegerToString(c4Signal.m_guid) +
+                             " | stage:" + EnumToString(c4Signal.stage), LOG_LEVEL_WARN);
+                }
+                 }
+            }
        }
 
     // ═══════════════════════════════════════════════════════════
@@ -3281,91 +3353,78 @@ if(c4Permitted && c4FromC3)
           if(c4Evaluated)
              LogPrint("[CONTINUATION_ACCEPTED] C4 | continuity expansion", LOG_LEVEL_DEBUG);
        }
-   // C2, C3, C4 are INDEPENDENT species. Each registers via its own Lock() path.
-   // C3/C4 registration happens inside the C3 pipeline block below.
-   // C2 registration happens inside the C2 Lock() block further below.
+    // C2, C3, C4 are INDEPENDENT species. Each registers via its own Lock() path.
+    // C3 registration happens in the block below. C4 registration happens in its
+    // standalone detection path above (decoupled from C3 pipeline).
+    // C2 registration happens inside the C2 Lock() block further below.
 
-if(c3_evaluated || delayedC3Evaluated || c4Evaluated)
+// Only C3 enters this pipeline block — C4 handled in standalone path above
+if(c3_evaluated || delayedC3Evaluated)
         {
-            // Per AGENTS.md §XVII Gate 4: entry_price from POI scan via ProcessC3Pipeline
-            // C4 uses T-Spot zone (now properly populated from Anchor TF) for POI mapping
            out_signal = signal_c3;
           
           // C3 SPAM KILLER: IMPROVED detection using type + fractalState + timestamp + entry
-          // Uses type (not closureType), fractalState, direction, and entry price for uniqueness
            string closureSig = IntegerToString(signal_c3.type) + "|" +
-                               IntegerToString(signal_c3.fractalState) + "|" +
-                               (signal_c3.is_bullish ? "BUY" : "SELL") + "|" +
-                               DoubleToString(signal_c3.entry_price > 0 ? signal_c3.entry_price : 0, _Digits) + "|" +
-                                IntegerToString(signal_c3.m_guid) + "|" + "C3";
-   
-          bool isNewClosure = (closureSig != g_lastC3ClosureSignature ||
-                               TimeCurrent() - g_lastClosureLogTime > 5);
+                                IntegerToString(signal_c3.fractalState) + "|" +
+                                (signal_c3.is_bullish ? "BUY" : "SELL") + "|" +
+                                DoubleToString(signal_c3.entry_price > 0 ? signal_c3.entry_price : 0, _Digits) + "|" +
+                                 IntegerToString(signal_c3.m_guid) + "|" + "C3";
+    
+           bool isNewClosure = (closureSig != g_lastC3ClosureSignature ||
+                                TimeCurrent() - g_lastClosureLogTime > 5);
 
-          if(isNewClosure)
-              {
-                  if(g_logLevel <= LOG_LEVEL_INFO)
-                  {
-                      LogPrint("[CONFIRMATION_GATE] C3_DISPLACEMENT - Verification Passed. Initializing Pipeline Lifecycle.", LOG_LEVEL_INFO);
-                  }
+           if(isNewClosure)
+               {
+                   if(g_logLevel <= LOG_LEVEL_INFO)
+                   {
+                       LogPrint("[CONFIRMATION_GATE] C3_DISPLACEMENT - Verification Passed. Initializing Pipeline Lifecycle.", LOG_LEVEL_INFO);
+                   }
 
-                  ENUM_CLOSURE_TYPE regType = signal_c3.type;
-                  if(c4Evaluated)
-                     regType = CLOSURE_C4;
-
-                   // [MODE_ASSIGNED] Mode determined at Lock() - ClosureEngine does NOT own executionMode
-                   // C3/C4 signals pass through Lock() for proper mode assignment per Constitution
-                   SClosureSignal c3Signal;
-                   c3Signal.valid = true;
-                   c3Signal.type = signal_c3.type;
-                   c3Signal.is_bullish = signal_c3.is_bullish;
+                     // [MODE_ASSIGNED] Mode determined at Lock() — ClosureEngine does NOT own executionMode
+                     SClosureSignal c3Signal;
+                     c3Signal.valid = true;
+                     c3Signal.type = CLOSURE_C3;
+                     c3Signal.is_bullish = signal_c3.is_bullish;
                      c3Signal.entry_price = signal_c3.entry_price;
-                     // SL computed by ProcessC3Pipeline (species-aware per closureType)
-                   c3Signal.c1_high = signal_c3.c1_high;
-                   c3Signal.c1_low = signal_c3.c1_low;
-                   c3Signal.c2_high = signal_c3.c2_high;
-                   c3Signal.c2_low = signal_c3.c2_low;
-                   c3Signal.c2_open = signal_c3.c2_open;
-                   c3Signal.c2_close = signal_c3.c2_close;
-                   c3Signal.c3_high = signal_c3.c3_high;
-                   c3Signal.c3_low = signal_c3.c3_low;
-                   c3Signal.c3_open = signal_c3.c3_open;
-                   c3Signal.c3_close = signal_c3.c3_close;
-                   c3Signal.equilibrium = signal_c3.equilibrium;
-                   c3Signal.setupStartTime = signal_c3.setupStartTime;
-                   c3Signal.setupHtfCandleStart = signal_c3.setupHtfCandleStart;
-                   c3Signal.setupInitialHigh = signal_c3.setupInitialHigh;
-                   c3Signal.setupInitialLow = signal_c3.setupInitialLow;
-                    c3Signal.setupIsBullish = signal_c3.setupIsBullish;
-                    c3Signal.c1_close = signal_c3.c1_close;
+                     c3Signal.c1_high = signal_c3.c1_high;
+                     c3Signal.c1_low = signal_c3.c1_low;
+                     c3Signal.c2_high = signal_c3.c2_high;
+                     c3Signal.c2_low = signal_c3.c2_low;
+                     c3Signal.c2_open = signal_c3.c2_open;
+                     c3Signal.c2_close = signal_c3.c2_close;
+                     c3Signal.c3_high = signal_c3.c3_high;
+                     c3Signal.c3_low = signal_c3.c3_low;
+                     c3Signal.c3_open = signal_c3.c3_open;
+                     c3Signal.c3_close = signal_c3.c3_close;
+                     c3Signal.equilibrium = signal_c3.equilibrium;
+                     c3Signal.setupStartTime = signal_c3.setupStartTime;
+                     c3Signal.setupHtfCandleStart = signal_c3.setupHtfCandleStart;
+                     c3Signal.setupInitialHigh = signal_c3.setupInitialHigh;
+                     c3Signal.setupInitialLow = signal_c3.setupInitialLow;
+                     c3Signal.setupIsBullish = signal_c3.setupIsBullish;
+                     c3Signal.c1_close = signal_c3.c1_close;
                      c3Signal.fractalState = signal_c3.fractalState;
                      c3Signal.m_guid = signal_c3.m_guid;
                      c3Signal.tSpotMin = signal_c3.tSpotMin;
                      c3Signal.tSpotMax = signal_c3.tSpotMax;
 
-// VERBATIM REPAIR: Synchronous C3 Mapping (§II)
 SLockedSignal c3LockedSignal;
 c3LockedSignal.Reset();
 c3LockedSignal.symbol = _Symbol;
 c3LockedSignal.direction = signal_c3.is_bullish ? DIRECTION_BUY : DIRECTION_SELL;
 c3LockedSignal.branch = g_activeBranch;
 c3LockedSignal.branchId = g_activeBranch;
-c3LockedSignal.closureType = regType;
+c3LockedSignal.closureType = CLOSURE_C3;
 c3LockedSignal.entryTF = (g_activeBranch == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
 c3LockedSignal.tSpotMin = signal_c3.tSpotMin;
 c3LockedSignal.tSpotMax = signal_c3.tSpotMax;
 c3LockedSignal.m_detectionTime = signal_c3.m_detectionTime;
-// Propagate C3 extremes for C4 SL calculation (C4_SL_Calculator requires c3_high/c3_low)
-if(regType == CLOSURE_C4)
-{
-   c3LockedSignal.c3_high = signal_c3.c3_high;
-   c3LockedSignal.c3_low = signal_c3.c3_low;
-}
+c3LockedSignal.entry_price = signal_c3.entry_price;
 ProcessC3Pipeline(c3LockedSignal);
 if (c3LockedSignal.stage == STAGE_WAITING_FOR_POI) {
     LogPrint("[C3_ROUTE_RESTORED] GUID:" + IntegerToString(c3LockedSignal.m_guid) +
              " | stage:" + EnumToString(c3LockedSignal.stage), LOG_LEVEL_INFO);
-    CommitSignalToStore(c3LockedSignal, g_activeBranch, regType);
+    CommitSignalToStore(c3LockedSignal, g_activeBranch, CLOSURE_C3);
     lockedSignal = c3LockedSignal;
 } else {
     LogPrint("[C3_LOCK_REJECTED] GUID:" + IntegerToString(signal_c3.m_guid) +
@@ -5100,17 +5159,17 @@ void SetSignalStage(ulong guid, ENUM_SIGNAL_STAGE newStage)
          ENUM_SIGNAL_STAGE oldStage = g_activeC2[i].stage;
          if(oldStage == newStage) return;
          g_activeC2[i].TransitionStage(newStage);
-         PrintFormat("[STAGE_TRANSITION] guid=%I64u %s->%s",
-                     guid, EnumToString(oldStage), EnumToString(newStage));
-         return;
-      }
-      if(g_activeC3[i].m_guid == guid)
-      {
-         ENUM_SIGNAL_STAGE oldStage = g_activeC3[i].stage;
-         if(oldStage == newStage) return;
-         g_activeC3[i].TransitionStage(newStage);
-         PrintFormat("[STAGE_TRANSITION] guid=%I64u %s->%s",
-                     guid, EnumToString(oldStage), EnumToString(newStage));
+   LogPrint(StringFormat("[STAGE_TRANSITION] guid=%I64u %s->%s",
+               guid, EnumToString(oldStage), EnumToString(newStage)), LOG_LEVEL_INFO);
+      return;
+   }
+   if(g_activeC3[i].m_guid == guid)
+   {
+      ENUM_SIGNAL_STAGE oldStage = g_activeC3[i].stage;
+      if(oldStage == newStage) return;
+      g_activeC3[i].TransitionStage(newStage);
+      LogPrint(StringFormat("[STAGE_TRANSITION] guid=%I64u %s->%s",
+                  guid, EnumToString(oldStage), EnumToString(newStage)), LOG_LEVEL_INFO);
          return;
       }
    }

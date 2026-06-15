@@ -28,6 +28,11 @@
 #define MAX_C3_SIGNALS_PER_BRANCH 3
 #endif
 
+#ifndef MAX_C4_SIGNALS_PER_BRANCH
+#define MAX_C4_SIGNALS_PER_BRANCH 3
+#endif
+
+#define MAX_C4_SLOTS (MAX_C4_SIGNALS_PER_BRANCH * 2)
 #define MAX_TOTAL_SIGNALS_PER_BRANCH (MAX_C2_SIGNALS_PER_BRANCH + MAX_C3_SIGNALS_PER_BRANCH)
 #define MAX_SLOTS MAX_TOTAL_SIGNALS_PER_BRANCH
 
@@ -290,7 +295,12 @@ enum ENUM_SIGNAL_STAGE
    STAGE_WAITING_FOR_CISD,
    STAGE_READY,
    STAGE_EXECUTED,
-   STAGE_EXPIRED
+   STAGE_EXPIRED,
+   // C4-specific stages (decoupled from C3 pipeline)
+   STAGE_C4_WAITING,
+   STAGE_C4_DETECTED,
+   STAGE_C4_WAITING_POI,
+   STAGE_C4_READY
 };
 
 //+------------------------------------------------------------------+
@@ -327,6 +337,7 @@ struct SLineage
 // Global signal pools — defined here so all includes and the main file see them
 SLockedSignal g_activeC2[MAX_SLOTS];
 SLockedSignal g_activeC3[MAX_SLOTS];
+SLockedSignal g_activeC4[MAX_C4_SLOTS];
 
 //+------------------------------------------------------------------+
 //| SClosureSignal — Legacy wrapper for backward compatibility      |
@@ -530,15 +541,15 @@ bool SLockedSignal::Lock(SClosureSignal &signal, int id, ENUM_EXECUTION_BRANCH e
           TransitionStage(STAGE_AWAITING_C3_CLOSURE);
        }
       else if(signal.type == CLOSURE_C4)
-      {
-         // C4 validation: must have c3 reference data
-         if(signal.c3_high <= 0.0 || signal.c3_low <= 0.0)
-         {
-            LogPrint("[C4_LOCK_FAILED] Missing C3 reference data | GUID=" + IntegerToString(m_guid), LOG_LEVEL_WARN);
-            return false;
-         }
-         TransitionStage(STAGE_AWAITING_C3_CLOSURE);
-      }
+       {
+          // C4 validation: must have c3 reference data
+          if(signal.c3_high <= 0.0 || signal.c3_low <= 0.0)
+          {
+             LogPrint("[C4_LOCK_FAILED] Missing C3 reference data | GUID=" + IntegerToString(m_guid), LOG_LEVEL_WARN);
+             return false;
+          }
+          TransitionStage(STAGE_C4_WAITING);
+       }
       else
       {
          TransitionStage(STAGE_LOCKED);
@@ -589,20 +600,32 @@ bool SLockedSignal::Lock(SClosureSignal &signal, int id, ENUM_EXECUTION_BRANCH e
     m_c2HadSmallWick = signal.c2HasSmallWick;
     m_c2ClosureConfirmed = signal.c2ClosureConfirmed;
 
-    // C3-specific metadata (only if C3 pipeline active)
-    if(signal.type == CLOSURE_C3)
-    {
-        m_c3CommitBarTime = TimeCurrent();
-        m_c3EntryHigh = signal.c3_high;
-        m_c3EntryLow = signal.c3_low;
-        m_c3Equilibrium = (signal.c3_high + signal.c3_low) / 2.0;
+     // C3-specific metadata (only if C3 pipeline active)
+     if(signal.type == CLOSURE_C3)
+     {
+         m_c3CommitBarTime = TimeCurrent();
+         m_c3EntryHigh = signal.c3_high;
+         m_c3EntryLow = signal.c3_low;
+         m_c3Equilibrium = (signal.c3_high + signal.c3_low) / 2.0;
 m_c3CisdConfirmed = false; // Will be set true after CISD check on LTF
-         m_c3ParentC2Guid = 0; // Will be set during modal upgrade
+          m_c3ParentC2Guid = 0; // Will be set during modal升级
+          tSpotMin = signal.tSpotMin;
+          tSpotMax = signal.tSpotMax;
+     }
+
+     // C4-specific metadata (decoupled from C3 pipeline)
+     if(signal.type == CLOSURE_C4)
+     {
+         m_c3CommitBarTime = TimeCurrent();
+         m_c3EntryHigh = signal.c3_high;
+         m_c3EntryLow = signal.c3_low;
+         m_c3Equilibrium = (signal.c3_high + signal.c3_low) / 2.0;
+         m_c3CisdConfirmed = false;
          tSpotMin = signal.tSpotMin;
          tSpotMax = signal.tSpotMax;
-    }
+     }
 
-    ENUM_TIMEFRAMES structTF = (tf == PERIOD_CURRENT) ? _Period : tf;
+     ENUM_TIMEFRAMES structTF = (tf == PERIOD_CURRENT) ? _Period : tf;
     lockTime = TimeCurrent();
 
     double c1Range = signal.c2_high - signal.c2_low;

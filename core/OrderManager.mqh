@@ -797,8 +797,33 @@ bool ExecutionGatePass(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, doub
        return false;
     }
 
-    if(!OrderSend(request, result)) {
-        LogPrint(StringFormat("[ORDER_FAILED] GUID:%I64u | Error:%d", signal.m_guid, GetLastError()), LOG_LEVEL_ERROR);
+    if(!IsMarketOpen())
+    {
+        LogPrint("[MARKET_CLOSED] Order not sent – outside trading hours | GUID=" +
+                 IntegerToString(signal.m_guid), LOG_LEVEL_WARN);
+        return false;
+    }
+
+    int retryCount = 0;
+    bool orderSent = false;
+    while(retryCount < 3 && !orderSent)
+    {
+        if(OrderSend(request, result))
+            orderSent = true;
+        else
+        {
+            retryCount++;
+            if(retryCount < 3)
+            {
+                LogPrint(StringFormat("[ORDER_RETRY] GUID:%I64u | attempt:%d | Error:%d",
+                         signal.m_guid, retryCount, GetLastError()), LOG_LEVEL_WARN);
+            }
+        }
+    }
+    if(!orderSent)
+    {
+        LogPrint(StringFormat("[ORDER_FAILED] GUID:%I64u | Error:%d | retries:%d",
+                 signal.m_guid, GetLastError(), retryCount), LOG_LEVEL_ERROR);
         return false;
     }
     
@@ -815,12 +840,14 @@ bool ExecutionGatePass(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, doub
                  signal.branchId == BRANCH_INTRADAY ? "A" : "B"), LOG_LEVEL_INFO);
     }
     
+    g_totalOrdersSent++;
     LogPrint("[ORDER_SENT] GUID=" + IntegerToString(signal.m_guid) +
              " | type=" + EnumToString(request.type) +
              " | price=" + DoubleToString(request.price, digits) +
              " | sl=" + DoubleToString(request.sl, digits) +
              " | tp=" + DoubleToString(request.tp, digits) +
-             " | vol=" + DoubleToString(request.volume, 2), LOG_LEVEL_INFO);
+             " | vol=" + DoubleToString(request.volume, 2) +
+             " | totalSent=" + IntegerToString(g_totalOrdersSent), LOG_LEVEL_INFO);
     
     return true;
 }

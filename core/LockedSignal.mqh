@@ -481,71 +481,98 @@ ulong GetGUID() { return m_guid; }
                bool legal = false;
                string reason = "";
 
-               switch(stage)
-               {
-                    case STAGE_NONE:
-                        legal = (newStage == STAGE_LOCKED ||
-                                 newStage == STAGE_AWAITING_C3_CLOSURE ||
-                                 newStage == STAGE_WAITING_FOR_POI);
-                        if(!legal) reason = "NONE -> " + EnumToString(newStage) + " illegal; must go to LOCKED, AWAITING_C3_CLOSURE, or WAITING_FOR_POI";
-                        break;
+                switch(stage)
+                {
+                     case STAGE_NONE:
+                         legal = (newStage == STAGE_LOCKED ||
+                                  newStage == STAGE_AWAITING_C3_CLOSURE ||
+                                  newStage == STAGE_WAITING_FOR_POI ||
+                                  newStage == STAGE_C4_WAITING);
+                         if(!legal) reason = "NONE -> " + EnumToString(newStage) + " illegal; must go to LOCKED, AWAITING_C3_CLOSURE, WAITING_FOR_POI, or C4_WAITING";
+                         break;
 
-                    case STAGE_LOCKED:
+                     case STAGE_LOCKED:
+                         legal = (newStage == STAGE_WAITING_FOR_POI ||
+                                  newStage == STAGE_READY ||
+                                  newStage == STAGE_EXPIRED);
+                         if(!legal) reason = "LOCKED -> " + EnumToString(newStage) + " illegal; must go to WAITING_FOR_POI, READY, or EXPIRED";
+                         break;
+
+                    case STAGE_AWAITING_C2_CLOSURE:
                         legal = (newStage == STAGE_WAITING_FOR_POI ||
-                                 newStage == STAGE_READY ||
                                  newStage == STAGE_EXPIRED);
-                        if(!legal) reason = "LOCKED -> " + EnumToString(newStage) + " illegal; must go to WAITING_FOR_POI, READY, or EXPIRED";
+                        if(!legal) reason = "AWAITING_C2 -> " + EnumToString(newStage) + " illegal; must go to WAITING_FOR_POI or EXPIRED";
                         break;
 
-                   case STAGE_AWAITING_C2_CLOSURE:
-                       legal = (newStage == STAGE_WAITING_FOR_POI ||
-                                newStage == STAGE_EXPIRED);
-                       if(!legal) reason = "AWAITING_C2 -> " + EnumToString(newStage) + " illegal; must go to WAITING_FOR_POI or EXPIRED";
-                       break;
+                case STAGE_AWAITING_C3_CLOSURE:
+                     legal = (newStage == STAGE_WAITING_FOR_POI ||
+                              newStage == STAGE_WAITING_FOR_CISD ||
+                              newStage == STAGE_EXPIRED);
+                     if(!legal) reason = "AWAITING_C3 -> " + EnumToString(newStage) + " illegal; must go to WAITING_FOR_POI, WAITING_FOR_CISD, or EXPIRED";
+                     break;
 
-               case STAGE_AWAITING_C3_CLOSURE:
-                    legal = (newStage == STAGE_WAITING_FOR_POI ||
-                             newStage == STAGE_WAITING_FOR_CISD ||
-                             newStage == STAGE_EXPIRED);
-                    if(!legal) reason = "AWAITING_C3 -> " + EnumToString(newStage) + " illegal; must go to WAITING_FOR_POI, WAITING_FOR_CISD, or EXPIRED";
-                    break;
-
-                   case STAGE_WAITING_FOR_POI:
-                       legal = (newStage == STAGE_READY ||
-                                newStage == STAGE_EXPIRED ||
-                                newStage == STAGE_AWAITING_C3_CLOSURE ||
-                                newStage == STAGE_WAITING_FOR_CISD);
-                       if(!legal) reason = "WAITING_FOR_POI -> " + EnumToString(newStage) + " illegal; must go to READY, EXPIRED, AWAITING_C3, or WAITING_FOR_CISD";
-                       break;
-
-                    case STAGE_WAITING_FOR_CISD:
+                    case STAGE_WAITING_FOR_POI:
                         legal = (newStage == STAGE_READY ||
                                  newStage == STAGE_EXPIRED ||
-                                 newStage == STAGE_WAITING_FOR_POI);
-                        if(!legal) reason = "WAITING_FOR_CISD -> " + EnumToString(newStage) + " illegal; must go to READY, WAITING_FOR_POI, or EXPIRED";
+                                 newStage == STAGE_AWAITING_C3_CLOSURE ||
+                                 newStage == STAGE_WAITING_FOR_CISD);
+                        if(!legal) reason = "WAITING_FOR_POI -> " + EnumToString(newStage) + " illegal; must go to READY, EXPIRED, AWAITING_C3, or WAITING_FOR_CISD";
                         break;
 
-                   case STAGE_READY:
-                       legal = (newStage == STAGE_EXECUTED ||
-                                newStage == STAGE_EXPIRED);
-                       if(!legal) reason = "READY -> " + EnumToString(newStage) + " illegal; must go to EXECUTED or EXPIRED";
-                       break;
+                     case STAGE_WAITING_FOR_CISD:
+                         legal = (newStage == STAGE_READY ||
+                                  newStage == STAGE_EXPIRED ||
+                                  newStage == STAGE_WAITING_FOR_POI);
+                         if(!legal) reason = "WAITING_FOR_CISD -> " + EnumToString(newStage) + " illegal; must go to READY, WAITING_FOR_POI, or EXPIRED";
+                         break;
 
-                   case STAGE_EXECUTED:
-                       legal = false;
-                       reason = "EXECUTED -> " + EnumToString(newStage) + " illegal; terminal state";
-                       break;
+                    case STAGE_READY:
+                        legal = (newStage == STAGE_EXECUTED ||
+                                 newStage == STAGE_EXPIRED);
+                        if(!legal) reason = "READY -> " + EnumToString(newStage) + " illegal; must go to EXECUTED or EXPIRED";
+                        break;
 
-                   case STAGE_EXPIRED:
-                       legal = false;
-                       reason = "EXPIRED -> " + EnumToString(newStage) + " illegal; terminal state";
-                       break;
+                    case STAGE_EXECUTED:
+                        legal = false;
+                        reason = "EXECUTED -> " + EnumToString(newStage) + " illegal; terminal state";
+                        break;
 
-                   default:
-                       legal = false;
-                       reason = "Unknown stage " + IntegerToString(stage) + " -> " + EnumToString(newStage) + " illegal";
-                       break;
-               }
+                    case STAGE_EXPIRED:
+                        legal = false;
+                        reason = "EXPIRED -> " + EnumToString(newStage) + " illegal; terminal state";
+                        break;
+
+                    // ── C4-specific stage transitions (decoupled pipeline) ──
+                    case STAGE_C4_WAITING:
+                        legal = (newStage == STAGE_C4_DETECTED ||
+                                 newStage == STAGE_C4_WAITING_POI ||
+                                 newStage == STAGE_EXPIRED);
+                        if(!legal) reason = "C4_WAITING -> " + EnumToString(newStage) + " illegal; must go to C4_DETECTED, C4_WAITING_POI, or EXPIRED";
+                        break;
+
+                    case STAGE_C4_DETECTED:
+                        legal = (newStage == STAGE_C4_WAITING_POI ||
+                                 newStage == STAGE_EXPIRED);
+                        if(!legal) reason = "C4_DETECTED -> " + EnumToString(newStage) + " illegal; must go to C4_WAITING_POI or EXPIRED";
+                        break;
+
+                    case STAGE_C4_WAITING_POI:
+                        legal = (newStage == STAGE_C4_READY ||
+                                 newStage == STAGE_EXPIRED);
+                        if(!legal) reason = "C4_WAITING_POI -> " + EnumToString(newStage) + " illegal; must go to C4_READY or EXPIRED";
+                        break;
+
+                    case STAGE_C4_READY:
+                        legal = (newStage == STAGE_EXECUTED ||
+                                 newStage == STAGE_EXPIRED);
+                        if(!legal) reason = "C4_READY -> " + EnumToString(newStage) + " illegal; must go to EXECUTED or EXPIRED";
+                        break;
+
+                    default:
+                        legal = false;
+                        reason = "Unknown stage " + IntegerToString(stage) + " -> " + EnumToString(newStage) + " illegal";
+                        break;
+                }
 
                datetime now = TimeCurrent();
                int minutesInOldStage = (stageEntryTime > 0) ? (int)((now - stageEntryTime) / 60) : 0;
@@ -570,12 +597,13 @@ ulong GetGUID() { return m_guid; }
             }
 
          // FIX 1: Mark as executed
-          void MarkExecuted()
-          {
-               TransitionStage(STAGE_EXECUTED);
-               isCommitted = false;
-               // Don't reset executionAttempts - keep for audit trail
-          }
+           void MarkExecuted()
+           {
+                ReleaseHandover();
+                TransitionStage(STAGE_EXECUTED);
+                isCommitted = false;
+                // Don't reset executionAttempts - keep for audit trail
+           }
         
            void Invalidate(string reason)
            {

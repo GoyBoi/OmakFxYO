@@ -38,30 +38,45 @@ bool SQ_HasSignalType(ENUM_EXECUTION_BRANCH branch, ENUM_CLOSURE_TYPE closureTyp
             return true;
       }
    }
-   else if(closureType == CLOSURE_C3 || closureType == CLOSURE_C4)
-   {
-      int baseIdx = (branch == BRANCH_INTRADAY) ? 0 : MAX_C3_SIGNALS_PER_BRANCH;
-      for(int i = baseIdx; i < baseIdx + MAX_C3_SIGNALS_PER_BRANCH; i++)
-      {
-         if(g_activeC3[i].m_guid != 0 && g_activeC3[i].closureType == closureType)
-            return true;
-      }
-   }
-   else
-   {
-      int c2base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C2_SIGNALS_PER_BRANCH;
-      int c3base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C3_SIGNALS_PER_BRANCH;
-      for(int i = c2base; i < c2base + MAX_C2_SIGNALS_PER_BRANCH; i++)
-      {
-         if(g_activeC2[i].m_guid != 0 && g_activeC2[i].closureType == closureType)
-            return true;
-      }
-      for(int i = c3base; i < c3base + MAX_C3_SIGNALS_PER_BRANCH; i++)
-      {
-         if(g_activeC3[i].m_guid != 0 && g_activeC3[i].closureType == closureType)
-            return true;
-      }
-   }
+    else if(closureType == CLOSURE_C4)
+    {
+       int baseIdx = (branch == BRANCH_INTRADAY) ? 0 : MAX_C4_SIGNALS_PER_BRANCH;
+       for(int i = baseIdx; i < baseIdx + MAX_C4_SIGNALS_PER_BRANCH; i++)
+       {
+          if(g_activeC4[i].m_guid != 0 && g_activeC4[i].closureType == closureType)
+             return true;
+       }
+    }
+    else if(closureType == CLOSURE_C3)
+    {
+       int baseIdx = (branch == BRANCH_INTRADAY) ? 0 : MAX_C3_SIGNALS_PER_BRANCH;
+       for(int i = baseIdx; i < baseIdx + MAX_C3_SIGNALS_PER_BRANCH; i++)
+       {
+          if(g_activeC3[i].m_guid != 0 && g_activeC3[i].closureType == closureType)
+             return true;
+       }
+    }
+    else
+    {
+       int c2base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C2_SIGNALS_PER_BRANCH;
+       int c3base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C3_SIGNALS_PER_BRANCH;
+       int c4base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C4_SIGNALS_PER_BRANCH;
+       for(int i = c2base; i < c2base + MAX_C2_SIGNALS_PER_BRANCH; i++)
+       {
+          if(g_activeC2[i].m_guid != 0 && g_activeC2[i].closureType == closureType)
+             return true;
+       }
+       for(int i = c3base; i < c3base + MAX_C3_SIGNALS_PER_BRANCH; i++)
+       {
+          if(g_activeC3[i].m_guid != 0 && g_activeC3[i].closureType == closureType)
+             return true;
+       }
+       for(int i = c4base; i < c4base + MAX_C4_SIGNALS_PER_BRANCH; i++)
+       {
+          if(g_activeC4[i].m_guid != 0 && g_activeC4[i].closureType == closureType)
+             return true;
+       }
+    }
    return false;
 }
 
@@ -69,37 +84,49 @@ bool SQ_HasSignalType(ENUM_EXECUTION_BRANCH branch, ENUM_CLOSURE_TYPE closureTyp
  //| QUERY: Find signal slot by GUID + closure type                      |
  //+------------------------------------------------------------------+
  // Updated to search all C2/C3 slots
- int SQ_FindSignalSlot(ENUM_EXECUTION_BRANCH branch, ulong guid, ENUM_CLOSURE_TYPE closureType)
- {
-    int c2base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C2_SIGNALS_PER_BRANCH;
-    int c3base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C3_SIGNALS_PER_BRANCH;
-    if(closureType == CLOSURE_C2)
-    {
-       for(int i = c2base; i < c2base + MAX_C2_SIGNALS_PER_BRANCH; i++)
-       {
-          if(g_activeC2[i].m_guid == guid) return i;
-       }
-    }
-    else if(closureType == CLOSURE_C3 || closureType == CLOSURE_C4)
-    {
-       for(int i = c3base; i < c3base + MAX_C3_SIGNALS_PER_BRANCH; i++)
-       {
-          if(g_activeC3[i].m_guid == guid) return i;
-       }
-    }
-    else
-    {
-       for(int i = c2base; i < c2base + MAX_C2_SIGNALS_PER_BRANCH; i++)
-       {
-          if(g_activeC2[i].m_guid == guid) return i;
-       }
-       for(int i = c3base; i < c3base + MAX_C3_SIGNALS_PER_BRANCH; i++)
-       {
-          if(g_activeC3[i].m_guid == guid) return i;
-       }
-    }
-    return -1;
- }
+  int SQ_FindSignalSlot(ENUM_EXECUTION_BRANCH branch, ulong guid, ENUM_CLOSURE_TYPE closureType)
+  {
+     int c2base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C2_SIGNALS_PER_BRANCH;
+     int c3base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C3_SIGNALS_PER_BRANCH;
+     int c4base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C4_SIGNALS_PER_BRANCH;
+     if(closureType == CLOSURE_C2)
+     {
+        for(int i = c2base; i < c2base + MAX_C2_SIGNALS_PER_BRANCH; i++)
+        {
+           if(g_activeC2[i].m_guid == guid) return i;
+        }
+     }
+     else if(closureType == CLOSURE_C4)
+     {
+        for(int i = c4base; i < c4base + MAX_C4_SIGNALS_PER_BRANCH; i++)
+        {
+           if(g_activeC4[i].m_guid == guid) return i;
+        }
+     }
+     else if(closureType == CLOSURE_C3)
+     {
+        for(int i = c3base; i < c3base + MAX_C3_SIGNALS_PER_BRANCH; i++)
+        {
+           if(g_activeC3[i].m_guid == guid) return i;
+        }
+     }
+     else
+     {
+        for(int i = c2base; i < c2base + MAX_C2_SIGNALS_PER_BRANCH; i++)
+        {
+           if(g_activeC2[i].m_guid == guid) return i;
+        }
+        for(int i = c3base; i < c3base + MAX_C3_SIGNALS_PER_BRANCH; i++)
+        {
+           if(g_activeC3[i].m_guid == guid) return i;
+        }
+        for(int i = c4base; i < c4base + MAX_C4_SIGNALS_PER_BRANCH; i++)
+        {
+           if(g_activeC4[i].m_guid == guid) return i;
+        }
+     }
+     return -1;
+  }
 
  //+------------------------------------------------------------------+
  //| QUERY: Count active signals in branch                        |
@@ -116,7 +143,16 @@ bool SQ_HasSignalType(ENUM_EXECUTION_BRANCH branch, ENUM_CLOSURE_TYPE closureTyp
              count++;
        }
     }
-    else if(closureType == CLOSURE_C3 || closureType == CLOSURE_C4)
+    else if(closureType == CLOSURE_C4)
+    {
+       int baseIdx = GetSignalStoreIndex(branch, CLOSURE_C4);
+       for(int i = 0; i < MAX_C4_SIGNALS_PER_BRANCH; i++)
+       {
+          if(g_activeC4[baseIdx + i].m_guid != 0 && g_activeC4[baseIdx + i].stage != STAGE_NONE)
+             count++;
+       }
+    }
+    else if(closureType == CLOSURE_C3)
     {
        int baseIdx = GetSignalStoreIndex(branch, CLOSURE_C3);
        for(int i = 0; i < MAX_C3_SIGNALS_PER_BRANCH; i++)
@@ -129,6 +165,7 @@ bool SQ_HasSignalType(ENUM_EXECUTION_BRANCH branch, ENUM_CLOSURE_TYPE closureTyp
     {
        int c2base = GetSignalStoreIndex(branch, CLOSURE_C2);
        int c3base = GetSignalStoreIndex(branch, CLOSURE_C3);
+       int c4base = GetSignalStoreIndex(branch, CLOSURE_C4);
        for(int i = 0; i < MAX_C2_SIGNALS_PER_BRANCH; i++)
        {
           if(g_activeC2[c2base + i].m_guid != 0 && g_activeC2[c2base + i].stage != STAGE_NONE)
@@ -137,6 +174,11 @@ bool SQ_HasSignalType(ENUM_EXECUTION_BRANCH branch, ENUM_CLOSURE_TYPE closureTyp
        for(int i = 0; i < MAX_C3_SIGNALS_PER_BRANCH; i++)
        {
           if(g_activeC3[c3base + i].m_guid != 0 && g_activeC3[c3base + i].stage != STAGE_NONE)
+             count++;
+       }
+       for(int i = 0; i < MAX_C4_SIGNALS_PER_BRANCH; i++)
+       {
+          if(g_activeC4[c4base + i].m_guid != 0 && g_activeC4[c4base + i].stage != STAGE_NONE)
              count++;
        }
     }
@@ -157,7 +199,16 @@ bool SQ_HasSignalType(ENUM_EXECUTION_BRANCH branch, ENUM_CLOSURE_TYPE closureTyp
              return baseIdx + i;
        }
     }
-    else if(closureType == CLOSURE_C3 || closureType == CLOSURE_C4)
+    else if(closureType == CLOSURE_C4)
+    {
+       int baseIdx = GetSignalStoreIndex(branch, CLOSURE_C4);
+       for(int i = 0; i < MAX_C4_SIGNALS_PER_BRANCH; i++)
+       {
+          if(g_activeC4[baseIdx + i].m_guid == 0 || g_activeC4[baseIdx + i].stage == STAGE_NONE)
+             return baseIdx + i;
+       }
+    }
+    else if(closureType == CLOSURE_C3)
     {
        int baseIdx = GetSignalStoreIndex(branch, CLOSURE_C3);
        for(int i = 0; i < MAX_C3_SIGNALS_PER_BRANCH; i++)
@@ -180,6 +231,12 @@ bool SQ_HasSignalType(ENUM_EXECUTION_BRANCH branch, ENUM_CLOSURE_TYPE closureTyp
           if(g_activeC3[c3base + i].m_guid == 0 || g_activeC3[c3base + i].stage == STAGE_NONE)
              return c3base + i;
        }
+       int c4base = GetSignalStoreIndex(branch, CLOSURE_C4);
+       for(int i = 0; i < MAX_C4_SIGNALS_PER_BRANCH; i++)
+       {
+          if(g_activeC4[c4base + i].m_guid == 0 || g_activeC4[c4base + i].stage == STAGE_NONE)
+             return c4base + i;
+       }
     }
    return -1;
  }
@@ -188,10 +245,11 @@ bool SQ_HasSignalType(ENUM_EXECUTION_BRANCH branch, ENUM_CLOSURE_TYPE closureTyp
 //| INVALIDATE: Full cleanup of signal GUID from context + store      |
 //| FIX B: Prevent stuck GUID recycling                              |
 //+------------------------------------------------------------------+
- bool SQ_InvalidateSignal(ulong guid, ENUM_EXECUTION_BRANCH branch)
+  bool SQ_InvalidateSignal(ulong guid, ENUM_EXECUTION_BRANCH branch)
 {
    int c2base = GetSignalStoreIndex(branch, CLOSURE_C2);
    int c3base = GetSignalStoreIndex(branch, CLOSURE_C3);
+   int c4base = GetSignalStoreIndex(branch, CLOSURE_C4);
    for(int i = c2base; i < c2base + MAX_C2_SIGNALS_PER_BRANCH; i++)
    {
       if(g_activeC2[i].m_guid == guid)
@@ -205,6 +263,14 @@ bool SQ_HasSignalType(ENUM_EXECUTION_BRANCH branch, ENUM_CLOSURE_TYPE closureTyp
       if(g_activeC3[i].m_guid == guid)
       {
          g_activeC3[i].Reset();
+         return true;
+      }
+   }
+   for(int i = c4base; i < c4base + MAX_C4_SIGNALS_PER_BRANCH; i++)
+   {
+      if(g_activeC4[i].m_guid == guid)
+      {
+         g_activeC4[i].Reset();
          return true;
       }
    }
@@ -229,10 +295,34 @@ bool GetC2ExtremesForSignal(ulong guid, double &c2_low, double &c2_high)
       {
          int c2base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C2_SIGNALS_PER_BRANCH;
          int c3base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C3_SIGNALS_PER_BRANCH;
-         bool inC2Range = (slot >= c2base && slot < c2base + MAX_C2_SIGNALS_PER_BRANCH);
-         int poolIdx = inC2Range ? slot : slot - c2base;
-         c2_low = inC2Range ? g_activeC2[poolIdx].c2_low : g_activeC3[poolIdx].c2_low;
-         c2_high = inC2Range ? g_activeC2[poolIdx].c2_high : g_activeC3[poolIdx].c2_high;
+         int c4base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C4_SIGNALS_PER_BRANCH;
+         int c2end = c2base + MAX_C2_SIGNALS_PER_BRANCH;
+         int c3end = c3base + MAX_C3_SIGNALS_PER_BRANCH;
+         int c4end = c4base + MAX_C4_SIGNALS_PER_BRANCH;
+         int poolIdx;
+         if(slot >= c2base && slot < c2end)
+         {
+            poolIdx = slot;
+            c2_low = g_activeC2[poolIdx].c2_low;
+            c2_high = g_activeC2[poolIdx].c2_high;
+         }
+         else if(slot >= c3base && slot < c3end)
+         {
+            poolIdx = slot;
+            c2_low = g_activeC3[poolIdx].c2_low;
+            c2_high = g_activeC3[poolIdx].c2_high;
+         }
+         else if(slot >= c4base && slot < c4end)
+         {
+            poolIdx = slot;
+            c2_low = g_activeC4[poolIdx].c2_low;
+            c2_high = g_activeC4[poolIdx].c2_high;
+         }
+         else
+         {
+            c2_low = 0.0;
+            c2_high = 0.0;
+         }
          if(c2_low > 0.0 || c2_high > 0.0)
             return true;
       }

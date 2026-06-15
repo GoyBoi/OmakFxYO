@@ -35,6 +35,7 @@ input ENUM_ACTIVE_BRANCH InpActiveBranch = BRANCH_A;  // Active branch: A=Intrad
 input double InpMaxMinLotRiskPercent = 20.0; // Affordability bridge: max minLot risk % for symbol tradeability gating
 input double InpMaxRiskDeviation = 0.25; // Max allowed risk deviation after lot adjustment (%)
     input double InpMinStopBuffer = 1.0;      // Minimum SL buffer as multiplier of broker's SYMBOL_TRADE_STOPS_LEVEL (0=use broker minimum)
+   input double InpStopsBuffer = 1.0;        // Multiplier for broker stops level enforcement
   input int InpMaxPoiWaitBars = 10;         // Max bars to wait for POI touch before expiring (PROMPT_E3: was 5)
   input int    InpMagicNumber = 88001;
  input bool   InpEnableTrace = true;
@@ -86,7 +87,7 @@ input double InpPyramidAdditionalRiskPct = 50.0;   // Additional risk % per pyra
 input double InpPyramidRiskFactor = 0.70;           // Declining risk factor per pyramid layer (0.70 = 30% reduction per layer)
 
 //--- PHASE 3: Mode-specific parameters
-input double InpAnticipationRR = 2.0;           // Minimum R:R for Anticipation mode
+input double InpAnticipationRR = 3.0;           // Minimum R:R for Anticipation mode (C2: 3R)
 input bool   InpAllowAnticipationReversals = true;      // Allow counter-D1 bias in Anticipation mode
 input double InpRiskRewardRatio = 2.0;          // [FIX 5] TP multiplier (1.0=1:1, 2.0=1:2, 3.0=1:3)
 
@@ -317,6 +318,9 @@ int GetPendingOrderTimeoutSeconds(ENUM_TIMEFRAMES entryTF)
    }
 }
 
+// Forward declaration — defined below includes
+bool IsMarketOpen();
+
  //+------------------------------------------------------------------+
  //| SEQUENCE 5: ENGINE INCLUDES                                       |
  //+------------------------------------------------------------------+
@@ -491,10 +495,15 @@ double UpdateDynamicRisk(double baseRiskPercent)
 //+------------------------------------------------------------------+
 void OnTimer()
 {
-    LogPrint("[ON_TIMER_TELEMETRY] Heartbeat | equity=" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2) +
-             " | balance=" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2) +
-             " | state=" + EnumToString(g_equityGuardState) +
-             " | blocked=" + (g_blockNewEntries ? "true" : "false"), LOG_LEVEL_DEBUG);
+    static datetime s_lastTimerLog = 0;
+    if(TimeCurrent() - s_lastTimerLog >= 60)
+    {
+        LogPrint("[ON_TIMER_TELEMETRY] Heartbeat | equity=" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2) +
+                 " | balance=" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2) +
+                 " | state=" + EnumToString(g_equityGuardState) +
+                 " | blocked=" + (g_blockNewEntries ? "true" : "false"), LOG_LEVEL_DEBUG);
+        s_lastTimerLog = TimeCurrent();
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -620,8 +629,13 @@ void SyncBlockNewEntries()
 //+------------------------------------------------------------------+
 void EquityGuardCheck()
 {
-    LogPrint("[EQ_GUARD_TICK] equity=" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2) +
-             " | balance=" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2), LOG_LEVEL_DEBUG);
+    static datetime s_lastEqGuardLog = 0;
+    if(TimeCurrent() - s_lastEqGuardLog >= 60)
+    {
+        LogPrint("[EQ_GUARD_TICK] equity=" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2) +
+                 " | balance=" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2), LOG_LEVEL_DEBUG);
+        s_lastEqGuardLog = TimeCurrent();
+    }
 
     double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
     ENUM_EQUITY_GUARD_STATE newState = g_equityGuardState;
@@ -659,7 +673,6 @@ void EquityGuardCheck()
     }
 
     // Daily loss check (includes floating PnL)
-    LogPrint("[EQ_FLOATING_DD] checking daily loss limit", LOG_LEVEL_DEBUG);
     if(CheckDailyLossLimit())
         newState = EQUITY_GUARD_BREACHED;
 
@@ -798,6 +811,18 @@ bool IsMarketOpen()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    if(bid <= 0.0 || ask <= 0.0)
       return false;
+   // 24/7 symbols (crypto, synthetics) — skip market hours check
+   ENUM_SYMBOL_CLASS symClass = DetectSymbolClass(_Symbol);
+   if(symClass == CLASS_CRYPTO || symClass == CLASS_SYNTHETIC)
+      return true;
+   // Traditional markets (forex, metals, indices) — check weekend/Friday close
+   MqlDateTime now;
+   TimeCurrent(now);
+   int dayOfWeek = now.day_of_week;
+   int hour = now.hour;
+   if(dayOfWeek == 5 && hour >= 22) return false;
+   if(dayOfWeek == 6) return false;
+   if(dayOfWeek == 0 && hour < 23) return false;
    return true;
 }
 
@@ -973,6 +998,11 @@ bool FindSignalByGUID(ulong guid, SLockedSignal &outSignal)
             outSignal = g_activeC3[i];
             return true;
         }
+        if(g_activeC4[i].m_guid == guid)
+        {
+            outSignal = g_activeC4[i];
+            return true;
+        }
     }
     return false;
 }
@@ -1146,19 +1176,23 @@ int g_limitExpirationBars = 4;
  {
      if(closureType == CLOSURE_C2)
          return (branch == BRANCH_INTRADAY) ? 0 : MAX_C2_SIGNALS_PER_BRANCH;
-     else if(closureType == CLOSURE_C3 || closureType == CLOSURE_C4)
+     else if(closureType == CLOSURE_C4)
+         return (branch == BRANCH_INTRADAY) ? 0 : MAX_C4_SIGNALS_PER_BRANCH;
+     else if(closureType == CLOSURE_C3)
          return (branch == BRANCH_INTRADAY) ? 0 : MAX_C3_SIGNALS_PER_BRANCH;
      return 0;
  }
 
  //+------------------------------------------------------------------+
- //| GetMaxSignalsForClosureType — Get max slots for C2 or C3          |
+ //| GetMaxSignalsForClosureType — Get max slots for C2, C3, or C4     |
  //+------------------------------------------------------------------+
  int GetMaxSignalsForClosureType(ENUM_CLOSURE_TYPE closureType)
  {
       if(closureType == CLOSURE_C2)
           return MAX_C2_SIGNALS_PER_BRANCH;
-      else if(closureType == CLOSURE_C3 || closureType == CLOSURE_C4)
+      else if(closureType == CLOSURE_C4)
+          return MAX_C4_SIGNALS_PER_BRANCH;
+      else if(closureType == CLOSURE_C3)
           return MAX_C3_SIGNALS_PER_BRANCH;
       return MAX_TOTAL_SIGNALS_PER_BRANCH;  // Fallback
  }
@@ -1217,6 +1251,7 @@ int g_limitExpirationBars = 4;
  {
      int c2base = GetSignalStoreIndex(branch, CLOSURE_C2);
      int c3base = GetSignalStoreIndex(branch, CLOSURE_C3);
+     int c4base = GetSignalStoreIndex(branch, CLOSURE_C4);
      for(int i = 0; i < MAX_C2_SIGNALS_PER_BRANCH; i++)
      {
          g_activeC2[c2base + i].Reset();
@@ -1224,6 +1259,10 @@ int g_limitExpirationBars = 4;
      for(int i = 0; i < MAX_C3_SIGNALS_PER_BRANCH; i++)
      {
          g_activeC3[c3base + i].Reset();
+     }
+     for(int i = 0; i < MAX_C4_SIGNALS_PER_BRANCH; i++)
+     {
+         g_activeC4[c4base + i].Reset();
      }
  }
 
@@ -1246,12 +1285,20 @@ bool CommitSignalToStore(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, EN
       LogPrint(StringFormat("[C2_COMMIT_ATTEMPT] GUID=%I64u | branch=%d", signal.m_guid, branch), LOG_LEVEL_DEBUG);
    }
 
-    // Duplicate GUID check - reject if already stored, force regen on retry
-    if(IsGuidInStoreSafe(signal.m_guid, branch))
+    // Duplicate GUID check — retry loop with fresh GUID generation
+    int guidRegenAttempt = 0;
+    while(IsGuidInStoreSafe(signal.m_guid, branch))
     {
-       LogPrint(StringFormat("[GUID_DUPLICATE_BLOCKED] Attempting regen | GUID=%I64u | branch=%d", signal.m_guid, branch), LOG_LEVEL_WARN);
-       signal.m_guid = 0; // force regen in Lock on retry
-       return false;
+        guidRegenAttempt++;
+        if(guidRegenAttempt > 5)
+        {
+            LogPrint(StringFormat("[GUID_DUPLICATE_BLOCKED] Regeneration exhausted GUID=%I64u branch=%d", signal.m_guid, branch), LOG_LEVEL_ERROR);
+            return false;
+        }
+        LogPrint(StringFormat("[GUID_DUPLICATE_BLOCKED] Attempting regen attempt=%d GUID=%I64u branch=%d", guidRegenAttempt, signal.m_guid, branch), LOG_LEVEL_WARN);
+        signal.m_guid = SLockedSignal::GenerateSignalGUID();
+        if(IsRetiredGUID(signal.m_guid))
+            continue;
     }
 
    int baseIdx = GetSignalStoreIndex(branch, closureType);
@@ -1260,7 +1307,7 @@ bool CommitSignalToStore(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, EN
    // FIRST: Attempt slot hygiene to reclaim stuck signals before rejecting
    int reclaimed = PerformSlotHygiene(branch, 1, closureType);
 
-   // Find empty slot within C2/C3 pool
+    // Find empty slot within C2/C3/C4 pool
    int targetIdx = -1;
    if(closureType == CLOSURE_C2)
    {
@@ -1268,6 +1315,18 @@ bool CommitSignalToStore(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, EN
       {
           int idx = baseIdx + i;
           if(g_activeC2[idx].m_guid == 0 || g_activeC2[idx].stage == STAGE_NONE)
+          {
+              targetIdx = idx;
+              break;
+          }
+      }
+   }
+   else if(closureType == CLOSURE_C4)
+   {
+      for(int i = 0; i < maxSlotsLocal; i++)
+      {
+          int idx = baseIdx + i;
+          if(g_activeC4[idx].m_guid == 0 || g_activeC4[idx].stage == STAGE_NONE)
           {
               targetIdx = idx;
               break;
@@ -1294,6 +1353,9 @@ bool CommitSignalToStore(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, EN
        if(closureType == CLOSURE_C3)
           LogPrint("[C3_STORE_FAIL] reason=SLOTS_FULL_AFTER_HYGIENE | branch=" + IntegerToString(branch) +
                    " | GUID=" + IntegerToString(signal.m_guid), LOG_LEVEL_WARN);
+       if(closureType == CLOSURE_C4)
+          LogPrint("[C4_STORE_FAIL] reason=SLOTS_FULL_AFTER_HYGIENE | branch=" + IntegerToString(branch) +
+                   " | GUID=" + IntegerToString(signal.m_guid), LOG_LEVEL_WARN);
        return false;
    }
 
@@ -1308,6 +1370,17 @@ bool CommitSignalToStore(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, EN
       g_activeC2[targetIdx].Reset();
       g_activeC2[targetIdx] = signal;
    }
+   else if(closureType == CLOSURE_C4)
+   {
+      if(g_activeC4[targetIdx].stage == STAGE_C4_READY && !g_activeC4[targetIdx].hasFailedRG)
+      {
+         LogPrint("[STORE_HYGIENE_SAFE] Protected C4_READY signal in target slot skipped | GUID=" + 
+                  IntegerToString(g_activeC4[targetIdx].m_guid) + " | slot=" + IntegerToString(targetIdx), LOG_LEVEL_WARN);
+         return false;
+      }
+      g_activeC4[targetIdx].Reset();
+      g_activeC4[targetIdx] = signal;
+   }
    else
    {
       if(g_activeC3[targetIdx].stage == STAGE_READY && !g_activeC3[targetIdx].hasFailedRG)
@@ -1321,7 +1394,8 @@ bool CommitSignalToStore(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, EN
    }
    g_poiCache[targetIdx].isValid = false;
    
-   LogPrint(StringFormat("[SIGNAL_STORED] GUID=%I64u | branch=%d | slot=%d | pool=%s", signal.m_guid, branch, targetIdx, (closureType == CLOSURE_C2 ? "C2" : "C3")), LOG_LEVEL_INFO);
+   string poolName = (closureType == CLOSURE_C2) ? "C2" : (closureType == CLOSURE_C4) ? "C4" : "C3";
+   LogPrint(StringFormat("[SIGNAL_STORED] GUID=%I64u | branch=%d | slot=%d | pool=%s", signal.m_guid, branch, targetIdx, poolName), LOG_LEVEL_INFO);
    LogPrint(StringFormat("[SLOT_DEEP_RESET] slot=%d | branch=%d | closureType=%s",
             targetIdx, branch, EnumToString(closureType)), LOG_LEVEL_DEBUG);
    
@@ -1403,52 +1477,97 @@ void ClearSignalByGUID(ENUM_EXECUTION_BRANCH branch, ulong guid, string reason)
          return;
       }
       
-      // Scan C3 pool
-      for(int i = c3Base; i < c3Base + c3Max; i++)
-      {
-         if(g_activeC3[i].m_guid != guid) continue;
-         SLockedSignal sig = g_activeC3[i];
-         ENUM_CLOSURE_TYPE closureType = sig.closureType;
+       // Scan C3 pool
+       for(int i = c3Base; i < c3Base + c3Max; i++)
+       {
+          if(g_activeC3[i].m_guid != guid) continue;
+          SLockedSignal sig = g_activeC3[i];
+          ENUM_CLOSURE_TYPE closureType = sig.closureType;
 
-         if(StringFind(reason, "AFFORDABILITY") >= 0 ||
-            StringFind(reason, "LOT_NOT_TRADEABLE") >= 0 ||
-            StringFind(reason, "MINLOT") >= 0)
-         {
-            LogPrint("[PERMANENT_SKIP] GUID=" + IntegerToString(guid) + " | reason=" + reason + " | slot=C3[" + IntegerToString(i) + "]", LOG_LEVEL_WARN);
-            if(sig.handoverState != HANDOVER_NONE && sig.handoverState != HANDOVER_RELEASED)
-               g_activeC3[i].ForceReleaseHandover("PERMANENT_SKIP:" + reason);
-            g_activeC3[i].slotClearedFor = STAGE_NONE;
-            g_activeC3[i].Reset();
-            g_poiCache[i].isValid = false;
-            ClearCachedModeForGUID(guid);
-            AddPermanentSkip(_Symbol, reason + " | GUID=" + IntegerToString(guid));
-            LogPrint(StringFormat("[SIGNAL_CLEARED] GUID=%I64u | reason=%s_PERMANENT_SKIP | slot=C3[%d]", guid, reason, i), LOG_LEVEL_INFO);
-            return;
-         }
-         if(sig.executionAttempts > 8 || (sig.stage == STAGE_READY && sig.hasFailedRG))
-         {
-            LogPrint("[ZOMBIE_CLEARED] GUID=" + IntegerToString(guid) + " | idx=C3[" + IntegerToString(i) + "] | attempts=" + IntegerToString(sig.executionAttempts) + " | stage=" + EnumToString(sig.stage), LOG_LEVEL_WARN);
-            if(sig.handoverState != HANDOVER_NONE && sig.handoverState != HANDOVER_RELEASED)
-               g_activeC3[i].ForceReleaseHandover("ZOMBIE_CLEAR:" + reason);
-            g_activeC3[i].slotClearedFor = STAGE_NONE;
-            g_activeC3[i].Reset();
-            ClearCachedModeForGUID(guid);
-            LogPrint(StringFormat("[SIGNAL_CLEARED] GUID=%I64u | reason=%s_ZOMBIE | slot=C3[%d]", guid, reason, i), LOG_LEVEL_INFO);
-            return;
-         }
-         if(sig.stage == STAGE_READY && !sig.hasFailedRG && !sig.isStructurallyInvalid)
-         {
-            LogPrint("[READY_CLEARED_BLOCKED] Protected READY signal skipped | GUID=" + IntegerToString(guid) + " | idx=C3[" + IntegerToString(i) + "]", LOG_LEVEL_WARN);
-            continue;
-         }
-         g_activeC3[i].slotClearedFor = STAGE_NONE;
-         g_activeC3[i].Reset();
-         g_poiCache[i].isValid = false;
-         ClearCachedModeForGUID(guid);
-         LogPrint(StringFormat("[SIGNAL_CLEARED] GUID=%I64u | reason=%s | slot=C3[%d]", guid, reason, i), LOG_LEVEL_INFO);
-         return;
-      }
-   }
+          if(StringFind(reason, "AFFORDABILITY") >= 0 ||
+             StringFind(reason, "LOT_NOT_TRADEABLE") >= 0 ||
+             StringFind(reason, "MINLOT") >= 0)
+          {
+             LogPrint("[PERMANENT_SKIP] GUID=" + IntegerToString(guid) + " | reason=" + reason + " | slot=C3[" + IntegerToString(i) + "]", LOG_LEVEL_WARN);
+             if(sig.handoverState != HANDOVER_NONE && sig.handoverState != HANDOVER_RELEASED)
+                g_activeC3[i].ForceReleaseHandover("PERMANENT_SKIP:" + reason);
+             g_activeC3[i].slotClearedFor = STAGE_NONE;
+             g_activeC3[i].Reset();
+             g_poiCache[i].isValid = false;
+             ClearCachedModeForGUID(guid);
+             AddPermanentSkip(_Symbol, reason + " | GUID=" + IntegerToString(guid));
+             LogPrint(StringFormat("[SIGNAL_CLEARED] GUID=%I64u | reason=%s_PERMANENT_SKIP | slot=C3[%d]", guid, reason, i), LOG_LEVEL_INFO);
+             return;
+          }
+          if(sig.executionAttempts > 8 || (sig.stage == STAGE_READY && sig.hasFailedRG))
+          {
+             LogPrint("[ZOMBIE_CLEARED] GUID=" + IntegerToString(guid) + " | idx=C3[" + IntegerToString(i) + "] | attempts=" + IntegerToString(sig.executionAttempts) + " | stage=" + EnumToString(sig.stage), LOG_LEVEL_WARN);
+             if(sig.handoverState != HANDOVER_NONE && sig.handoverState != HANDOVER_RELEASED)
+                g_activeC3[i].ForceReleaseHandover("ZOMBIE_CLEAR:" + reason);
+             g_activeC3[i].slotClearedFor = STAGE_NONE;
+             g_activeC3[i].Reset();
+             ClearCachedModeForGUID(guid);
+             LogPrint(StringFormat("[SIGNAL_CLEARED] GUID=%I64u | reason=%s_ZOMBIE | slot=C3[%d]", guid, reason, i), LOG_LEVEL_INFO);
+             return;
+          }
+          if(sig.stage == STAGE_READY && !sig.hasFailedRG && !sig.isStructurallyInvalid)
+          {
+             LogPrint("[READY_CLEARED_BLOCKED] Protected READY signal skipped | GUID=" + IntegerToString(guid) + " | idx=C3[" + IntegerToString(i) + "]", LOG_LEVEL_WARN);
+             continue;
+          }
+          g_activeC3[i].slotClearedFor = STAGE_NONE;
+          g_activeC3[i].Reset();
+          g_poiCache[i].isValid = false;
+          ClearCachedModeForGUID(guid);
+          LogPrint(StringFormat("[SIGNAL_CLEARED] GUID=%I64u | reason=%s | slot=C3[%d]", guid, reason, i), LOG_LEVEL_INFO);
+          return;
+       }
+       
+       // Scan C4 pool (decoupled registry)
+       int c4Base = GetSignalStoreIndex(branch, CLOSURE_C4);
+       int c4Max = GetMaxSignalsForClosureType(CLOSURE_C4);
+       for(int i = c4Base; i < c4Base + c4Max; i++)
+       {
+          if(g_activeC4[i].m_guid != guid) continue;
+          SLockedSignal sig = g_activeC4[i];
+          
+          if(StringFind(reason, "AFFORDABILITY") >= 0 ||
+             StringFind(reason, "LOT_NOT_TRADEABLE") >= 0 ||
+             StringFind(reason, "MINLOT") >= 0)
+          {
+             LogPrint("[PERMANENT_SKIP] GUID=" + IntegerToString(guid) + " | reason=" + reason + " | slot=C4[" + IntegerToString(i) + "]", LOG_LEVEL_WARN);
+             if(sig.handoverState != HANDOVER_NONE && sig.handoverState != HANDOVER_RELEASED)
+                g_activeC4[i].ForceReleaseHandover("PERMANENT_SKIP:" + reason);
+             g_activeC4[i].slotClearedFor = STAGE_NONE;
+             g_activeC4[i].Reset();
+             ClearCachedModeForGUID(guid);
+             AddPermanentSkip(_Symbol, reason + " | GUID=" + IntegerToString(guid));
+             LogPrint(StringFormat("[SIGNAL_CLEARED] GUID=%I64u | reason=%s_PERMANENT_SKIP | slot=C4[%d]", guid, reason, i), LOG_LEVEL_INFO);
+             return;
+          }
+          if(sig.executionAttempts > 8 || ((sig.stage == STAGE_C4_READY) && sig.hasFailedRG))
+          {
+             LogPrint("[ZOMBIE_CLEARED] GUID=" + IntegerToString(guid) + " | idx=C4[" + IntegerToString(i) + "] | attempts=" + IntegerToString(sig.executionAttempts), LOG_LEVEL_WARN);
+             if(sig.handoverState != HANDOVER_NONE && sig.handoverState != HANDOVER_RELEASED)
+                g_activeC4[i].ForceReleaseHandover("ZOMBIE_CLEAR:" + reason);
+             g_activeC4[i].slotClearedFor = STAGE_NONE;
+             g_activeC4[i].Reset();
+             ClearCachedModeForGUID(guid);
+             LogPrint(StringFormat("[SIGNAL_CLEARED] GUID=%I64u | reason=%s_ZOMBIE | slot=C4[%d]", guid, reason, i), LOG_LEVEL_INFO);
+             return;
+          }
+          if(sig.stage == STAGE_C4_READY && !sig.hasFailedRG && !sig.isStructurallyInvalid)
+          {
+             LogPrint("[READY_CLEARED_BLOCKED] Protected C4_READY signal skipped | GUID=" + IntegerToString(guid) + " | idx=C4[" + IntegerToString(i) + "]", LOG_LEVEL_WARN);
+             continue;
+          }
+          g_activeC4[i].slotClearedFor = STAGE_NONE;
+          g_activeC4[i].Reset();
+          ClearCachedModeForGUID(guid);
+          LogPrint(StringFormat("[SIGNAL_CLEARED] GUID=%I64u | reason=%s | slot=C4[%d]", guid, reason, i), LOG_LEVEL_INFO);
+          return;
+       }
+    }
 
   //+------------------------------------------------------------------+
   //| ForceClearSignal — Nuclear signal cleanup using the handover      |
@@ -1570,30 +1689,45 @@ void ClearSignalByGUID(ENUM_EXECUTION_BRANCH branch, ulong guid, string reason)
                  count++;
          }
      }
-     else if(closureType == CLOSURE_C3 || closureType == CLOSURE_C4)
-     {
-         int baseIdx = GetSignalStoreIndex(branch, CLOSURE_C3);
-         for(int i = 0; i < MAX_C3_SIGNALS_PER_BRANCH; i++)
-         {
-             if(g_activeC3[baseIdx + i].m_guid != 0 && g_activeC3[baseIdx + i].stage != STAGE_NONE)
-                 count++;
-         }
-     }
-     else
-     {
-         int c2base = GetSignalStoreIndex(branch, CLOSURE_C2);
-         int c3base = GetSignalStoreIndex(branch, CLOSURE_C3);
-         for(int i = 0; i < MAX_C2_SIGNALS_PER_BRANCH; i++)
-         {
-             if(g_activeC2[c2base + i].m_guid != 0 && g_activeC2[c2base + i].stage != STAGE_NONE)
-                 count++;
-         }
-         for(int i = 0; i < MAX_C3_SIGNALS_PER_BRANCH; i++)
-         {
-             if(g_activeC3[c3base + i].m_guid != 0 && g_activeC3[c3base + i].stage != STAGE_NONE)
-                 count++;
-         }
-     }
+    else if(closureType == CLOSURE_C4)
+    {
+        int baseIdx = GetSignalStoreIndex(branch, CLOSURE_C4);
+        for(int i = 0; i < MAX_C4_SIGNALS_PER_BRANCH; i++)
+        {
+            if(g_activeC4[baseIdx + i].m_guid != 0 && g_activeC4[baseIdx + i].stage != STAGE_NONE)
+                count++;
+        }
+    }
+    else if(closureType == CLOSURE_C3)
+    {
+        int baseIdx = GetSignalStoreIndex(branch, CLOSURE_C3);
+        for(int i = 0; i < MAX_C3_SIGNALS_PER_BRANCH; i++)
+        {
+            if(g_activeC3[baseIdx + i].m_guid != 0 && g_activeC3[baseIdx + i].stage != STAGE_NONE)
+                count++;
+        }
+    }
+    else
+    {
+        int c2base = GetSignalStoreIndex(branch, CLOSURE_C2);
+        int c3base = GetSignalStoreIndex(branch, CLOSURE_C3);
+        int c4base = GetSignalStoreIndex(branch, CLOSURE_C4);
+        for(int i = 0; i < MAX_C2_SIGNALS_PER_BRANCH; i++)
+        {
+            if(g_activeC2[c2base + i].m_guid != 0 && g_activeC2[c2base + i].stage != STAGE_NONE)
+                count++;
+        }
+        for(int i = 0; i < MAX_C3_SIGNALS_PER_BRANCH; i++)
+        {
+            if(g_activeC3[c3base + i].m_guid != 0 && g_activeC3[c3base + i].stage != STAGE_NONE)
+                count++;
+        }
+        for(int i = 0; i < MAX_C4_SIGNALS_PER_BRANCH; i++)
+        {
+            if(g_activeC4[c4base + i].m_guid != 0 && g_activeC4[c4base + i].stage != STAGE_NONE)
+                count++;
+        }
+    }
      return count;
  }
 
@@ -1748,9 +1882,17 @@ bool IsSignalOnCooldown(ENUM_CLOSURE_TYPE closureType, string symbol = "")
     if(lastTime > 0 && (now - lastTime) < cooldownSeconds)
     {
         int remaining = cooldownSeconds - (int)(now - lastTime);
-        LogPrint("[COOLDOWN_BLOCK] closure=" + EnumToString(closureType) +
-                " | remaining=" + IntegerToString(remaining) + "s" +
-                " | symbol=" + symbol, LOG_LEVEL_DEBUG);
+        static int s_lastCooldownRemainingC2 = -1;
+        static int s_lastCooldownRemainingC3 = -1;
+        bool shouldLog = (closureType == CLOSURE_C2) ? (remaining != s_lastCooldownRemainingC2) : (remaining != s_lastCooldownRemainingC3);
+        if(shouldLog)
+        {
+            LogPrint("[COOLDOWN_BLOCK] closure=" + EnumToString(closureType) +
+                    " | remaining=" + IntegerToString(remaining) + "s" +
+                    " | symbol=" + symbol, LOG_LEVEL_DEBUG);
+            if(closureType == CLOSURE_C2) s_lastCooldownRemainingC2 = remaining;
+            else s_lastCooldownRemainingC3 = remaining;
+        }
         return true;
     }
     return false;
@@ -2043,7 +2185,11 @@ int GetSignalTimeoutBars(const SLockedSignal &signal)
         return bars;
    }
 
-      if(stage == STAGE_WAITING_FOR_POI || stage == STAGE_WAITING_FOR_CISD || stage == STAGE_READY)
+   // STAGE_READY signals must not expire — return minimum non-zero to avoid divide-by-zero
+   if(stage == STAGE_READY)
+       return 1;
+
+      if(stage == STAGE_WAITING_FOR_POI || stage == STAGE_WAITING_FOR_CISD)
      {
         int baseBars;
         // POI wait state / CISD wait state - use closure-type specific timeout
@@ -2095,18 +2241,18 @@ bool IsSignalStuck(const SLockedSignal &signal, string &stuckReason)
       return true;
    }
 
-    // Check 3: POI timeout with valid detectionTime
-    if(signal.stage == STAGE_WAITING_FOR_POI && signal.m_detectionTime > 0)
-    {
-       int barsSinceDetection = (int)((TimeCurrent() - signal.m_detectionTime) / PeriodSeconds(entryTF));
-       int maxBars = GetSignalTimeoutBars(signal);
+     // Check 3: POI timeout with valid detectionTime (C2/C3 + C4)
+     if((signal.stage == STAGE_WAITING_FOR_POI || signal.stage == STAGE_C4_WAITING_POI) && signal.m_detectionTime > 0)
+     {
+        int barsSinceDetection = (int)((TimeCurrent() - signal.m_detectionTime) / PeriodSeconds(entryTF));
+        int maxBars = GetSignalTimeoutBars(signal);
 
-       if(barsSinceDetection > maxBars)
-       {
-          stuckReason = "POI_TIMEOUT";
-          return true;
-       }
-    }
+        if(barsSinceDetection > maxBars)
+        {
+           stuckReason = "POI_TIMEOUT";
+           return true;
+        }
+     }
 
     // Check 3b: CISD wait timeout with valid detectionTime
     if(signal.stage == STAGE_WAITING_FOR_CISD && signal.m_detectionTime > 0)
@@ -2121,12 +2267,12 @@ bool IsSignalStuck(const SLockedSignal &signal, string &stuckReason)
        }
     }
 
-    // Check 4: STAGE_WAITING_FOR_POI with ZERO detectionTime (never progressed)
-    if(signal.stage == STAGE_WAITING_FOR_POI && signal.m_detectionTime == 0)
-    {
-       stuckReason = "POI_ZERO_DETECTIONTIME";
-       return true;
-    }
+     // Check 4: POI stage with ZERO detectionTime (never progressed) — C2/C3 + C4
+     if((signal.stage == STAGE_WAITING_FOR_POI || signal.stage == STAGE_C4_WAITING_POI) && signal.m_detectionTime == 0)
+     {
+        stuckReason = "POI_ZERO_DETECTIONTIME";
+        return true;
+     }
 
    // Check 5: Early stage stuck signals
    if(signal.stage < STAGE_WAITING_FOR_POI && signal.m_detectionTime > 0)
@@ -2328,6 +2474,11 @@ int PerformSlotHygiene(ENUM_EXECUTION_BRANCH branch, int neededSlots = 1, ENUM_C
  */
 bool CheckSignalExpiryEnhanced(const SLockedSignal &sig)
 {
+   // STAGE_READY signals never expire — they must execute or be explicitly released
+   if(sig.stage == STAGE_READY)
+       return false;
+   if(sig.stage == STAGE_EXECUTED)
+       return false;
    long secondsPerBar = PeriodSeconds(sig.entryTF);
     long expirySeconds = secondsPerBar * GetSignalTimeoutBars(sig);
     long ageInSeconds = (long)(TimeCurrent() - sig.lockTime);
@@ -2351,6 +2502,7 @@ void CheckAndExpireSignals(ENUM_EXECUTION_BRANCH branch)
 {
    int c2base = GetSignalStoreIndex(branch, CLOSURE_C2);
    int c3base = GetSignalStoreIndex(branch, CLOSURE_C3);
+   int c4base = GetSignalStoreIndex(branch, CLOSURE_C4);
    int expiredCount = 0;
 
    for(int i = c2base; i < c2base + MAX_C2_SIGNALS_PER_BRANCH; i++)
@@ -2379,6 +2531,21 @@ void CheckAndExpireSignals(ENUM_EXECUTION_BRANCH branch)
                   signal.m_guid, EnumToString(signal.closureType), signal.executionMode, EnumToString(signal.stage)), LOG_LEVEL_WARN);
 
          g_activeC3[i].Reset();
+         expiredCount++;
+      }
+   }
+
+   for(int i = c4base; i < c4base + MAX_C4_SIGNALS_PER_BRANCH; i++)
+   {
+      if(g_activeC4[i].m_guid == 0 || g_activeC4[i].stage == STAGE_NONE) continue;
+
+      SLockedSignal signal = g_activeC4[i];
+      if(CheckSignalExpiryEnhanced(signal))
+      {
+         LogPrint(StringFormat("[SIGNAL_EXPIRED_ENHANCED] GUID=%I64u | closure=%s | mode=%d | stage=%s",
+                  signal.m_guid, EnumToString(signal.closureType), signal.executionMode, EnumToString(signal.stage)), LOG_LEVEL_WARN);
+
+         g_activeC4[i].Reset();
          expiredCount++;
       }
    }
@@ -2426,34 +2593,62 @@ void PerformTTLSignalCleanup()
          }
       }
 
-      // Check C3 pool
-      if(g_activeC3[i].m_guid != 0)
-      {
-         ulong guid = g_activeC3[i].m_guid;
-         datetime detectionTime = g_activeC3[i].m_detectionTime;
-         ENUM_TIMEFRAMES entryTF = (g_activeC3[i].branchId == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
+       // Check C3 pool
+       if(g_activeC3[i].m_guid != 0)
+       {
+          ulong guid = g_activeC3[i].m_guid;
+          datetime detectionTime = g_activeC3[i].m_detectionTime;
+          ENUM_TIMEFRAMES entryTF = (g_activeC3[i].branchId == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
 
-         if(detectionTime == 0)
-         {
-            LogPrint(StringFormat("[SIGNAL_CORRUPT] GUID=%I64u | reason=CORRUPT_NO_TIMESTAMP | idx=C3[%d]", guid, i), LOG_LEVEL_WARN);
-            ENUM_EXECUTION_BRANCH signalBranch = (ENUM_EXECUTION_BRANCH)g_activeC3[i].branchId;
-            ClearSignalByGUID(signalBranch, guid, "CORRUPT_NO_TIMESTAMP");
-            continue;
-         }
+          if(detectionTime == 0)
+          {
+             LogPrint(StringFormat("[SIGNAL_CORRUPT] GUID=%I64u | reason=CORRUPT_NO_TIMESTAMP | idx=C3[%d]", guid, i), LOG_LEVEL_WARN);
+             ENUM_EXECUTION_BRANCH signalBranch = (ENUM_EXECUTION_BRANCH)g_activeC3[i].branchId;
+             ClearSignalByGUID(signalBranch, guid, "CORRUPT_NO_TIMESTAMP");
+             continue;
+          }
 
-         int maxBars = GetSignalTimeoutBars(g_activeC3[i]);
-         int ttlSeconds = (maxBars > 0) ? maxBars * (int)PeriodSeconds(entryTF) : 0;
-         if(ttlSeconds > 0 && now - detectionTime > ttlSeconds)
-         {
-            if(g_activeC3[i].stage == STAGE_READY)
-               g_activeC3[i].hasFailedRG = true;
-            LogPrint(StringFormat("[SIGNAL_EXPIRED] GUID=%I64u | reason=TTL_TIMEOUT | idx=C3[%d] | age_sec=%d | closure=%s | maxBars=%d",
-                     guid, i, (int)(now - detectionTime), EnumToString(g_activeC3[i].closureType), maxBars), LOG_LEVEL_WARN);
-            ENUM_EXECUTION_BRANCH signalBranch = (ENUM_EXECUTION_BRANCH)g_activeC3[i].branchId;
-            ClearSignalByGUID(signalBranch, guid, "TTL_TIMEOUT");
-         }
-      }
-   }
+          int maxBars = GetSignalTimeoutBars(g_activeC3[i]);
+          int ttlSeconds = (maxBars > 0) ? maxBars * (int)PeriodSeconds(entryTF) : 0;
+          if(ttlSeconds > 0 && now - detectionTime > ttlSeconds)
+          {
+             if(g_activeC3[i].stage == STAGE_READY)
+                g_activeC3[i].hasFailedRG = true;
+             LogPrint(StringFormat("[SIGNAL_EXPIRED] GUID=%I64u | reason=TTL_TIMEOUT | idx=C3[%d] | age_sec=%d | closure=%s | maxBars=%d",
+                      guid, i, (int)(now - detectionTime), EnumToString(g_activeC3[i].closureType), maxBars), LOG_LEVEL_WARN);
+             ENUM_EXECUTION_BRANCH signalBranch = (ENUM_EXECUTION_BRANCH)g_activeC3[i].branchId;
+             ClearSignalByGUID(signalBranch, guid, "TTL_TIMEOUT");
+          }
+       }
+
+       // Check C4 pool (decoupled registry)
+       if(g_activeC4[i].m_guid != 0)
+       {
+          ulong guid = g_activeC4[i].m_guid;
+          datetime detectionTime = g_activeC4[i].m_detectionTime;
+          ENUM_TIMEFRAMES entryTF = (g_activeC4[i].branchId == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
+
+          if(detectionTime == 0)
+          {
+             LogPrint(StringFormat("[SIGNAL_CORRUPT] GUID=%I64u | reason=CORRUPT_NO_TIMESTAMP | idx=C4[%d]", guid, i), LOG_LEVEL_WARN);
+             ENUM_EXECUTION_BRANCH signalBranch = (ENUM_EXECUTION_BRANCH)g_activeC4[i].branchId;
+             ClearSignalByGUID(signalBranch, guid, "CORRUPT_NO_TIMESTAMP");
+             continue;
+          }
+
+          int maxBars = GetSignalTimeoutBars(g_activeC4[i]);
+          int ttlSeconds = (maxBars > 0) ? maxBars * (int)PeriodSeconds(entryTF) : 0;
+          if(ttlSeconds > 0 && now - detectionTime > ttlSeconds)
+          {
+             if(g_activeC4[i].stage == STAGE_C4_READY)
+                g_activeC4[i].hasFailedRG = true;
+             LogPrint(StringFormat("[SIGNAL_EXPIRED] GUID=%I64u | reason=TTL_TIMEOUT | idx=C4[%d] | age_sec=%d | closure=%s | maxBars=%d",
+                      guid, i, (int)(now - detectionTime), EnumToString(g_activeC4[i].closureType), maxBars), LOG_LEVEL_WARN);
+             ENUM_EXECUTION_BRANCH signalBranch = (ENUM_EXECUTION_BRANCH)g_activeC4[i].branchId;
+             ClearSignalByGUID(signalBranch, guid, "TTL_TIMEOUT");
+          }
+       }
+    }
 
    // Clean stale pending links (TF-aware timeout per §XII)
    for(int i = ArraySize(g_pendingLinks) - 1; i >= 0; i--)
@@ -2462,11 +2657,11 @@ void PerformTTLSignalCleanup()
       int timeoutSec = GetPendingOrderTimeoutSeconds(entryTF);
       if(TimeCurrent() - g_pendingLinks[i].created > timeoutSec)
       {
-         PrintFormat("[PENDING_LINK_CLEANUP] request_id=%d guid=%I64u age_sec=%d timeout_sec=%d",
+         LogPrint(StringFormat("[PENDING_LINK_CLEANUP] request_id=%d guid=%I64u age_sec=%d timeout_sec=%d",
                       g_pendingLinks[i].request_id,
                       g_pendingLinks[i].guid,
                       TimeCurrent() - g_pendingLinks[i].created,
-                      timeoutSec);
+                      timeoutSec), LOG_LEVEL_INFO);
          ArrayRemove(g_pendingLinks, i, 1);
       }
    }
@@ -2485,6 +2680,7 @@ void CheckPoiTimeout(ENUM_EXECUTION_BRANCH branch)
 
     int c2base = GetSignalStoreIndex(branch, CLOSURE_C2);
     int c3base = GetSignalStoreIndex(branch, CLOSURE_C3);
+    int c4base = GetSignalStoreIndex(branch, CLOSURE_C4);
 
     // Check C2 pool
     for(int i = c2base; i < c2base + MAX_C2_SIGNALS_PER_BRANCH; i++)
@@ -2542,6 +2738,34 @@ void CheckPoiTimeout(ENUM_EXECUTION_BRANCH branch)
         }
     }
 
+    // Check C4 pool (decoupled registry - uses STAGE_C4_WAITING_POI)
+    for(int i = c4base; i < c4base + MAX_C4_SIGNALS_PER_BRANCH; i++)
+    {
+        if(g_activeC4[i].m_guid == 0 || g_activeC4[i].stage == STAGE_NONE) continue;
+        if(g_activeC4[i].stage != STAGE_C4_WAITING_POI) continue;
+        if(g_activeC4[i].m_detectionTime <= 0) continue;
+
+        int secondsSinceDetection = (int)(TimeCurrent() - g_activeC4[i].m_detectionTime);
+        int barsWaited = secondsSinceDetection / PeriodSeconds(_entryTfPoi);
+        int warningThreshold = (int)(g_maxPoiWaitBars * 0.75);
+        if(warningThreshold < 1) warningThreshold = 1;
+
+        if(!g_activeC4[i].poiWarningLogged && barsWaited >= warningThreshold)
+        {
+           LogPrint(StringFormat("[POI_WARNING] GUID=%I64u | waitBars=%d | max=%d",
+                  g_activeC4[i].m_guid, barsWaited, g_maxPoiWaitBars), LOG_LEVEL_WARN);
+           g_activeC4[i].poiWarningLogged = true;
+        }
+
+        if(barsWaited > g_maxPoiWaitBars)
+        {
+            LogPrint(StringFormat("[SIGNAL_EXPIRED] GUID=%I64u | reason=POI_TIMEOUT | barsWaited=%d | maxBars=%d | closure=%s",
+                     g_activeC4[i].m_guid, barsWaited, g_maxPoiWaitBars, EnumToString(g_activeC4[i].closureType)), LOG_LEVEL_WARN);
+            g_activeC4[i].Reset();
+            expiredCount++;
+        }
+    }
+
     if(expiredCount > 0)
     {
         LogPrint("[POI_TIMEOUT_REPORT] branch=" + IntegerToString(branch) +
@@ -2564,6 +2788,7 @@ void CheckSetupLifespan(ENUM_EXECUTION_BRANCH branch)
 
     int c2base = GetSignalStoreIndex(branch, CLOSURE_C2);
     int c3base = GetSignalStoreIndex(branch, CLOSURE_C3);
+    int c4base = GetSignalStoreIndex(branch, CLOSURE_C4);
 
     ENUM_TIMEFRAMES htfBiasTF = (branch == BRANCH_INTRADAY) ? PERIOD_D1 : PERIOD_W1;
     ENUM_TIMEFRAMES structTF  = (branch == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4;
@@ -2594,7 +2819,7 @@ void CheckSetupLifespan(ENUM_EXECUTION_BRANCH branch)
 
         if((int)barsInSetup > (maxBars + graceBars))
         {
-            LogPrint("[C3_SETUP_EXPIRED] GUID: " + IntegerToString(signal.m_guid) + " | age=" + IntegerToString(barsInSetup), LOG_LEVEL_INFO);
+            LogPrint("[C3_SETUP_EXPIRED] GUID=" + IntegerToString(signal.m_guid) + " | age=" + IntegerToString(barsInSetup), LOG_LEVEL_INFO);
             g_activeC2[i].hasFailedRG = true;
             ClearSignalByGUID(branch, signal.m_guid, "TTL_EXPIRED");
             continue;
@@ -2642,7 +2867,7 @@ void CheckSetupLifespan(ENUM_EXECUTION_BRANCH branch)
 
         if((int)barsInSetup > (maxBars + graceBars))
         {
-            LogPrint("[C3_SETUP_EXPIRED] GUID: " + IntegerToString(signal.m_guid) + " | age=" + IntegerToString(barsInSetup), LOG_LEVEL_INFO);
+            LogPrint("[C3_SETUP_EXPIRED] GUID=" + IntegerToString(signal.m_guid) + " | age=" + IntegerToString(barsInSetup), LOG_LEVEL_INFO);
             g_activeC3[i].hasFailedRG = true;
             ClearSignalByGUID(branch, signal.m_guid, "TTL_EXPIRED");
             continue;
@@ -2663,6 +2888,43 @@ void CheckSetupLifespan(ENUM_EXECUTION_BRANCH branch)
             LogPrint(StringFormat("[CISD_CONFIRMED] 3-Tier pass | GUID=%I64u | structTF=%s -> entryTF=%s",
                      g_activeC3[i].m_guid, EnumToString(structTF), EnumToString(entryTF)), LOG_LEVEL_INFO);
         }
+    }
+
+    // Process C4 pool (decoupled registry)
+    for(int i = c4base; i < c4base + MAX_C4_SIGNALS_PER_BRANCH; i++)
+    {
+        if(g_activeC4[i].m_guid == 0 || g_activeC4[i].stage == STAGE_NONE) continue;
+        SLockedSignal signal = g_activeC4[i];
+        if(signal.m_detectionTime == 0) continue;
+
+        if(IsSetupStructurallyInvalid(signal))
+        {
+            LogPrint(StringFormat("[C4_SETUP_INVALIDATED] GUID=%I64u | reason=PRICE_RETURNED_TO_INITIAL_EXTREME", signal.m_guid), LOG_LEVEL_WARN);
+            g_activeC4[i].isStructurallyInvalid = true;
+            ClearSignalByGUID(branch, signal.m_guid, "SETUP_STRUCTURAL_INVALIDATION");
+            invalidatedCount++;
+            continue;
+        }
+
+        uint secondsElapsed = (uint)(TimeCurrent() - signal.m_detectionTime);
+        uint barsInSetup = secondsElapsed / PeriodSeconds(signal.entryTF);
+
+        if((int)barsInSetup > (maxBars + graceBars))
+        {
+            LogPrint("[C4_SETUP_EXPIRED] GUID=" + IntegerToString(signal.m_guid) + " | age=" + IntegerToString(barsInSetup), LOG_LEVEL_INFO);
+            g_activeC4[i].hasFailedRG = true;
+            ClearSignalByGUID(branch, signal.m_guid, "TTL_EXPIRED");
+            continue;
+        }
+
+        if((int)barsInSetup > maxBars && !g_activeC4[i].m_orangeLogged)
+        {
+            LogPrint(StringFormat("[C4_SETUP_ORANGE] GUID=%I64u | barsInSetup=%d | maxBars=%d", signal.m_guid, barsInSetup, maxBars), LOG_LEVEL_INFO);
+            g_activeC4[i].m_orangeLogged = true;
+            orangeCount++;
+        }
+
+        if(g_activeC4[i].stage >= STAGE_C4_READY) continue;
     }
 
     if(invalidatedCount > 0 || expiredCount > 0)
@@ -3602,9 +3864,6 @@ void ProcessPipelineSignal(SLockedSignal &sig,
     if(sig.stage == STAGE_WAITING_FOR_POI)
         sig.resolveLockedCount++;
     
-    if(g_InpLogLevel <= LOG_LEVEL_DEBUG)
-        LogPrint("[LOOP_TICK] Processing | stage=" + EnumToString(sig.stage), LOG_LEVEL_DEBUG);
-    
     static ulong lastLoggedGUID = 0;
     if(sig.m_guid != 0 && sig.m_guid != lastLoggedGUID && sig.stage == STAGE_LOCKED)
     {
@@ -3854,10 +4113,84 @@ void ProcessPipelineSignal(SLockedSignal &sig,
                 }
             }
         }
+        else if(sig.closureType == CLOSURE_C4)
+        {
+            // ── C4 DETECTED → CISD check → POI mapping ──
+            if(sig.stage == STAGE_C4_DETECTED)
+            {
+                ENUM_TIMEFRAMES itfPeriod = (ctx.branch == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4;
+                SSE_CISDResult cisdResult = SSE_DetectCISD(_Symbol, itfPeriod, sig.direction, 20);
+                if(!cisdResult.confirmed)
+                    return;
+
+                // Map T-Spot zone for C4
+                if(!EE_MapTSpotPOI(sig))
+                {
+                    LogPrint("[C4_PIPELINE] Failed to map POI for C4 signal GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_WARN);
+                    return;
+                }
+
+                // Assign SL using C4 calculator
+                if(sig.stop_loss <= 0.0)
+                {
+                    double minStopMult = InpMinStopBuffer;
+                    sig.stop_loss = C4_SL_Calculator(
+                        (sig.direction == DIRECTION_BUY) ? 1 : -1,
+                        sig.entry_price,
+                        sig.c3_high,
+                        sig.c3_low,
+                        minStopMult
+                    );
+                }
+
+                if(!sig.TransitionStage(STAGE_C4_WAITING_POI))
+                {
+                    LogPrint("[C4_PIPELINE] Transition to WAITING_POI failed | GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_WARN);
+                    return;
+                }
+                LogPrint(StringFormat("[C4_PIPELINE] GUID=%I64u | C4_DETECTED -> C4_WAITING_POI | CISD confirmed", sig.m_guid), LOG_LEVEL_INFO);
+                return;
+            }
+
+            // ── C4 WAITING_POI → POI touch → READY ──
+            if(sig.stage == STAGE_C4_WAITING_POI)
+            {
+                double zoneLow = MathMin(sig.tSpotMin, sig.tSpotMax);
+                double zoneHigh = MathMax(sig.tSpotMin, sig.tSpotMax);
+
+                if(zoneLow > 0.0 && zoneHigh > 0.0)
+                {
+                    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+                    bool inTSpotBuy  = (sig.direction == DIRECTION_BUY && ask >= zoneLow && ask <= zoneHigh);
+                    bool inTSpotSell = (sig.direction == DIRECTION_SELL && bid <= zoneHigh && bid >= zoneLow);
+                    bool priceInTSpot = inTSpotBuy || inTSpotSell;
+
+                    if(priceInTSpot)
+                    {
+                        if(!sig.TransitionStage(STAGE_C4_READY))
+                        {
+                            LogPrint("[C4_PIPELINE] Transition to READY failed | GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_WARN);
+                            return;
+                        }
+                        LogPrint(StringFormat("[C4_PIPELINE] GUID=%I64u | C4_WAITING_POI -> C4_READY | POI touched", sig.m_guid), LOG_LEVEL_INFO);
+
+                        // Evaluate risk gate (signal already in g_activeC4[])
+                        if(!RG_EvaluateAndGate(sig, ctx.branch, rgError))
+                        {
+                            LogPrint("[C4_PIPELINE] RG_GATE_FAIL: " + rgError, LOG_LEVEL_ERROR);
+                            sig.TransitionStage(STAGE_EXPIRED);
+                        }
+
+                        return;
+                    }
+                }
+            }
+        }
     }
     
-    // STEP 3: Immediate Order Execution for STAGE_READY
-    if(sig.isCommitted && sig.stage == STAGE_READY)
+    // STEP 3: Immediate Order Execution for STAGE_READY or STAGE_C4_READY
+    if(sig.isCommitted && (sig.stage == STAGE_READY || sig.stage == STAGE_C4_READY))
     {
         if(IsSignalOnCooldown(sig.closureType, sig.symbol))
         {
@@ -4086,18 +4419,18 @@ void ProcessPipelineSignal(SLockedSignal &sig,
             ClearSignalByGUID(ctx.branch, execSig.m_guid, "RISK_MINLOT_REJECT");
             return;
         }
-        double rawLot = CalculateRiskLot(execSig, execSig.riskProfile.positionSizeFactor);
-        if(rawLot <= 0.0)
+        double lot = 0.0;
+        if(!CalculateRiskLot(execSig, activeRiskPct, lot))
         {
-            LogPrint("[LOT_CALC_FAILED] GUID=" + IntegerToString(execSig.m_guid) + " reason=rawLot<=0", LOG_LEVEL_ERROR);
+            LogPrint("[PERMANENT_SKIP] reason=riskPct_zero | pct=" + DoubleToString(activeRiskPct, 2) + " | GUID=" + IntegerToString(execSig.m_guid), LOG_LEVEL_ERROR);
+            ClearSignalByGUID(ctx.branch, execSig.m_guid, "PERMANENT_SKIP");
             return;
         }
         
         double minLot  = spExecPre.volumeMin;
         double maxLot  = spExecPre.volumeMax;
         double lotStep = spExecPre.volumeStep;
-        StabiliseLot(rawLot, minLot, maxLot, lotStep, _Symbol);
-        double lot = rawLot;
+        StabiliseLot(lot, minLot, maxLot, lotStep, _Symbol);
         if(lot <= 0.0)
         {
             sig.hasFailedRG = true;
@@ -4126,13 +4459,15 @@ void ProcessPipelineSignal(SLockedSignal &sig,
             {
                 isPyramidOrder = true;
                 double riskPct = InpRiskPercent * g_InpPyramidAdditionalRiskPct / 100.0;
-                double pyramidLotRaw = CalculateRiskLot(execSig, riskPct);
-                if(pyramidLotRaw > 0.0)
+                if(!CalculateRiskLot(execSig, riskPct, pyramidLot))
+                {
+                    isPyramidOrder = false;
+                }
+                else
                 {
                     double protectedSL = (execSig.direction == DIRECTION_BUY) ? execSig.c2_low : execSig.c2_high;
                     if(protectedSL > 0.0)
-                        StabiliseLot(pyramidLotRaw, minLot, maxLot, lotStep, _Symbol);
-                        pyramidLot = pyramidLotRaw;
+                        StabiliseLot(pyramidLot, minLot, maxLot, lotStep, _Symbol);
                 }
                 if(pyramidLot <= 0.0) isPyramidOrder = false;
             }
@@ -4176,6 +4511,7 @@ void ProcessPipelineSignal(SLockedSignal &sig,
         {
             sig = signalRef;
             sig.executionAttempts = signalRef.executionAttempts;
+            execSig.ReleaseHandover();
             sig.MarkExecuted();
             // Slot remains active — cleanup deferred to OnTradeTransaction fill confirmation
             if(ctx.branch == BRANCH_INTRADAY)
@@ -4286,10 +4622,16 @@ void ProcessPersistentScanPool(SLockedSignal &pool[], int maxSlots, BranchContex
             continue;
         }
         
+        double persistRiskPct = ResolveActiveRiskPct(scanSignal.executionMode, InpRiskPercent);
         SSymbolProfile spPersist = SY_GetProfile(_Symbol);
-        double rawLotPersist = CalculateRiskLot(scanSignal, scanSignal.riskProfile.positionSizeFactor);
-        StabiliseLot(rawLotPersist, spPersist.volumeMin, spPersist.volumeMax, spPersist.volumeStep, _Symbol);
-        double persistLot = rawLotPersist;
+        double persistLot = 0.0;
+        if(!CalculateRiskLot(scanSignal, persistRiskPct, persistLot))
+        {
+            pool[si].hasFailedRG = true;
+            pool[si].Reset();
+            continue;
+        }
+        StabiliseLot(persistLot, spPersist.volumeMin, spPersist.volumeMax, spPersist.volumeStep, _Symbol);
         if(persistLot <= 0.0)
         {
             pool[si].hasFailedRG = true;
@@ -4318,6 +4660,134 @@ void ProcessPersistentScanPool(SLockedSignal &pool[], int maxSlots, BranchContex
             pool[si] = scanSignal;
             pool[si].MarkExecuted();
             // Slot remains active — cleanup deferred to OnTradeTransaction fill confirmation
+            continue;
+        }
+        else
+        {
+            pool[si] = scanSignal;
+            pool[si].executionRetryCount++;
+            continue;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| ProcessC4PipelinePool — C4 FSM state routing                     |
+//| Iterates g_activeC4[] and processes all C4-specific stages.      |
+//| C4 stages: C4_WAITING -> C4_DETECTED -> C4_WAITING_POI -> READY  |
+//+------------------------------------------------------------------+
+void ProcessC4PipelinePool(SLockedSignal &pool[],
+                           int baseIdx,
+                           int maxSlots,
+                           BranchContext &ctx,
+                           datetime currentTick,
+                           int &transitionsThisTick)
+{
+    for(int i = 0; i < maxSlots; i++)
+    {
+        int idx = baseIdx + i;
+        ProcessPipelineSignal(pool[idx], idx, ctx, currentTick, transitionsThisTick, false);
+        pool[idx].m_lastEvaluationTick = currentTick;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| ProcessC4PersistentScanPool — Execute orphaned C4 READY signals   |
+//| Scans g_activeC4[] for C4_READY signals that the pipeline missed.|
+//| Uses STAGE_C4_READY instead of STAGE_READY.                      |
+//+------------------------------------------------------------------+
+void ProcessC4PersistentScanPool(SLockedSignal &pool[], int maxSlots, BranchContext &ctx)
+{
+    for(int si = 0; si < maxSlots; si++)
+    {
+        if(pool[si].m_guid == 0 || pool[si].stage != STAGE_C4_READY) continue;
+
+        ulong scanGuid = pool[si].m_guid;
+        ENUM_EXECUTION_BRANCH sigBranch = pool[si].branchId;
+
+        if(pool[si].executionAttempts > 8 || (pool[si].stage == STAGE_C4_READY && pool[si].hasFailedRG))
+        {
+            if(pool[si].handoverState != HANDOVER_NONE && pool[si].handoverState != HANDOVER_RELEASED)
+                pool[si].ForceReleaseHandover("ZOMBIE_CLEAR_PERSIST_C4");
+            pool[si].hasFailedRG = true;
+            pool[si].Reset();
+            continue;
+        }
+
+        int retryWindowMinutes = g_InpC3RGReadyRetryWindowMinutes;
+        datetime now = TimeCurrent();
+        int minutesSinceReady = (pool[si].stageEntryTime > 0) ?
+                                (int)((now - pool[si].stageEntryTime) / 60) : 0;
+        if(pool[si].hasFailedRG && minutesSinceReady > retryWindowMinutes)
+        {
+            pool[si].hasFailedRG = true;
+            pool[si].Reset();
+            continue;
+        }
+
+        if(g_symbolUntradeable) continue;
+        if(IsSymbolPermanentlySkipped(_Symbol))
+        {
+            pool[si].hasFailedRG = true;
+            pool[si].Reset();
+            continue;
+        }
+        if(IsSignalOnCooldown(pool[si].closureType, _Symbol)) continue;
+
+        SLockedSignal scanSignal = pool[si];
+
+        if(!pool[si].hasFailedRG)
+        {
+            if(!RG_EvaluateAndGate(scanSignal, sigBranch))
+            {
+                pool[si].hasFailedRG = true;
+                continue;
+            }
+        }
+
+        if(pool[si].executionRetryCount >= MAX_EXEC_RETRIES)
+        {
+            pool[si].hasFailedRG = true;
+            pool[si].Reset();
+            continue;
+        }
+
+        double persistRiskPct = ResolveActiveRiskPct(scanSignal.executionMode, InpRiskPercent);
+        SSymbolProfile spPersist = SY_GetProfile(_Symbol);
+        double persistLot = 0.0;
+        if(!CalculateRiskLot(scanSignal, persistRiskPct, persistLot))
+        {
+            pool[si].hasFailedRG = true;
+            pool[si].Reset();
+            continue;
+        }
+        StabiliseLot(persistLot, spPersist.volumeMin, spPersist.volumeMax, spPersist.volumeStep, _Symbol);
+        if(persistLot <= 0.0)
+        {
+            pool[si].hasFailedRG = true;
+            pool[si].Reset();
+            continue;
+        }
+
+        if(scanSignal.tp <= 0.0 && scanSignal.stop_loss > 0.0 && scanSignal.stop_loss != scanSignal.entry_price)
+        {
+            double tp1 = 0, tp2 = 0, tp3 = 0;
+            string errMsg;
+            if(CalculateProjectionTPs(scanSignal, scanSignal.stop_loss, tp1, tp2, tp3, errMsg))
+            {
+                scanSignal.tp = tp1;
+                LogPrint("[TP_CALC_INLINE] GUID=" + IntegerToString(scanSignal.m_guid) + " tp=" + DoubleToString(tp1, _Digits), LOG_LEVEL_DEBUG);
+            }
+            else
+            {
+                LogPrint("[TP_CALC_FAIL] GUID=" + IntegerToString(scanSignal.m_guid) + " reason=" + errMsg, LOG_LEVEL_WARN);
+                continue;
+            }
+        }
+        if(ExecutionGatePass(scanSignal, sigBranch, persistLot))
+        {
+            pool[si] = scanSignal;
+            pool[si].MarkExecuted();
             continue;
         }
         else
@@ -4695,8 +5165,8 @@ if(!initDiagLogged)
 
     if(IsTesterPipsMode())
     {
-       Print("ERROR: Tester is in 'calculate profit in pips' mode. "
-             "This EA requires deposit currency mode. Please change tester settings and restart.");
+       LogPrint("ERROR: Tester is in 'calculate profit in pips' mode. "
+                "This EA requires deposit currency mode. Please change tester settings and restart.", LOG_LEVEL_ERROR);
        return INIT_FAILED;
     }
 
@@ -5901,15 +6371,17 @@ void UpdatePerformanceCounters(ulong guid, double pnl)
     {
         if(sig.closureType == CLOSURE_C2)
         {
-            if(pnl > 0.0) g_c2Wins++;
-            else if(pnl < 0.0) g_c2Losses++;
+            if(pnl > 0.0) { g_c2Wins++; if(pnl > g_c2LargestWin) g_c2LargestWin = pnl; }
+            else if(pnl < 0.0) { g_c2Losses++; if(pnl < g_c2LargestLoss) g_c2LargestLoss = pnl; }
             else g_c2Breakeven++;
+            g_c2TotalProfit += pnl;
         }
         else if(sig.closureType == CLOSURE_C3)
         {
-            if(pnl > 0.0) g_c3Wins++;
-            else if(pnl < 0.0) g_c3Losses++;
+            if(pnl > 0.0) { g_c3Wins++; if(pnl > g_c3LargestWin) g_c3LargestWin = pnl; }
+            else if(pnl < 0.0) { g_c3Losses++; if(pnl < g_c3LargestLoss) g_c3LargestLoss = pnl; }
             else g_c3Breakeven++;
+            g_c3TotalProfit += pnl;
         }
 
         LogInfo(StringFormat("[PERF_UPDATE] %s PnL=%.2f | C2: W=%d L=%d B=%d | C3: W=%d L=%d B=%d",
@@ -5926,15 +6398,17 @@ void UpdatePerformanceCounters(ulong guid, double pnl)
             {
                 if(g_positionMap[i].closureType == CLOSURE_C2)
                 {
-                    if(pnl > 0.0) g_c2Wins++;
-                    else if(pnl < 0.0) g_c2Losses++;
+                    if(pnl > 0.0) { g_c2Wins++; if(pnl > g_c2LargestWin) g_c2LargestWin = pnl; }
+                    else if(pnl < 0.0) { g_c2Losses++; if(pnl < g_c2LargestLoss) g_c2LargestLoss = pnl; }
                     else g_c2Breakeven++;
+                    g_c2TotalProfit += pnl;
                 }
                 else if(g_positionMap[i].closureType == CLOSURE_C3)
                 {
-                    if(pnl > 0.0) g_c3Wins++;
-                    else if(pnl < 0.0) g_c3Losses++;
+                    if(pnl > 0.0) { g_c3Wins++; if(pnl > g_c3LargestWin) g_c3LargestWin = pnl; }
+                    else if(pnl < 0.0) { g_c3Losses++; if(pnl < g_c3LargestLoss) g_c3LargestLoss = pnl; }
                     else g_c3Breakeven++;
+                    g_c3TotalProfit += pnl;
                 }
                 LogInfo(StringFormat("[PERF_UPDATE] %s (map) PnL=%.2f | C2: W=%d L=%d B=%d | C3: W=%d L=%d B=%d",
                         g_positionMap[i].closureType == CLOSURE_C2 ? "C2" : "C3",
@@ -5960,7 +6434,7 @@ ulong ResolveGUIDByRequest(uint request_id)
       {
          ulong guid = g_pendingLinks[i].guid;
          ArrayRemove(g_pendingLinks, i, 1);
-         PrintFormat("[GUID_BRIDGE_RESOLVED] request_id=%u -> GUID=%I64u", request_id, guid);
+         LogPrint(StringFormat("[GUID_BRIDGE_RESOLVED] request_id=%u -> GUID=%I64u", request_id, guid), LOG_LEVEL_INFO);
          return guid;
       }
    }
@@ -5985,8 +6459,8 @@ void OnTradeTransaction(
           {
              s_pendingGuid = g_pendingLinks[i].guid;
              s_pendingBranch = g_pendingLinks[i].branch;
-             PrintFormat("[PENDING_GUID_CAPTURED] request_id=%u guid=%I64u branch=%d", result.request_id, s_pendingGuid, s_pendingBranch);
-             break;
+              LogPrint(StringFormat("[PENDING_GUID_CAPTURED] request_id=%u guid=%I64u branch=%d", result.request_id, s_pendingGuid, s_pendingBranch), LOG_LEVEL_DEBUG);
+              break;
           }
        }
       // Stale cleanup — TF-aware timeout per §XII
@@ -5996,11 +6470,11 @@ void OnTradeTransaction(
          int timeoutSec = GetPendingOrderTimeoutSeconds(entryTF);
          if(TimeCurrent() - g_pendingLinks[i].created > timeoutSec)
          {
-            PrintFormat("[PENDING_LINK_TRANSACTION_CLEANUP] request_id=%d guid=%I64u age_sec=%d timeout_sec=%d",
-                         g_pendingLinks[i].request_id,
-                         g_pendingLinks[i].guid,
-                         TimeCurrent() - g_pendingLinks[i].created,
-                         timeoutSec);
+             LogPrint(StringFormat("[PENDING_LINK_TRANSACTION_CLEANUP] request_id=%d guid=%I64u age_sec=%d timeout_sec=%d",
+                          g_pendingLinks[i].request_id,
+                          g_pendingLinks[i].guid,
+                          TimeCurrent() - g_pendingLinks[i].created,
+                          timeoutSec), LOG_LEVEL_DEBUG);
             ArrayRemove(g_pendingLinks, i, 1);
          }
       }
@@ -6033,9 +6507,13 @@ void OnTradeTransaction(
                 dealEntryType == DEAL_ENTRY_INOUT ? "INOUT" : "STATE",
                 dealPrice, dealVolume, dealProfit));
 
-       // Update performance counters for closing deals (broker-triggered SL/trailing)
-       if((dealEntryType == DEAL_ENTRY_OUT || dealEntryType == DEAL_ENTRY_INOUT) && dealGuid != 0)
-          UpdatePerformanceCounters(dealGuid, dealProfit);
+        // Update performance counters for closing deals (broker-triggered SL/trailing)
+        if((dealEntryType == DEAL_ENTRY_OUT || dealEntryType == DEAL_ENTRY_INOUT) && dealGuid != 0)
+        {
+           UpdatePerformanceCounters(dealGuid, dealProfit);
+           g_totalDeals++;
+           g_totalNetProfit += dealProfit;
+        }
 
         if(HistoryDealSelect(trans.deal))
         {
@@ -6051,15 +6529,15 @@ void OnTradeTransaction(
                  {
                     LogExitMarker(closedGuid, EXIT_SL_HIT, dealProfit);
                     OM_ClearSlot(closedGuid);
-                    PrintFormat("[SLOT_RELEASED] DEAL_ENTRY_OUT position=%I64u guid=%I64u deal=%I64u",
-                                trans.position, closedGuid, trans.deal);
+                     LogPrint(StringFormat("[SLOT_RELEASED] DEAL_ENTRY_OUT position=%I64u guid=%I64u deal=%I64u",
+                                 trans.position, closedGuid, trans.deal), LOG_LEVEL_INFO);
                     RemovePositionMapEntry(trans.position);
                  }
                else
                {
-                  PrintFormat("[WARNING] DEAL_ENTRY_OUT position=%I64u has no GUID in map", trans.position);
+                   LogPrint(StringFormat("[WARNING] DEAL_ENTRY_OUT position=%I64u has no GUID in map", trans.position), LOG_LEVEL_WARN);
                   g_positionSlot.Reset();
-                  PrintFormat("[SLOT] Force reset via DEAL_ENTRY_OUT fallback position=%I64u (unmapped close)", trans.position);
+                  LogPrint(StringFormat("[SLOT] Force reset via DEAL_ENTRY_OUT fallback position=%I64u (unmapped close)", trans.position), LOG_LEVEL_WARN);
                }
             }
 
@@ -6083,15 +6561,15 @@ void OnTradeTransaction(
                // Restore identity truth — map position to resolved GUID
                if(assignedGUID != 0)
                {
-                  PrintFormat("[GUID_POSITION_MAP] pos=%I64u -> GUID=%I64u (src=bridge)", trans.position, assignedGUID);
+                   LogPrint(StringFormat("[GUID_POSITION_MAP] pos=%I64u -> GUID=%I64u (src=bridge)", trans.position, assignedGUID), LOG_LEVEL_DEBUG);
                }
 
                // Secure fallback: allocate a fresh, unique GUID via sole authority
                if(assignedGUID == 0)
                {
                   assignedGUID = SLockedSignal::GenerateSignalGUID();
-                  PrintFormat("[SECURE_GUID_FALLBACK] Fresh GUID=%I64u created for position=%I64u",
-                              assignedGUID, positionTicket);
+                   LogPrint(StringFormat("[SECURE_GUID_FALLBACK] Fresh GUID=%I64u created for position=%I64u",
+                               assignedGUID, positionTicket), LOG_LEVEL_WARN);
                }
 
 if(assignedGUID != 0)
@@ -6171,11 +6649,11 @@ if(assignedGUID != 0)
                      PositionGUIDMap verifiedMap;
                      if(GetPositionGUIDMapByGUID(assignedGUID, verifiedMap))
                     {
-                       PrintFormat("[POS_MAP_VERIFIED] pos=%I64u guid=%I64u entry=%.5f "
-                                   "c1_h=%.5f c1_l=%.5f c2_h=%.5f c2_l=%.5f",
-                                   positionTicket, assignedGUID, verifiedMap.entryPrice,
-                                   verifiedMap.c1_high, verifiedMap.c1_low,
-                                   verifiedMap.c2_high, verifiedMap.c2_low);
+                        LogPrint(StringFormat("[POS_MAP_VERIFIED] pos=%I64u guid=%I64u entry=%.5f "
+                                    "c1_h=%.5f c1_l=%.5f c2_h=%.5f c2_l=%.5f",
+                                    positionTicket, assignedGUID, verifiedMap.entryPrice,
+                                    verifiedMap.c1_high, verifiedMap.c1_low,
+                                    verifiedMap.c2_high, verifiedMap.c2_low), LOG_LEVEL_DEBUG);
 
                        // CRITICAL: Verify GUID matches — detect off-by-two corruption
                        if(verifiedMap.signalGUID != assignedGUID)
@@ -6367,6 +6845,38 @@ bool ValidateRiskGate(const SLockedSignal &signal, double stopLoss, double tpPri
 }
 // REGRESSION_GUARD_V57_3
 
+//+------------------------------------------------------------------+
+//| Periodic tradeability recheck (AGENTS.md §XVI)                   |
+//+------------------------------------------------------------------+
+void PerformTradeabilityRecheck()
+{
+   static datetime lastCheckTime = 0;
+   datetime currentBarTime = iTime(_Symbol, PERIOD_M5, 0);
+   if(currentBarTime == lastCheckTime) return;
+   lastCheckTime = currentBarTime;
+   
+   static int barCounter = 0;
+   barCounter++;
+   if(barCounter < InpTradeabilityRecheckBars) return;
+   barCounter = 0;
+   
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   SSymbolProfile prof = SY_GetProfile(_Symbol);
+   if(!prof.isValid) return;
+   
+   double minStopDistPoints = prof.stopsLevel * prof.point * InpMinStopBuffer;
+   double minRisk = (minStopDistPoints / prof.tickSize) * prof.tickValue * prof.volumeMin;
+   double budget = equity * InpMaxMinLotRiskPercent / 100.0;
+   
+   bool tradeable = (minRisk <= budget);
+   LogPrint("[TRADEABILITY_CHECK] status=" + (tradeable ? "TRADEABLE" : "UNTRADEABLE") +
+            " | equity=" + DoubleToString(equity, 2) +
+            " | minRisk=" + DoubleToString(minRisk, 2) +
+            " | budget=" + DoubleToString(budget, 2), LOG_LEVEL_INFO);
+   
+   g_symbolUntradeable = !tradeable;
+}
+
 /**
  * OnTick() — Pipeline execution with optional tick iterator
  *
@@ -6418,9 +6928,9 @@ void OnTick()
             int ageSeconds = (int)(TimeCurrent() - g_pendingLinks[pi].created);
             if(ageSeconds > timeoutSeconds)
             {
-                PrintFormat("[PENDING_STALE] GUID=%I64u | age_sec=%d | timeout_sec=%d (entryTF=%s) — removing",
+                LogPrint(StringFormat("[PENDING_STALE] GUID=%I64u | age_sec=%d | timeout_sec=%d (entryTF=%s) — removing",
                             g_pendingLinks[pi].guid, ageSeconds, timeoutSeconds,
-                            entryTF == PERIOD_M5 ? "M5" : "M15");
+                            entryTF == PERIOD_M5 ? "M5" : "M15"), LOG_LEVEL_WARN);
                 if(g_pendingLinks[pi].orderTicket > 0)
                 {
                     MqlTradeRequest req = {};
@@ -6677,6 +7187,8 @@ if(!s_warmupLogged)
             s_warmupLogged = true;
         }
     }
+    
+    PerformTradeabilityRecheck();
 
     //=== POSITION CLOSURE HARDENING — Timeout + Diagnostics ===
     CheckPositionTimeouts(_Symbol, InpMagicNumber);
@@ -6761,6 +7273,10 @@ g_lastTickTime = currentTick;
             int c3MaxPersist = GetMaxSignalsForClosureType(CLOSURE_C3);
             ProcessPersistentScanPool(g_activeC3, c3MaxPersist, ctx);
         }
+        {
+            int c4MaxPersist = GetMaxSignalsForClosureType(CLOSURE_C4);
+            ProcessC4PersistentScanPool(g_activeC4, c4MaxPersist, ctx);
+        }
 
 // ===== THEN EXPIRE SIGNALS =====
     static datetime s_lastExpiryCheck = 0;
@@ -6807,8 +7323,11 @@ g_lastTickTime = currentTick;
             int c3Max = GetMaxSignalsForClosureType(CLOSURE_C3);
             ProcessPipelinePool(g_activeC3, c3Base, c3Max, ctx, currentTick, s_transitionsThisTick, false);
         }
-
-
+        {
+            int c4Base = GetSignalStoreIndex(ctx.branch, CLOSURE_C4);
+            int c4Max = GetMaxSignalsForClosureType(CLOSURE_C4);
+            ProcessC4PipelinePool(g_activeC4, c4Base, c4Max, ctx, currentTick, s_transitionsThisTick);
+        }
 
     MonitorTPLevels();
 

@@ -1722,11 +1722,11 @@ bool RG_EvaluateAndGate(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch)
                  " | reason=SL_DISTANCE_ZERO | step=RG_EvaluateAndGate", LOG_LEVEL_DEBUG);
         return false;
     }
+    double minRR = (signal.closureType == CLOSURE_C2) ? InpAnticipationRR : InpConfirmationRR;
     double provisionalTP = (isBuy)
-        ? signal.entry_price + slDistPrice * 2.0
-        : signal.entry_price - slDistPrice * 2.0;
+        ? signal.entry_price + slDistPrice * minRR
+        : signal.entry_price - slDistPrice * minRR;
     signal.tp = (signal.tp <= 0.0) ? provisionalTP : signal.tp;
-
     double slDist = slDistPrice / rgProf.point;
 
     ENUM_TIMEFRAMES structTF = (branch == BRANCH_SWING) ? PERIOD_H4 : PERIOD_H1;
@@ -1785,9 +1785,10 @@ bool RG_EvaluateAndGate(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, str
                  " | reason=SL_DISTANCE_ZERO | step=RG_EvaluateAndGate", LOG_LEVEL_DEBUG);
         return false;
     }
+    double minRR = (signal.closureType == CLOSURE_C2) ? InpAnticipationRR : InpConfirmationRR;
     double provisionalTP = (isBuy)
-        ? signal.entry_price + slDistPrice * 2.0
-        : signal.entry_price - slDistPrice * 2.0;
+        ? signal.entry_price + slDistPrice * minRR
+        : signal.entry_price - slDistPrice * minRR;
     signal.tp = (signal.tp <= 0.0) ? provisionalTP : signal.tp;
     double slDist = slDistPrice / rgProf2.point;
     ENUM_TIMEFRAMES structTF = (branch == BRANCH_SWING) ? PERIOD_H4 : PERIOD_H1;

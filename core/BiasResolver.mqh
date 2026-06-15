@@ -258,8 +258,8 @@ bool IsBiasAligned(bool signalIsBullish, const BiasOutput &bias)
 {
     if(bias.bias == BIAS_NEUTRAL || bias.bias == BIAS_PENDING)
     {
-        LogPrint("[BIAS_ALIGNED] NEUTRAL/PENDING bias — REJECTING signal (no edge)", LOG_LEVEL_WARN);
-        LogPrint("[BIAS_MISALIGNED] bias=NEUTRAL | signal has no directional edge", LOG_LEVEL_DEBUG);
+        LogPrint("[BIAS_MISALIGNED] NEUTRAL/PENDING bias — REJECTING signal (no edge)", LOG_LEVEL_WARN);
+        LogPrint("[BIAS_MISALIGNED] direction=" + (signalIsBullish ? "BUY" : "SELL") + " bias=" + EnumToString(bias.bias), LOG_LEVEL_DEBUG);
         return false;
     }
 
@@ -268,9 +268,11 @@ bool IsBiasAligned(bool signalIsBullish, const BiasOutput &bias)
         if(!signalIsBullish)
         {
             LogPrint("[BIAS_MISALIGNED] REJECT | signal=BEAR but bias=BULLISH", LOG_LEVEL_WARN);
+            LogPrint("[BIAS_MISALIGNED] direction=" + (signalIsBullish ? "BUY" : "SELL") + " bias=" + EnumToString(bias.bias), LOG_LEVEL_DEBUG);
             return false;
         }
-        LogPrint("[BIAS_ALIGNED] OK | signal=BULL and bias=BULLISH", LOG_LEVEL_DEBUG);
+        LogPrint("[BIAS_ALIGNED] OK | signal=BULL and bias=BULLISH", LOG_LEVEL_INFO);
+        LogPrint("[BIAS_ALIGNED] direction=" + (signalIsBullish ? "BUY" : "SELL") + " bias=" + EnumToString(bias.bias), LOG_LEVEL_DEBUG);
         return true;
     }
 
@@ -279,9 +281,11 @@ bool IsBiasAligned(bool signalIsBullish, const BiasOutput &bias)
         if(signalIsBullish)
         {
             LogPrint("[BIAS_MISALIGNED] REJECT | signal=BULL but bias=BEARISH", LOG_LEVEL_WARN);
+            LogPrint("[BIAS_MISALIGNED] direction=" + (signalIsBullish ? "BUY" : "SELL") + " bias=" + EnumToString(bias.bias), LOG_LEVEL_DEBUG);
             return false;
         }
-        LogPrint("[BIAS_ALIGNED] OK | signal=BEAR and bias=BEARISH", LOG_LEVEL_DEBUG);
+        LogPrint("[BIAS_ALIGNED] OK | signal=BEAR and bias=BEARISH", LOG_LEVEL_INFO);
+        LogPrint("[BIAS_ALIGNED] direction=" + (signalIsBullish ? "BUY" : "SELL") + " bias=" + EnumToString(bias.bias), LOG_LEVEL_DEBUG);
         return true;
     }
 

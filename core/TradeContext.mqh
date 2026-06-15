@@ -81,10 +81,10 @@ void TC_InitTrade(string p_signalId, string symbol, ENUM_SIGNAL_DIRECTION direct
     if(g_trade.minLot <= 0.0 || g_trade.step <= 0.0)
     {
         g_trade.isActive = false;
-        PrintFormat("[TC_INIT_FAIL] Symbol=%s | minLot=%.5f | step=%.5f | Reason=INVALID_VOLUME_CONSTRAINTS",
+        LogPrint(StringFormat("[TC_INIT_FAIL] Symbol=%s | minLot=%.5f | step=%.5f | Reason=INVALID_VOLUME_CONSTRAINTS",
                     symbol,
                     g_trade.minLot,
-                    g_trade.step);
+                    g_trade.step), LOG_LEVEL_ERROR);
         return;
     }
 

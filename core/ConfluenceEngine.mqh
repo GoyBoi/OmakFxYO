@@ -234,7 +234,12 @@ bool ValidateC2ReversalSincerity(const SLockedSignal &sig)
 
     if(isCorrelated)
     {
-        return SMT_CheckDivergence(sig);
+        bool smtResult = SMT_CheckDivergence(sig);
+        if(smtResult)
+            LogPrint("[SMT_DIVERGENCE_PASS] GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_DEBUG);
+        else
+            LogPrint("[SMT_DIVERGENCE_FAIL] GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_DEBUG);
+        return smtResult;
     }
 
     // Solo Asset Law: Aggressive Displacement
