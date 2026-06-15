@@ -588,6 +588,155 @@ double GetFurthestTarget(STargetResult &result)
 // REGRESSION_GUARD_V52.5_TARGETENGINE_FALLBACK_REMOVED
 
 //+------------------------------------------------------------------+
+//| VERBATIM REPAIR: Finding 2 — Synchronous TP/SL Recalculation      |
+//+------------------------------------------------------------------+
+
+/**
+ * CalculateHTFLiquidityPool — Get the nearest HTF liquidity pool target
+ *
+ * Branch-aware: Branch A (Intraday) uses D1 levels (PDH/PDL).
+ *              Branch B (Swing) uses W1 levels (PWH/PWL).
+ *
+ * For BUY: highest HTF liquidity level above current price
+ * For SELL: lowest HTF liquidity level below current price
+ *
+ * @param symbol Trading symbol
+ * @param direction Trade direction
+ * @param branch Execution branch (BRANCH_INTRADAY → D1, BRANCH_SWING → W1)
+ * @return HTF liquidity pool price (0.0 if none found)
+ */
+double CalculateHTFLiquidityPool(const string symbol, ENUM_DIRECTION direction, ENUM_EXECUTION_BRANCH branch)
+{
+   if(direction == DIRECTION_BUY)
+   {
+      if(branch == BRANCH_SWING)
+      {
+         double pwh = GetPWH(symbol);
+         return (pwh > 0) ? pwh : GetPDH(symbol);
+      }
+      else
+      {
+         double pdh = GetPDH(symbol);
+         return (pdh > 0) ? pdh : GetPWH(symbol);
+      }
+   }
+   else if(direction == DIRECTION_SELL)
+   {
+      if(branch == BRANCH_SWING)
+      {
+         double pwl = GetPWL(symbol);
+         return (pwl > 0) ? pwl : GetPDL(symbol);
+      }
+      else
+      {
+         double pdl = GetPDL(symbol);
+         return (pdl > 0) ? pdl : GetPWL(symbol);
+      }
+   }
+   return 0.0;
+}
+
+/**
+ * CalculateSDProjection — Standard Deviation projection target
+ *
+ * Projects a target at (level * candle range) from entry price.
+ * Uses C2 range first, falls back to C3 range for standalone C3 signals.
+ * Level -2.5 is the standard mechanical expansion target.
+ *
+ * @param sig Locked signal (c2_high/c2_low or c3_high/c3_low for range, entry_price for base)
+ * @param level SD level multiplier (e.g., -2.5)
+ * @return Projected TP price (0.0 if range is invalid)
+ */
+double CalculateSDProjection(const SLockedSignal &sig, double level)
+{
+   double c2Range = MathAbs(sig.c2_high - sig.c2_low);
+   double c3Range = MathAbs(sig.c3_high - sig.c3_low);
+   double baseRange = (c2Range > 0.0) ? c2Range : c3Range;
+   if(baseRange <= 0.0)
+      return 0.0;
+
+   double projection = baseRange * MathAbs(level);
+   if(sig.direction == DIRECTION_BUY)
+      return sig.entry_price + projection;
+   else
+      return sig.entry_price - projection;
+}
+
+/**
+ * ValidateRRConvergence — Clamp TP to minR-maxR band relative to refined SL
+ *
+ * If the current R:R is below minR, TP is widened to meet minR.
+ * If above maxR, TP is tightened to maxR.
+ *
+ * @param sig Locked signal (entry_price, stop_loss, tp are read/written)
+ * @param minR Minimum acceptable R:R (default 2.0)
+ * @param maxR Maximum acceptable R:R (default 4.0)
+ */
+void ValidateRRConvergence(SLockedSignal &sig, double minR, double maxR)
+{
+   if(sig.stop_loss <= 0.0 || sig.tp <= 0.0)
+      return;
+
+   double risk = MathAbs(sig.entry_price - sig.stop_loss);
+   if(risk <= 0.0)
+      return;
+
+   double reward = (sig.direction == DIRECTION_BUY)
+      ? (sig.tp - sig.entry_price)
+      : (sig.entry_price - sig.tp);
+
+   if(reward <= 0.0)
+      return;
+
+   double rr = reward / risk;
+
+   if(rr < minR)
+   {
+      if(sig.direction == DIRECTION_BUY)
+         sig.tp = sig.entry_price + risk * minR;
+      else
+         sig.tp = sig.entry_price - risk * minR;
+   }
+   else if(rr > maxR)
+   {
+      if(sig.direction == DIRECTION_BUY)
+         sig.tp = sig.entry_price + risk * maxR;
+      else
+         sig.tp = sig.entry_price - risk * maxR;
+   }
+}
+
+/**
+ * SyncRefinedTargets — Force TP recalculation when SL is synced to manipulation leg
+ *
+ * Called immediately after SL refinement to ensure TP stays anchored
+ * to HTF Liquidity Pools with SD Projection fallback, clamped to 2R-4R band.
+ *
+ * @param sig Locked signal to update (entry_price, stop_loss, tp must be set)
+ */
+void SyncRefinedTargets(SLockedSignal &sig)
+{
+   double oldTP = sig.tp;
+
+   double liquidityTP = CalculateHTFLiquidityPool(sig.symbol, sig.direction, sig.branch);
+   double projectionTP = CalculateSDProjection(sig, -2.5);
+
+    if(sig.tp <= 0.0)
+    {
+        if(liquidityTP > 0.0)
+           sig.tp = liquidityTP;
+        else if(projectionTP > 0.0)
+           sig.tp = projectionTP;
+    }
+
+   if(sig.tp > 0.0)
+      ValidateRRConvergence(sig, 2.0, 4.0);
+
+   if(oldTP != sig.tp)
+      LogPrint(StringFormat("[TP_SYNC] GUID:%I64u | NewTP:%.5f (Old:%.5f)", sig.m_guid, sig.tp, oldTP), LOG_LEVEL_INFO);
+}
+
+//+------------------------------------------------------------------+
 //| END OF FILE                                                      |
 //+------------------------------------------------------------------+
 

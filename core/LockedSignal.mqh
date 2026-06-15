@@ -156,9 +156,12 @@ ENUM_HANDOVER_STATE handoverState;  // Handover ownership state machine
       ENUM_CLOSURE_TYPE originalClosureType;  // The type when signal was first created
 
 // HTF T-Spot (structure-derived POI zone)
-       double htfTSpotHigh;
-       double htfTSpotLow;
-       double htfTSpotMid;
+        double htfTSpotHigh;
+        double htfTSpotLow;
+        double htfTSpotMid;
+
+       // HTF Expansion Objective — PDH/PDL or failure swings for C3 TP target
+       double htfExpansionObjective;
 
       // T-Spot Zone for C3 POI mapping (HTF-derived zone boundaries)
       double tSpotMin;              // Zone lower bound (HTF Low for bullish, Equilibrium for bearish)
@@ -176,6 +179,8 @@ ENUM_HANDOVER_STATE handoverState;  // Handover ownership state machine
        string symbol;          // Trading symbol
        ENUM_EXECUTION_BRANCH branch; // Branch (used by RecalculateSignalForC3)
        double poi;             // Point of interest / POI price
+       ENUM_PD_ARRAY_TYPE poi_type; // PD Array type from Gate 4 T-Spot mapping
+       double poi_price;       // POI price level from Gate 4 mapping
        double sl;              // Stop loss
        double tp;             // Take profit
 
@@ -208,11 +213,13 @@ ENUM_HANDOVER_STATE handoverState;  // Handover ownership state machine
          int invalidationState;        // 0=INVALID_NONE, 1=INVALID_VALID, 2=INVALID_INVALIDATED
 
          // === EXECUTION TRUTH FIELDS (Execution Truth Separation) ===
-         double candidateEntryPrice;   // Original entry price from signal detection (c4_open at Lock time)
-         double requestedEntryPrice;   // Price sent to broker via OrderSend (0 until requested)
-         double actualFillPrice;       // Fill price from broker/DEAL_PRICE (0 until filled)
-         datetime fillTime;            // When the fill was confirmed
-         int fillStatus;               // 0=FILL_NONE, 1=FILL_REQUESTED, 2=FILL_PARTIAL, 3=FILL_COMPLETE
+          double candidateEntryPrice;   // Original entry price from signal detection (c4_open at Lock time)
+          double m_spreadAtLock;        // Spread (in price) captured at Lock time for deterministic replay
+          double requestedEntryPrice;   // Price sent to broker via OrderSend (0 until requested)
+          double actualFillPrice;       // Fill price from broker/DEAL_PRICE (0 until filled)
+          datetime fillTime;            // When the fill was confirmed
+          int fillStatus;               // 0=FILL_NONE, 1=FILL_REQUESTED, 2=FILL_PARTIAL, 3=FILL_COMPLETE
+          ulong positionTicket;         // Broker position ticket from OnTradeTransaction fill confirmation
 
          // === SETUP-LEVEL METADATA (shared by C2, C3, C4 within the same setup) ===
         datetime m_setupStartTime;          // bar time of C1 (start of setup)
@@ -476,17 +483,19 @@ ulong GetGUID() { return m_guid; }
 
                switch(stage)
                {
-                   case STAGE_NONE:
-                       legal = (newStage == STAGE_LOCKED ||
-                                newStage == STAGE_AWAITING_C3_CLOSURE);
-                       if(!legal) reason = "NONE -> " + EnumToString(newStage) + " illegal; must go to LOCKED or AWAITING_C3_CLOSURE";
-                       break;
+                    case STAGE_NONE:
+                        legal = (newStage == STAGE_LOCKED ||
+                                 newStage == STAGE_AWAITING_C3_CLOSURE ||
+                                 newStage == STAGE_WAITING_FOR_POI);
+                        if(!legal) reason = "NONE -> " + EnumToString(newStage) + " illegal; must go to LOCKED, AWAITING_C3_CLOSURE, or WAITING_FOR_POI";
+                        break;
 
-                   case STAGE_LOCKED:
-                       legal = (newStage == STAGE_WAITING_FOR_POI ||
-                                newStage == STAGE_EXPIRED);
-                       if(!legal) reason = "LOCKED -> " + EnumToString(newStage) + " illegal; must go to WAITING_FOR_POI or EXPIRED";
-                       break;
+                    case STAGE_LOCKED:
+                        legal = (newStage == STAGE_WAITING_FOR_POI ||
+                                 newStage == STAGE_READY ||
+                                 newStage == STAGE_EXPIRED);
+                        if(!legal) reason = "LOCKED -> " + EnumToString(newStage) + " illegal; must go to WAITING_FOR_POI, READY, or EXPIRED";
+                        break;
 
                    case STAGE_AWAITING_C2_CLOSURE:
                        legal = (newStage == STAGE_WAITING_FOR_POI ||

@@ -29,6 +29,7 @@
 #endif
 
 #define MAX_TOTAL_SIGNALS_PER_BRANCH (MAX_C2_SIGNALS_PER_BRANCH + MAX_C3_SIGNALS_PER_BRANCH)
+#define MAX_SLOTS MAX_TOTAL_SIGNALS_PER_BRANCH
 
 //+------------------------------------------------------------------+
 //| ENUM_DIRECTION — Trade Direction                                 |
@@ -101,7 +102,19 @@ enum ENUM_FRACTAL_STATE
    FRACTAL_STATE_C4,
    FRACTAL_STATE_C3_CONTINUATION,
    FRACTAL_STATE_C3_DELAYED_REVERSAL,
-   FRACTAL_STATE_WEAK
+    FRACTAL_STATE_WEAK
+};
+
+//+------------------------------------------------------------------+
+//| ENUM_PD_ARRAY_TYPE — PD Array classification for Gate 4           |
+//+------------------------------------------------------------------+
+enum ENUM_PD_ARRAY_TYPE
+{
+   PD_NONE        = 0,
+   PD_BREAKER_BLOCK,   // Priority 1 — highest
+   PD_FVG,              // Priority 2
+   PD_ORDER_BLOCK,      // Priority 3
+   PD_INVERSION_FVG     // Priority 4
 };
 
 //+------------------------------------------------------------------+
@@ -311,6 +324,10 @@ struct SLineage
 // Include LockedSignal for SLockedSignal definition
 #include <OmakFxYO/core/LockedSignal.mqh>
 
+// Global signal pools — defined here so all includes and the main file see them
+SLockedSignal g_activeC2[MAX_SLOTS];
+SLockedSignal g_activeC3[MAX_SLOTS];
+
 //+------------------------------------------------------------------+
 //| SClosureSignal — Legacy wrapper for backward compatibility      |
 //+------------------------------------------------------------------+
@@ -352,9 +369,11 @@ datetime m_detectionTime;
    double setupInitialLow;
    bool setupIsBullish;
 bool expansionMode;           // TTFM Gate 2: true = expansion candle (dominant wick < 50%), false = reversal candle
+   ENUM_PD_ARRAY_TYPE poi_type;   // PD Array type from Gate 4 T-Spot mapping (Breaker Block, FVG, OB, Inversion FVG)
+   double poi_price;              // POI price level from Gate 4 mapping
  
-    double tSpotMin;              // T-Spot zone lower bound (HTF Low for bullish, Equilibrium for bearish)
-    double tSpotMax;              // T-Spot zone upper bound (Equilibrium for bullish, HTF High for bearish)
+     double tSpotMin;              // T-Spot zone lower bound (HTF Low for bullish, Equilibrium for bearish)
+     double tSpotMax;              // T-Spot zone upper bound (Equilibrium for bullish, HTF High for bearish)
  
     void Reset()
    {
@@ -393,9 +412,11 @@ m_detectionTime = 0;
 setupInitialHigh = 0.0;
         setupInitialLow = 0.0;
         setupIsBullish = false;
-        expansionMode = false;
-        tSpotMin = 0.0;
-        tSpotMax = 0.0;
+         expansionMode = false;
+         poi_type = PD_NONE;
+         poi_price = 0.0;
+         tSpotMin = 0.0;
+         tSpotMax = 0.0;
      }
 
    SClosureSignal() { Reset(); }
@@ -542,9 +563,10 @@ bool SLockedSignal::Lock(SClosureSignal &signal, int id, ENUM_EXECUTION_BRANCH e
    c3_open = signal.c3_open;
    c3_close = signal.c3_close;
 
-   entry_price = signal.entry_price;
-   candidateEntryPrice = signal.entry_price; // [ENTRY_TRUTH] Preserve candidate at lock time
-   stop_loss = signal.stop_loss;
+    entry_price = signal.entry_price;
+    candidateEntryPrice = signal.entry_price; // [ENTRY_TRUTH] Preserve candidate at lock time
+    m_spreadAtLock = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    stop_loss = signal.stop_loss;
    LogPrint("[SL_TRACE] Lock COPY | guid=" + IntegerToString(m_guid) +
            " sl=" + DoubleToString(stop_loss, _Digits) +
            " from_signal.sl=" + DoubleToString(signal.stop_loss, _Digits), LOG_LEVEL_DEBUG);
@@ -581,7 +603,7 @@ m_c3CisdConfirmed = false; // Will be set true after CISD check on LTF
     }
 
     ENUM_TIMEFRAMES structTF = (tf == PERIOD_CURRENT) ? _Period : tf;
-    lockTime = iTime(_Symbol, structTF, 0);
+    lockTime = TimeCurrent();
 
     double c1Range = signal.c2_high - signal.c2_low;
     equilibrium = (c1Range > 0.0) ? signal.c2_low + (c1Range * 0.5) : 0.0;
@@ -710,6 +732,13 @@ bool SLockedSignal::Lock(double scannerMin, double scannerMax) {
     if(this.m_detectionTime <= 0)
         this.m_detectionTime = TimeCurrent();
     this.stage = STAGE_LOCKED;
+    this.isCommitted = true;
+    if(this.closureType == CLOSURE_C2)
+        this.executionMode = MODE_ANTICIPATION;
+    else if(this.closureType == CLOSURE_C3 || this.closureType == CLOSURE_C4)
+        this.executionMode = MODE_CONFIRMATION;
+    else
+        this.executionMode = MODE_NONE;
     return (this.tSpotMax > 0); 
 }
 

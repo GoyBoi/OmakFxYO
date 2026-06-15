@@ -245,11 +245,16 @@ void MonitorTPLevels()
 
       // Determine mode from signal store
       int posMode = MODE_NONE;
-      for(int s = 0; s < MAX_TOTAL_SIGNALS_PER_BRANCH; s++)
+      for(int s = 0; s < MAX_SLOTS; s++)
       {
-         if(g_hasActiveSignal[s] && g_activeSignal[s].m_guid == posMagic)
+         if(g_activeC2[s].m_guid == posMagic)
          {
-            posMode = g_activeSignal[s].executionMode;
+            posMode = g_activeC2[s].executionMode;
+            break;
+         }
+         if(g_activeC3[s].m_guid == posMagic)
+         {
+            posMode = g_activeC3[s].executionMode;
             break;
          }
       }
@@ -745,6 +750,13 @@ bool ExecutionGatePass(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, doub
     request.sl    = NormalizeDouble(signal.stop_loss, digits);
     request.tp    = NormalizeDouble(signal.tp, digits);
     
+    // §XII: Set TF-aware expiration for pending orders
+    if(request.action == TRADE_ACTION_PENDING)
+    {
+       request.type_time = ORDER_TIME_SPECIFIED;
+       request.expiration = TimeCurrent() + GetPendingOrderTimeoutSeconds(GetEntryTF(signal.branchId));
+    }
+    
     if(!RG_ValidateAndAdjustStops(request, signal)) {
         LogPrint(StringFormat("[RG_STOPS_REJECT] GUID:%I64u | SL:%.5f", signal.m_guid, request.sl), LOG_LEVEL_ERROR);
         return false;
@@ -757,13 +769,58 @@ bool ExecutionGatePass(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, doub
         return false;
     }
     
+    // Acquire handover ownership before order send
+    if(!signal.AcquireHandover(HANDOVER_OWNER_ORDER_MGR))
+    {
+        LogPrint("[HANDOVER_ACQUIRE_FAIL] GUID=" + IntegerToString(signal.m_guid), LOG_LEVEL_ERROR);
+        return false;
+    }
+    
+    string execSpecies = (signal.closureType == CLOSURE_C2 ? "C2" :
+                          signal.closureType == CLOSURE_C3 ? "C3" :
+                          signal.closureType == CLOSURE_C4 ? "C4" : "UNKNOWN");
+    string execDir     = (signal.direction == DIRECTION_BUY ? "BUY" :
+                          signal.direction == DIRECTION_SELL ? "SELL" : "NONE");
+    LogPrint("[EXEC_TRIGGER] GUID=" + IntegerToString(signal.m_guid) +
+             " | species=" + execSpecies +
+             " | direction=" + execDir +
+             " | entry=" + DoubleToString(signal.entry_price, digits) +
+             " | sl=" + DoubleToString(signal.stop_loss, digits) +
+             " | tp=" + DoubleToString(signal.tp, digits), LOG_LEVEL_INFO);
+
+    if(request.tp <= 0.0 || request.sl <= 0.0)
+    {
+       LogPrint("[PROTECTED_DELIVERY_BLOCK] sl=" + DoubleToString(request.sl, _Digits) +
+                " | tp=" + DoubleToString(request.tp, _Digits) +
+                " | GUID=" + IntegerToString(signal.m_guid) +
+                " | species=" + execSpecies, LOG_LEVEL_ERROR);
+       return false;
+    }
+
     if(!OrderSend(request, result)) {
         LogPrint(StringFormat("[ORDER_FAILED] GUID:%I64u | Error:%d", signal.m_guid, GetLastError()), LOG_LEVEL_ERROR);
         return false;
     }
     
-    LogPrint(StringFormat("[ORDER_SENT] GUID:%I64u | type=%s | price=%.5f | sl=%.5f | tp=%.5f | vol=%.2f",
-             signal.m_guid, EnumToString(request.type), request.price, request.sl, request.tp, request.volume), LOG_LEVEL_INFO);
+    // VERBATIM REPAIR: Finding 1 - GUID Identity Bridge
+    {
+        int linkIdx = ArraySize(g_pendingLinks);
+        ArrayResize(g_pendingLinks, linkIdx + 1);
+        g_pendingLinks[linkIdx].request_id = result.request_id;
+        g_pendingLinks[linkIdx].guid = signal.m_guid;
+        g_pendingLinks[linkIdx].branch = signal.branchId;
+        g_pendingLinks[linkIdx].orderTicket = result.order;
+        g_pendingLinks[linkIdx].created = TimeCurrent();
+        LogPrint(StringFormat("[GUID_BRIDGE_SET] ID:%u -> GUID:%I64u branch=%s", result.request_id, signal.m_guid,
+                 signal.branchId == BRANCH_INTRADAY ? "A" : "B"), LOG_LEVEL_INFO);
+    }
+    
+    LogPrint("[ORDER_SENT] GUID=" + IntegerToString(signal.m_guid) +
+             " | type=" + EnumToString(request.type) +
+             " | price=" + DoubleToString(request.price, digits) +
+             " | sl=" + DoubleToString(request.sl, digits) +
+             " | tp=" + DoubleToString(request.tp, digits) +
+             " | vol=" + DoubleToString(request.volume, 2), LOG_LEVEL_INFO);
     
     return true;
 }
@@ -818,14 +875,33 @@ request.action = TRADE_ACTION_PENDING;
       request.symbol = symbol;
       request.type = (direction == SIGNAL_BULLISH) ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
       request.magic = magicNumber;
-      request.type_time = ORDER_TIME_GTC;
+      // §XII: TF-aware expiration for limit orders
+      {
+         ENUM_EXECUTION_BRANCH limBranch = BRANCH_INTRADAY;
+         for(int si = 0; si < MAX_SLOTS; si++)
+         {
+            if(g_activeC2[si].m_guid == g_current_signal_guid)
+            {
+               limBranch = g_activeC2[si].branchId;
+               break;
+            }
+            if(g_activeC3[si].m_guid == g_current_signal_guid)
+            {
+               limBranch = g_activeC3[si].branchId;
+               break;
+            }
+         }
+         request.type_time = ORDER_TIME_SPECIFIED;
+         request.expiration = TimeCurrent() + GetPendingOrderTimeoutSeconds(GetEntryTF(limBranch));
+      }
 
       SSymbolProfile spLot = SY_GetProfile(symbol);
       double minLot = spLot.volumeMin;
       double maxLot = spLot.volumeMax;
       double lotStep = spLot.volumeStep;
 
-      lot = StabiliseLot(lot, minLot, maxLot, lotStep, symbol);
+      StabiliseLot(lot, minLot, maxLot, lotStep, symbol);
+      // lot already modified in-place by reference; no assignment needed
      
       if(lot < minLot || lot <= 0.0)
       {
@@ -838,18 +914,24 @@ request.action = TRADE_ACTION_PENDING;
 
       // [ORDER_REQUESTED] Capture requested price before send
       {
-         for(int loPre = 0; loPre < ArraySize(g_activeSignal); loPre++)
+         for(int loPre = 0; loPre < MAX_SLOTS; loPre++)
          {
-            if(g_hasActiveSignal[loPre] && g_activeSignal[loPre].m_guid == g_current_signal_guid)
+            if(g_activeC2[loPre].m_guid == g_current_signal_guid)
             {
-               g_activeSignal[loPre].requestedEntryPrice = limitPrice;
-               g_activeSignal[loPre].fillStatus = 1;  // FILL_REQUESTED
-               LogPrint("[ORDER_REQUESTED] GUID=" + IntegerToString(g_current_signal_guid) +
-                        " | requestedEntry=" + DoubleToString(limitPrice, _Digits) +
-                        " | type=LIMIT", LOG_LEVEL_INFO);
+               g_activeC2[loPre].requestedEntryPrice = limitPrice;
+               g_activeC2[loPre].fillStatus = 1;
+               break;
+            }
+            if(g_activeC3[loPre].m_guid == g_current_signal_guid)
+            {
+               g_activeC3[loPre].requestedEntryPrice = limitPrice;
+               g_activeC3[loPre].fillStatus = 1;
                break;
             }
          }
+         LogPrint("[ORDER_REQUESTED] GUID=" + IntegerToString(g_current_signal_guid) +
+                  " | requestedEntry=" + DoubleToString(limitPrice, digits) +
+                  " | type=LIMIT", LOG_LEVEL_INFO);
       }
 
     LogInfo("[LIMIT_ORDER] Status=READY | Symbol=" + symbol + 
@@ -906,30 +988,108 @@ request.action = TRADE_ACTION_PENDING;
         return false;
     }
 
+    {
+        ENUM_CLOSURE_TYPE execCt = CLOSURE_NONE;
+        for(int eCt = 0; eCt < MAX_SLOTS; eCt++)
+        {
+           if(g_activeC2[eCt].m_guid == g_current_signal_guid) { execCt = g_activeC2[eCt].closureType; break; }
+           if(g_activeC3[eCt].m_guid == g_current_signal_guid) { execCt = g_activeC3[eCt].closureType; break; }
+        }
+        string loSpecies = (execCt == CLOSURE_C2 ? "C2" :
+                            execCt == CLOSURE_C3 ? "C3" :
+                            execCt == CLOSURE_C4 ? "C4" : "UNKNOWN");
+        string loDir     = (direction == SIGNAL_BULLISH ? "BUY" :
+                            direction == SIGNAL_BEARISH ? "SELL" : "NONE");
+        LogPrint("[EXEC_TRIGGER] GUID=" + IntegerToString(g_current_signal_guid) +
+                 " | species=" + loSpecies +
+                 " | direction=" + loDir +
+                 " | entry=" + DoubleToString(limitPrice, digits) +
+                 " | sl=" + DoubleToString(stopLoss, digits) +
+                 " | tp=" + DoubleToString(takeProfit, digits), LOG_LEVEL_INFO);
+    }
+
+    if(request.tp <= 0.0 || request.sl <= 0.0)
+    {
+       string loSpecies2 = (g_current_signal_guid > 0) ? "UNKNOWN" : "UNKNOWN";
+       for(int pDi = 0; pDi < MAX_SLOTS; pDi++)
+       {
+          if(g_activeC2[pDi].m_guid == g_current_signal_guid) { loSpecies2 = "C2"; break; }
+          if(g_activeC3[pDi].m_guid == g_current_signal_guid) { loSpecies2 = (g_activeC3[pDi].closureType == CLOSURE_C4 ? "C4" : "C3"); break; }
+       }
+       LogPrint("[PROTECTED_DELIVERY_BLOCK] sl=" + DoubleToString(request.sl, _Digits) +
+                " | tp=" + DoubleToString(request.tp, _Digits) +
+                " | GUID=" + IntegerToString(g_current_signal_guid) +
+                " | species=" + loSpecies2, LOG_LEVEL_ERROR);
+       return false;
+    }
+
     bool sent = OrderSend(request, result);
 
-    PrintFormat("[LIMIT_ORDER_FILL_ATTEMPT] GUID=%I64u symbol=%s retcode=%u deal=%I64u fill_type=%d deviation=%d",
+    LogPrint(StringFormat("[LIMIT_ORDER_FILL_ATTEMPT] GUID=%I64u symbol=%s retcode=%u deal=%I64u fill_type=%d deviation=%d",
                 g_current_signal_guid, request.symbol, result.retcode, result.deal,
-                request.type_filling, request.deviation);
+                request.type_filling, request.deviation), LOG_LEVEL_INFO);
 
     if(sent && (result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED))
     {
-        PrintFormat("[LIMIT_ORDER_FILL_SUCCESS] GUID=%I64u ticket=%I64u deal=%I64u price=%.5f",
-                    g_current_signal_guid, result.order, result.deal, result.price);
+        LogPrint("[LIMIT_ORDER_FILL_SUCCESS] GUID=" + IntegerToString(g_current_signal_guid) +
+                 " | ticket=" + IntegerToString(result.order) +
+                 " | deal=" + IntegerToString(result.deal) +
+                 " | price=" + DoubleToString(result.price, digits), LOG_LEVEL_INFO);
 
-        // [ENTRY_TRUTH] Set fill price on the signal (via g_activeSignal store)
-        for(int loS = 0; loS < ArraySize(g_activeSignal); loS++)
+        // VERBATIM REPAIR: GUID Identity Bridge (limit order path)
         {
-           if(g_hasActiveSignal[loS] && g_activeSignal[loS].m_guid == g_current_signal_guid)
+            int linkIdx = ArraySize(g_pendingLinks);
+            ArrayResize(g_pendingLinks, linkIdx + 1);
+            g_pendingLinks[linkIdx].request_id = result.request_id;
+            g_pendingLinks[linkIdx].guid = g_current_signal_guid;
+        g_pendingLinks[linkIdx].orderTicket = (request.action == TRADE_ACTION_PENDING) ? result.order : 0;
+            g_pendingLinks[linkIdx].created = TimeCurrent();
+            {
+               ENUM_EXECUTION_BRANCH linkBranch = BRANCH_INTRADAY;
+               for(int si = 0; si < MAX_SLOTS; si++)
+               {
+                  if(g_activeC2[si].m_guid == g_current_signal_guid)
+                  {
+                     linkBranch = g_activeC2[si].branchId;
+                     break;
+                  }
+                  if(g_activeC3[si].m_guid == g_current_signal_guid)
+                  {
+                     linkBranch = g_activeC3[si].branchId;
+                     break;
+                  }
+               }
+               g_pendingLinks[linkIdx].branch = linkBranch;
+            }
+            LogPrint(StringFormat("[GUID_BRIDGE_SET] ID:%u -> GUID:%I64u", result.request_id, g_current_signal_guid), LOG_LEVEL_INFO);
+        }
+
+        // [ENTRY_TRUTH] Set fill price on the signal (via store)
+        for(int loS = 0; loS < MAX_SLOTS; loS++)
+        {
+           if(g_activeC2[loS].m_guid == g_current_signal_guid)
            {
-              g_activeSignal[loS].requestedEntryPrice = limitPrice;
-              g_activeSignal[loS].actualFillPrice = result.price;
-              g_activeSignal[loS].fillStatus = 3;  // FILL_COMPLETE
-              g_activeSignal[loS].fillTime = TimeCurrent();
-              g_activeSignal[loS].entry_price = result.price;
-              LogPrint("[ORDER_FILLED] GUID=" + IntegerToString(g_current_signal_guid) +
-                       " | fillPrice=" + DoubleToString(result.price, _Digits) +
-                       " | requestedPrice=" + DoubleToString(limitPrice, _Digits) +
+              g_activeC2[loS].requestedEntryPrice = limitPrice;
+              g_activeC2[loS].actualFillPrice = result.price;
+              g_activeC2[loS].fillStatus = 3;
+              g_activeC2[loS].fillTime = TimeCurrent();
+              g_activeC2[loS].entry_price = result.price;
+               LogPrint("[ORDER_FILLED] GUID=" + IntegerToString(g_current_signal_guid) +
+                        " | fillPrice=" + DoubleToString(result.price, digits) +
+                        " | requestedPrice=" + DoubleToString(limitPrice, digits) +
+                        " | entryTruthReconciled=true", LOG_LEVEL_INFO);
+               break;
+            }
+            if(g_activeC3[loS].m_guid == g_current_signal_guid)
+            {
+               g_activeC3[loS].requestedEntryPrice = limitPrice;
+               g_activeC3[loS].actualFillPrice = result.price;
+               g_activeC3[loS].fillStatus = 3;
+               g_activeC3[loS].fillTime = TimeCurrent();
+               g_activeC3[loS].entry_price = result.price;
+               LogPrint("[ORDER_FILLED] GUID=" + IntegerToString(g_current_signal_guid) +
+                        " | fillPrice=" + DoubleToString(result.price, digits) +
+                        " | requestedPrice=" + DoubleToString(limitPrice, digits) +
                        " | entryTruthReconciled=true", LOG_LEVEL_INFO);
               break;
            }
@@ -944,8 +1104,8 @@ request.action = TRADE_ACTION_PENDING;
         return true;
     }
 
-    PrintFormat("[LIMIT_ORDER_FILL_FAIL] GUID=%I64u reason=%u retcode_desc=%s",
-                g_current_signal_guid, result.retcode, GetRetcodeDescription(result.retcode));
+    LogPrint(StringFormat("[LIMIT_ORDER_FILL_FAIL] GUID=%I64u reason=%u retcode_desc=%s",
+                g_current_signal_guid, result.retcode, GetRetcodeDescription(result.retcode)), LOG_LEVEL_ERROR);
     LogError("[LIMIT_ORDER] GUID=" + IntegerToString(g_current_signal_guid) +
             " | Status=FAILED | Retcode=" + IntegerToString(result.retcode) +
             " | Error=" + IntegerToString(GetLastError()));

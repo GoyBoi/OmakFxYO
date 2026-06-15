@@ -28,6 +28,10 @@
 // REGRESSION_GUARD_V52.5_CONSOLIDATION: PositionGUIDMap now in CoreTypes.mqh
 extern int g_totalOrdersSent;
 extern PositionGUIDMap g_positionMap[];
+
+double C3_SL_Calculator(int direction, double entryPrice, ENUM_TIMEFRAMES itf, double minStopMult);
+double C2_SL_Calculator(int direction, double entryPrice, ENUM_TIMEFRAMES itf, double minStopMult);
+double C4_SL_Calculator(int direction, double entryPrice, double c3_high, double c3_low, double minStopMult);
 extern int g_positionMapCount;
 extern bool   g_blockNewEntries;   // Entry block flag from risk compliance engine
 // REGRESSION_GUARD_V52.5_GLOBAL_ENTRY_HALT
@@ -78,6 +82,7 @@ struct SSignalSnapshotRisk
     ENUM_TIMEFRAMES structureTF;
     datetime barTime;
     string   branchName;
+    ENUM_EXECUTION_BRANCH branch;
 
     double   entryPrice;
     double   stopLoss;
@@ -142,6 +147,7 @@ void RG_CreateSnapshot(SSignalSnapshotRisk &snap, const SLockedSignal &sig, doub
       snap.structureTF = structureTF;
       snap.barTime = barTime;
       snap.branchName = branchName;
+      snap.branch = sig.branch;
       snap.timestamp = TimeCurrent();
       snap.entryPrice = sig.entry_price;
       snap.stopLoss = sig.stop_loss;
@@ -706,6 +712,11 @@ ENUM_RG_FAIL PreTradeReadinessGate(SSignalSnapshotRisk &snap, bool skipRR = fals
                   StringFormat("RR=%.2f < minRR=%.2f closure=%s", rr_ratio, minRR, EnumToString(snap.closureType)));
               string snapModeStr = (snap.executionMode == MODE_ANTICIPATION) ? "ANTICIPATION" :
                                   (snap.executionMode == MODE_CONFIRMATION) ? "CONFIRMATION" : "NONE";
+              LogPrint("[RISK_2R_VIOLATION] GUID=" + IntegerToString(snap.signalID) +
+                       " | RR=" + DoubleToString(rr_ratio, 2) +
+                       " < minRR=" + DoubleToString(minRR, 2) +
+                       " | closure=" + EnumToString(snap.closureType) +
+                       " | mode=" + snapModeStr, LOG_LEVEL_ERROR);
               LogInfo(StringFormat("[RG_GATE_FAIL] INSUFFICIENT_RR | GUID=%I64u RR=%.2f < %.2f mode=%s[%d] closure=%s",
                   snap.signalID, rr_ratio, minRR,
                   snapModeStr, snap.executionMode,
@@ -717,21 +728,35 @@ ENUM_RG_FAIL PreTradeReadinessGate(SSignalSnapshotRisk &snap, bool skipRR = fals
               snap.signalID, rr_ratio, minRR, EnumToString(snap.closureType)));
       }
 
-// === C3 CONTEXT CHECK: Verify C2 extremes for protected swing anchor ===
-      if(snap.closureType == CLOSURE_C3)
+   // ===== C3 SPECIES HANDLING (REPLACEMENT FOR LINES 720-734) =====
+   if(snap.closureType == CLOSURE_C3)
+   {
+      // C3 does NOT require C2 extremes (standalone C3 is valid)
+      // Instead, ensure SL is valid using dedicated calculator
+      if(snap.stopLoss <= 0.0 || snap.stopLoss == snap.entryPrice)
       {
-          if(snap.c2_low <= 0.0 && snap.c2_high <= 0.0)
-          {
-              RG_LogFailure(RG_FAIL_SL_INVALID, snap.signalID, snap.symbol,
-                  "C3 missing C2 extremes | c2_low=" + DoubleToString(snap.c2_low, _Digits) +
-                  " | c2_high=" + DoubleToString(snap.c2_high, _Digits));
-              LogPrint("[RG_GATE_FAIL] reason=C3_MISSING_C2_EXTREMES | GUID=" + IntegerToString(snap.signalID), LOG_LEVEL_ERROR);
-              return RG_FAIL_PRECONDITION;
-          }
-          LogPrint("[RG_C3_CONTEXT] C2 extremes validated | c2_low=" + DoubleToString(snap.c2_low, _Digits) +
-                   " | c2_high=" + DoubleToString(snap.c2_high, _Digits) +
-                   " | GUID=" + IntegerToString(snap.signalID), LOG_LEVEL_DEBUG);
+         LogPrint("[C3_SL_FALLBACK] No valid SL found, computing fresh...", LOG_LEVEL_WARN);
+         snap.stopLoss = C3_SL_Calculator(
+            (snap.direction == DIRECTION_BUY) ? 1 : -1,
+            snap.entryPrice,
+            (snap.branch == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4,
+            InpMinStopBuffer
+         );
       }
+      
+      // Final validation
+      if(snap.stopLoss <= 0.0 || snap.stopLoss == snap.entryPrice)
+      {
+         LogPrint(StringFormat("[RG_GATE_FAIL] reason=C3_SL_STILL_INVALID | sl=%.5f entry=%.5f",
+                  snap.stopLoss, snap.entryPrice), LOG_LEVEL_ERROR);
+         return RG_FAIL_PRECONDITION;
+      }
+      
+      LogPrint(StringFormat("[C3_SL_VALID] sl=%.5f entry=%.5f distance=%.5f",
+               snap.stopLoss, snap.entryPrice,
+               MathAbs(snap.stopLoss - snap.entryPrice)), LOG_LEVEL_INFO);
+   }
+   // ===== END C3 HANDLING =====
 
       LogPrint("[RG_GATE_PASS] Pre-trade context and rules validation verified successfully.", LOG_LEVEL_INFO);
       return RG_FAIL_NONE;
@@ -819,10 +844,17 @@ double SincereRiskCalculation(const SLockedSignal &sig, double volume)
     LogPrint(StringFormat("[TELEMETRY_RISK] GUID:%I64u | BrokerRaw:%.2f", sig.m_guid, brokerLoss), LOG_LEVEL_INFO);
 
     // Manual Formula Fallback (The 100x Fraud Guard)
-    double slTicks = MathAbs(sig.entry_price - sig.stop_loss) / SymbolInfoDouble(sig.symbol, SYMBOL_TRADE_TICK_SIZE);
-    double manualLoss = slTicks * SymbolInfoDouble(sig.symbol, SYMBOL_TRADE_TICK_VALUE) * volume;
+    SSymbolProfile rgProf = SY_GetProfile(sig.symbol);
+    double tickSizeRG = rgProf.isValid ? rgProf.tickSize : 0.0;
+    double tickValRG = rgProf.isValid ? rgProf.tickValue : 0.0;
+    double slTicks = (tickSizeRG > 0.0) ? MathAbs(sig.entry_price - sig.stop_loss) / tickSizeRG : 0.0;
+    double manualLoss = slTicks * tickValRG * volume;
 
-    return (success && MathAbs(brokerLoss) < manualLoss * 10.0) ? MathAbs(brokerLoss) : manualLoss;
+    double discrepancy = (manualLoss != 0.0) ? MathAbs(brokerLoss - manualLoss) / manualLoss : 1.0;
+    if(success && discrepancy <= 0.05)
+        return MathAbs(brokerLoss);
+    else
+        return manualLoss;
 }
 
 //+------------------------------------------------------------------+
@@ -1245,6 +1277,20 @@ int maxRetries = 3;
       int lastRetcode = 0;
       for(int attempt = 1; attempt <= maxRetries; attempt++)
      {
+        if(req.tp <= 0.0 || req.sl <= 0.0)
+        {
+           string rgSpecies = "UNKNOWN";
+           for(int rDi = 0; rDi < MAX_SLOTS; rDi++)
+           {
+              if(g_activeC2[rDi].m_guid == signalID) { rgSpecies = "C2"; break; }
+              if(g_activeC3[rDi].m_guid == signalID) { rgSpecies = (g_activeC3[rDi].closureType == CLOSURE_C4 ? "C4" : "C3"); break; }
+           }
+           LogPrint("[PROTECTED_DELIVERY_BLOCK] sl=" + DoubleToString(req.sl, _Digits) +
+                    " | tp=" + DoubleToString(req.tp, _Digits) +
+                    " | GUID=" + IntegerToString(signalID) +
+                    " | species=" + rgSpecies, LOG_LEVEL_ERROR);
+           return false;
+        }
         MqlTradeResult res = {};
 if(OrderSend(req, res))
          {
@@ -1651,39 +1697,37 @@ bool IsPyramidHeatCapSafe(double additionalRiskDollars, double maxHeatPercent = 
 //+------------------------------------------------------------------+
 //| RG_EvaluateAndGate — Quick viability gate after STAGE_READY      |
 //| Called immediately after TransitionStage(STAGE_READY) in the     |
-//| pipeline. Uses Entry-TF Manipulation Leg extreme to build a      |
-//| provisional risk snapshot and evaluate gate readiness.           |
+//| pipeline. Uses signal.stop_loss (structural SL per species rules |
+//| §V) to build a provisional risk snapshot and evaluate RR.        |
 //| Returns true if signal is viable for execution on the same tick. |
 //+------------------------------------------------------------------+
 bool RG_EvaluateAndGate(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch)
 {
     ENUM_TIMEFRAMES entryTF = (branch == BRANCH_SWING) ? PERIOD_M15 : PERIOD_M5;
-
-    // VERBATIM REPAIR: Entry-TF Manipulation Leg SL (§II)
     bool isBuy = (signal.direction == DIRECTION_BUY);
-    int manipBars = 10;
-    double manipExtreme = isBuy
-        ? iLow(_Symbol, entryTF, iLowest(_Symbol, entryTF, MODE_LOW, manipBars, 1))
-        : iHigh(_Symbol, entryTF, iHighest(_Symbol, entryTF, MODE_HIGH, manipBars, 1));
-    if(manipExtreme <= 0.0)
+
+    // Use the signal's constitutionally-mandated stop_loss directly
+    // (C2: swept extreme on Structure TF, C3: protected swing on Structure TF, C4: C3 candle extreme)
+    if(signal.stop_loss <= 0.0)
     {
         LogPrint("[RG_GATE_FAIL] GUID=" + IntegerToString(signal.m_guid) +
-                 " | reason=NO_MANIP_ANCHOR | step=RG_EvaluateAndGate", LOG_LEVEL_DEBUG);
+                 " | reason=NO_STRUCTURAL_SL | step=RG_EvaluateAndGate", LOG_LEVEL_DEBUG);
         return false;
     }
-    double buffer = InpMinSLPoints * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    double provisionalSL = isBuy ? (manipExtreme - buffer) : (manipExtreme + buffer);
-
-    double slDist = MathAbs(signal.entry_price - provisionalSL) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    if(slDist <= 0.0)
+    SSymbolProfile rgProf = SY_GetProfile(_Symbol);
+    double slDistPrice = MathAbs(signal.entry_price - signal.stop_loss);
+    if(slDistPrice <= 0.0)
     {
         LogPrint("[RG_GATE_FAIL] GUID=" + IntegerToString(signal.m_guid) +
                  " | reason=SL_DISTANCE_ZERO | step=RG_EvaluateAndGate", LOG_LEVEL_DEBUG);
         return false;
     }
-    double provisionalTP = (signal.direction == DIRECTION_BUY)
-        ? signal.entry_price + (slDist * _Point * 2.0)
-        : signal.entry_price - (slDist * _Point * 2.0);
+    double provisionalTP = (isBuy)
+        ? signal.entry_price + slDistPrice * 2.0
+        : signal.entry_price - slDistPrice * 2.0;
+    signal.tp = (signal.tp <= 0.0) ? provisionalTP : signal.tp;
+
+    double slDist = slDistPrice / rgProf.point;
 
     ENUM_TIMEFRAMES structTF = (branch == BRANCH_SWING) ? PERIOD_H4 : PERIOD_H1;
 
@@ -1699,9 +1743,78 @@ bool RG_EvaluateAndGate(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch)
     ENUM_RG_FAIL result = PreTradeReadinessGate(snap);
     if(result != RG_FAIL_NONE)
     {
+        LogPrint("[RG_GATE_FAIL] GUID=" + IntegerToString(signal.m_guid) +
+                 " | reason=NO_STRUCTURAL_SL | step=RG_EvaluateAndGate", LOG_LEVEL_DEBUG);
+        return false;
+    }
+    if(signal.stop_loss <= 0.0 && snap.stopLoss > 0.0 && snap.stopLoss != signal.entry_price)
+    {
+        double oldSL = signal.stop_loss;
+        signal.stop_loss = snap.stopLoss;
+        LogPrint("[STATE_MUTATION] owner=RiskGate | field=stop_loss | old=" + DoubleToString(oldSL, _Digits) +
+                 " | new=" + DoubleToString(snap.stopLoss, _Digits) +
+                 " | GUID=" + IntegerToString(signal.m_guid), LOG_LEVEL_DEBUG);
+        LogPrint(StringFormat("[SL_FALLBACK_WRITEBACK] GUID=%I64u | SL:%.5f", signal.m_guid, snap.stopLoss), LOG_LEVEL_DEBUG);
+    }
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| RG_EvaluateAndGate (3-param overload with error string)           |
+//+------------------------------------------------------------------+
+bool RG_EvaluateAndGate(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, string &rgError)
+{
+    rgError = "";
+    ENUM_TIMEFRAMES entryTF = (branch == BRANCH_SWING) ? PERIOD_M15 : PERIOD_M5;
+    bool isBuy = (signal.direction == DIRECTION_BUY);
+
+    // Use the signal's constitutionally-mandated stop_loss directly
+    if(signal.stop_loss <= 0.0)
+    {
+        rgError = "NO_STRUCTURAL_SL";
+        LogPrint("[RG_GATE_FAIL] GUID=" + IntegerToString(signal.m_guid) +
+                 " | reason=NO_STRUCTURAL_SL | step=RG_EvaluateAndGate", LOG_LEVEL_DEBUG);
+        return false;
+    }
+    SSymbolProfile rgProf2 = SY_GetProfile(_Symbol);
+    double slDistPrice = MathAbs(signal.entry_price - signal.stop_loss);
+    if(slDistPrice <= 0.0)
+    {
+        rgError = "SL_DISTANCE_ZERO";
+        LogPrint("[RG_GATE_FAIL] GUID=" + IntegerToString(signal.m_guid) +
+                 " | reason=SL_DISTANCE_ZERO | step=RG_EvaluateAndGate", LOG_LEVEL_DEBUG);
+        return false;
+    }
+    double provisionalTP = (isBuy)
+        ? signal.entry_price + slDistPrice * 2.0
+        : signal.entry_price - slDistPrice * 2.0;
+    signal.tp = (signal.tp <= 0.0) ? provisionalTP : signal.tp;
+    double slDist = slDistPrice / rgProf2.point;
+    ENUM_TIMEFRAMES structTF = (branch == BRANCH_SWING) ? PERIOD_H4 : PERIOD_H1;
+    SSignalSnapshotRisk snap;
+    RG_CreateSnapshot(snap, signal, 0.0,
+        _Symbol, entryTF, structTF, TimeCurrent(),
+        "Branch" + IntegerToString(branch), slDist,
+        signal.direction, provisionalTP, signal.closureType,
+        signal.c2_low, signal.c2_high,
+        signal.executionMode
+    );
+    ENUM_RG_FAIL result = PreTradeReadinessGate(snap);
+    if(result != RG_FAIL_NONE)
+    {
+        rgError = EnumToString(result);
         LogPrint(StringFormat("[RG_GATE_FAIL] GUID=%I64u | reason=%s | step=RG_EvaluateAndGate",
                  signal.m_guid, EnumToString(result)), LOG_LEVEL_DEBUG);
         return false;
+    }
+    if(signal.stop_loss <= 0.0 && snap.stopLoss > 0.0 && snap.stopLoss != signal.entry_price)
+    {
+        double oldSL = signal.stop_loss;
+        signal.stop_loss = snap.stopLoss;
+        LogPrint("[STATE_MUTATION] owner=RiskGate | field=stop_loss | old=" + DoubleToString(oldSL, _Digits) +
+                 " | new=" + DoubleToString(snap.stopLoss, _Digits) +
+                 " | GUID=" + IntegerToString(signal.m_guid), LOG_LEVEL_DEBUG);
+        LogPrint(StringFormat("[SL_FALLBACK_WRITEBACK] GUID=%I64u | SL:%.5f", signal.m_guid, snap.stopLoss), LOG_LEVEL_DEBUG);
     }
     return true;
 }

@@ -192,9 +192,9 @@ ENUM_SYM_CLASSIFICATION SY_ClassifyByCalcMode(string symbol)
          result = SYM_CLASS_CFD_COMMODITY;
    }
 
-   Print("[SYM_CLASSIFIED] symbol=" + symbol +
+   LogPrint("[SYM_CLASSIFIED] symbol=" + symbol +
          " | calcMode=" + IntegerToString(mode) +
-         " | classification=" + EnumToString(result));
+         " | classification=" + EnumToString(result), LOG_LEVEL_INFO);
 
    return result;
 }
@@ -419,16 +419,16 @@ bool SY_ValidateSymbol(
    SSymbolProfile sp = SY_GetProfile(symbol);
    if(!sp.isValid)
    {
-      Print("[SYM_PROFILE_FAIL] symbol=" + symbol +
+      LogPrint("[SYM_PROFILE_FAIL] symbol=" + symbol +
             " | reason=INCOMPLETE_PROFILE | point=" + DoubleToString(sp.point, 6) +
             " | tickSize=" + DoubleToString(sp.tickSize, 6) +
             " | volumeMin=" + DoubleToString(sp.volumeMin, 2) +
-            " | digits=" + IntegerToString(sp.digits));
+            " | digits=" + IntegerToString(sp.digits), LOG_LEVEL_ERROR);
       failReason = "INCOMPLETE_SYMBOL_PROFILE";
       return false;
    }
 
-   Print("[SYM_PROFILE_OK] symbol=" + symbol +
+   LogPrint("[SYM_PROFILE_OK] symbol=" + symbol +
          " | calcMode=" + IntegerToString(sp.calcMode) +
          " | classification=" + EnumToString(sp.classification) +
          " | digits=" + IntegerToString(sp.digits) +
@@ -441,22 +441,22 @@ bool SY_ValidateSymbol(
          " | volMax=" + DoubleToString(sp.volumeMax, 4) +
          " | volStep=" + DoubleToString(sp.volumeStep, 4) +
          " | marginCurrency=" + sp.marginCurrency +
-         " | profitCurrency=" + sp.profitCurrency);
+         " | profitCurrency=" + sp.profitCurrency, LOG_LEVEL_INFO);
 
    if(sp.tickValue <= 0.0)
    {
-      Print("[SYM_PROFILE_FAIL] symbol=" + symbol +
-            " | reason=TICKVALUE_ZERO | tickValue=" + DoubleToString(sp.tickValue, 6));
+      LogPrint("[SYM_PROFILE_FAIL] symbol=" + symbol +
+            " | reason=TICKVALUE_ZERO | tickValue=" + DoubleToString(sp.tickValue, 6), LOG_LEVEL_ERROR);
       failReason = "TICKVALUE_ZERO";
       return false;
    }
 
    if(sp.volumeMin <= 0.0 || sp.volumeStep <= 0.0)
    {
-      Print("[SYM_PROFILE_FAIL] symbol=" + symbol +
+      LogPrint("[SYM_PROFILE_FAIL] symbol=" + symbol +
             " | reason=INVALID_VOLUME_CONSTRAINTS" +
             " | volMin=" + DoubleToString(sp.volumeMin, 4) +
-            " | volStep=" + DoubleToString(sp.volumeStep, 4));
+            " | volStep=" + DoubleToString(sp.volumeStep, 4), LOG_LEVEL_ERROR);
       failReason = "INVALID_VOLUME_CONSTRAINTS";
       return false;
    }
@@ -469,22 +469,22 @@ bool SY_ValidateSymbol(
          double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
          if(freeMargin > 0.0 && marginReq > freeMargin)
          {
-            Print("[BROKER_MARGIN_FAIL] symbol=" + symbol +
+            LogPrint("[BROKER_MARGIN_FAIL] symbol=" + symbol +
                   " | requiredMargin=" + DoubleToString(marginReq, 2) +
                   " | freeMargin=" + DoubleToString(freeMargin, 2) +
-                  " | shortfall=" + DoubleToString(marginReq - freeMargin, 2));
+                  " | shortfall=" + DoubleToString(marginReq - freeMargin, 2), LOG_LEVEL_ERROR);
             failReason = "INSUFFICIENT_MARGIN";
             return false;
          }
-         Print("[BROKER_MARGIN_OK] symbol=" + symbol +
-               " | requiredMargin=" + DoubleToString(marginReq, 2) +
-               " | freeMargin=" + DoubleToString(freeMargin, 2));
+        LogPrint("[BROKER_MARGIN_OK] symbol=" + symbol +
+              " | requiredMargin=" + DoubleToString(marginReq, 2) +
+              " | freeMargin=" + DoubleToString(freeMargin, 2), LOG_LEVEL_INFO);
       }
       else
       {
-         Print("[BROKER_MARGIN_FAIL] symbol=" + symbol +
-               " | reason=OrderCalcMargin_FAILED" +
-               " | err=" + IntegerToString(GetLastError()));
+        LogPrint("[BROKER_MARGIN_FAIL] symbol=" + symbol +
+              " | reason=OrderCalcMargin_FAILED" +
+              " | err=" + IntegerToString(GetLastError()), LOG_LEVEL_ERROR);
          failReason = "MARGIN_CALC_FAILED";
          return false;
       }
@@ -496,20 +496,20 @@ bool SY_ValidateSymbol(
       if(tickSzVal > 0.0 && tickValVal > 0.0 && slDistVal > 0.0)
       {
          brokerLoss = -((slDistVal / tickSzVal) * tickValVal * volume);
-         Print("[LOT_CALCPROFIT] validate | sym=" + symbol +
+         LogPrint("[LOT_CALCPROFIT] validate | sym=" + symbol +
                " | volume=" + DoubleToString(volume, 4) +
                " | entry=" + DoubleToString(entryPrice, _Digits) +
                " | sl=" + DoubleToString(stopLoss, _Digits) +
                " | slDist=" + DoubleToString(slDistVal, _Digits) +
                " | rawProfit=" + DoubleToString(brokerLoss, 2) +
-               " | source=formula");
+               " | source=formula", LOG_LEVEL_DEBUG);
       }
       else
       {
-         Print("[LOT_CALC_FAIL] Manual calc failed | sym=" + symbol +
+         LogPrint("[LOT_CALC_FAIL] Manual calc failed | sym=" + symbol +
                " | tickSz=" + DoubleToString(tickSzVal, 8) +
                " | tickVal=" + DoubleToString(tickValVal, 8) +
-               " | slDist=" + DoubleToString(slDistVal, _Digits));
+               " | slDist=" + DoubleToString(slDistVal, _Digits), LOG_LEVEL_ERROR);
          failReason = "PROFIT_CALC_FAILED";
          return false;
       }
@@ -518,10 +518,10 @@ bool SY_ValidateSymbol(
       double equity = AccountInfoDouble(ACCOUNT_EQUITY);
       if(equity > 0.0 && brokerLoss < 0.0)
          riskPct = MathAbs(brokerLoss) / equity * 100.0;
-      Print("[SYMBOL_RISK_MODEL_OK] symbol=" + symbol +
+      LogPrint("[SYMBOL_RISK_MODEL_OK] symbol=" + symbol +
             " | riskPct=" + DoubleToString(riskPct, 2) + "%" +
             " | equity=" + DoubleToString(equity, 2) +
-            " | leverage=" + DoubleToString(sp.accountLeverage, 1));
+            " | leverage=" + DoubleToString(sp.accountLeverage, 1), LOG_LEVEL_INFO);
    }
 
    return true;
@@ -536,14 +536,14 @@ bool SY_Initialize(string symbol)
    g_symProfileInitialized = false;
    SSymbolProfile sp = SY_RefreshProfile(symbol);
 
-   Print("[SYM_INTELLIGENCE_INIT] symbol=" + symbol +
+   LogPrint("[SYM_INTELLIGENCE_INIT] symbol=" + symbol +
          " | calcMode=" + IntegerToString(sp.calcMode) +
          " | class=" + EnumToString(sp.classification) +
-         " | valid=" + (sp.isValid ? "true" : "false"));
+         " | valid=" + (sp.isValid ? "true" : "false"), LOG_LEVEL_INFO);
 
    if(!sp.isValid)
    {
-      Print("[SYM_INTELLIGENCE_INIT] FAILED — symbol profile incomplete for " + symbol);
+      LogPrint("[SYM_INTELLIGENCE_INIT] FAILED — symbol profile incomplete for " + symbol, LOG_LEVEL_ERROR);
       return false;
    }
 
@@ -551,8 +551,8 @@ bool SY_Initialize(string symbol)
    string tradeabilityReason = "";
    if(!SY_ValidateTradeability(symbol, tradeabilityReason))
    {
-      Print("[SYM_INTELLIGENCE_INIT] TRADEABILITY_FAILED | reason=" + tradeabilityReason +
-            " | symbol=" + symbol);
+      LogPrint("[SYM_INTELLIGENCE_INIT] TRADEABILITY_FAILED | reason=" + tradeabilityReason +
+            " | symbol=" + symbol, LOG_LEVEL_WARN);
    }
 
    return true;
@@ -565,12 +565,12 @@ void SY_PrintProfile()
 {
    if(!g_symProfileInitialized)
    {
-      Print("[SYM_PROFILE] Not initialized");
+      LogPrint("[SYM_PROFILE] Not initialized", LOG_LEVEL_WARN);
       return;
    }
 
    SSymbolProfile sp = g_symProfile;
-   Print("[SYM_PROFILE] symbol=" + sp.symbol +
+   LogPrint("[SYM_PROFILE] symbol=" + sp.symbol +
          " | calcMode=" + IntegerToString(sp.calcMode) +
          " | class=" + EnumToString(sp.classification) +
          " | digits=" + IntegerToString(sp.digits) +
@@ -585,7 +585,7 @@ void SY_PrintProfile()
          " | margin=" + sp.marginCurrency +
          " | profit=" + sp.profitCurrency +
          " | leverage=" + DoubleToString(sp.accountLeverage, 1) +
-         " | valid=" + (sp.isValid ? "true" : "false"));
+         " | valid=" + (sp.isValid ? "true" : "false"), LOG_LEVEL_INFO);
 }
 
 //+------------------------------------------------------------------+
@@ -605,8 +605,8 @@ bool SY_ValidateTradeability(
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
    {
       failReason = "TERMINAL_TRADE_DISABLED";
-      Print("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
-            " | reason=" + failReason + " | owner=Terminal");
+      LogPrint("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
+            " | reason=" + failReason + " | owner=Terminal", LOG_LEVEL_ERROR);
       return false;
    }
 
@@ -614,8 +614,8 @@ bool SY_ValidateTradeability(
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
    {
       failReason = "EA_TRADE_DISABLED";
-      Print("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
-            " | reason=" + failReason + " | owner=MetaEditor");
+      LogPrint("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
+            " | reason=" + failReason + " | owner=MetaEditor", LOG_LEVEL_ERROR);
       return false;
    }
 
@@ -623,8 +623,8 @@ bool SY_ValidateTradeability(
    if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
    {
       failReason = "ACCOUNT_TRADE_DISABLED";
-      Print("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
-            " | reason=" + failReason + " | owner=Broker");
+      LogPrint("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
+            " | reason=" + failReason + " | owner=Broker", LOG_LEVEL_ERROR);
       return false;
    }
 
@@ -633,9 +633,9 @@ bool SY_ValidateTradeability(
    if(tmode != SYMBOL_TRADE_MODE_FULL)
    {
       failReason = (tmode == SYMBOL_TRADE_MODE_DISABLED) ? "SYMBOL_TRADE_DISABLED" : "SYMBOL_TRADE_READONLY";
-      Print("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
+      LogPrint("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
             " | reason=" + failReason + " | tradeMode=" + IntegerToString(tmode) +
-            " | owner=SymbolProperties");
+            " | owner=SymbolProperties", LOG_LEVEL_ERROR);
       return false;
    }
 
@@ -644,8 +644,8 @@ bool SY_ValidateTradeability(
    if(fillingModes == 0)
    {
       failReason = "NO_FILLING_MODE";
-      Print("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
-            " | reason=" + failReason + " | owner=SymbolProperties");
+      LogPrint("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
+            " | reason=" + failReason + " | owner=SymbolProperties", LOG_LEVEL_ERROR);
       return false;
    }
 
@@ -654,10 +654,10 @@ bool SY_ValidateTradeability(
    if(TimeCurrent() - lastTick > 300)
    {
       failReason = "STALE_TICK_DATA";
-      Print("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
+      LogPrint("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
             " | reason=" + failReason + " | lastTickSecsAgo=" +
             IntegerToString(TimeCurrent() - lastTick) +
-            " | owner=MarketWatch");
+            " | owner=MarketWatch", LOG_LEVEL_ERROR);
       return false;
    }
 
@@ -667,9 +667,9 @@ bool SY_ValidateTradeability(
    if(bid <= 0.0 || ask <= 0.0 || ask <= bid)
    {
       failReason = "INVALID_BID_ASK";
-      Print("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
+      LogPrint("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
             " | reason=" + failReason + " | bid=" + DoubleToString(bid, 6) +
-            " | ask=" + DoubleToString(ask, 6) + " | owner=MarketWatch");
+            " | ask=" + DoubleToString(ask, 6) + " | owner=MarketWatch", LOG_LEVEL_ERROR);
       return false;
    }
 
@@ -680,62 +680,62 @@ bool SY_ValidateTradeability(
       if(sp.contractSize <= 0.0)
       {
          failReason = "INVALID_CONTRACT_SIZE";
-         Print("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
-               " | reason=" + failReason + " | contractSize=" +
-               DoubleToString(sp.contractSize, 4) + " | owner=SymbolIntelligence");
+          LogPrint("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
+                " | reason=" + failReason + " | contractSize=" +
+                DoubleToString(sp.contractSize, 4) + " | owner=SymbolIntelligence", LOG_LEVEL_ERROR);
          return false;
       }
 
       if(sp.tickValue <= 0.0)
       {
          failReason = "TICKVALUE_ZERO";
-         Print("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
-               " | reason=" + failReason + " | calcMode=" +
-               IntegerToString(sp.calcMode) + " | owner=SymbolIntelligence");
+          LogPrint("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
+                " | reason=" + failReason + " | calcMode=" +
+                IntegerToString(sp.calcMode) + " | owner=SymbolIntelligence", LOG_LEVEL_ERROR);
          return false;
       }
 
       if(sp.tickSize <= 0.0)
       {
          failReason = "TICKSIZE_ZERO";
-         Print("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
-               " | reason=" + failReason + " | owner=SymbolIntelligence");
-         return false;
-      }
+          LogPrint("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
+                " | reason=" + failReason + " | owner=SymbolIntelligence", LOG_LEVEL_ERROR);
+          return false;
+       }
 
-      // 9. Spread sanity (class-aware)
-      int spread = sp.spread;
-      int maxSpread = 3000;
-      if(sp.classification == SYM_CLASS_CRYPTO)
-         maxSpread = 30000;
-      else if(sp.classification == SYM_CLASS_SYNTHETIC)
-         maxSpread = 50000;
-      else if(sp.classification == SYM_CLASS_CFD_INDEX || sp.calcMode == SY_CALC_CFDINDEX)
-         maxSpread = 10000;
-      else if(sp.classification == SYM_CLASS_METAL_SPOT)
-         maxSpread = 8000;
-      else if(sp.calcMode == SY_CALC_CFDLEVERAGE)
-         maxSpread = 8000;
+       // 9. Spread sanity (class-aware)
+       int spread = sp.spread;
+       int maxSpread = 3000;
+       if(sp.classification == SYM_CLASS_CRYPTO)
+          maxSpread = 30000;
+       else if(sp.classification == SYM_CLASS_SYNTHETIC)
+          maxSpread = 50000;
+       else if(sp.classification == SYM_CLASS_CFD_INDEX || sp.calcMode == SY_CALC_CFDINDEX)
+          maxSpread = 10000;
+       else if(sp.classification == SYM_CLASS_METAL_SPOT)
+          maxSpread = 8000;
+       else if(sp.calcMode == SY_CALC_CFDLEVERAGE)
+          maxSpread = 8000;
 
-      if(spread > maxSpread)
-      {
-         failReason = "SPREAD_TOO_WIDE";
-         Print("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
-               " | reason=" + failReason + " | spread=" + IntegerToString(spread) +
-               " | max=" + IntegerToString(maxSpread) +
-               " | class=" + EnumToString(sp.classification) +
-               " | owner=SpreadGate");
+       if(spread > maxSpread)
+       {
+          failReason = "SPREAD_TOO_WIDE";
+          LogPrint("[SYMBOL_TRADEABILITY_FAIL] symbol=" + symbol +
+                " | reason=" + failReason + " | spread=" + IntegerToString(spread) +
+                " | max=" + IntegerToString(maxSpread) +
+                " | class=" + EnumToString(sp.classification) +
+                " | owner=SpreadGate", LOG_LEVEL_ERROR);
          return false;
       }
    }
 
-   Print("[SYMBOL_TRADEABILITY_OK] symbol=" + symbol +
+   LogPrint("[SYMBOL_TRADEABILITY_OK] symbol=" + symbol +
          " | calcMode=" + (sp.isValid ? IntegerToString(sp.calcMode) : "N/A") +
          " | bid=" + DoubleToString(bid, 6) +
          " | ask=" + DoubleToString(ask, 6) +
          " | spread=" + (sp.isValid ? IntegerToString(sp.spread) : "N/A") +
          " | fillingModes=" + IntegerToString(fillingModes) +
-         " | owner=SymbolIntelligence");
+         " | owner=SymbolIntelligence", LOG_LEVEL_INFO);
 
    return true;
 }

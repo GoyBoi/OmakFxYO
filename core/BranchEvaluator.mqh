@@ -27,7 +27,7 @@
 #include <OmakFxYO/core/UniversalConfig.mqh>    // Symbol-class volatility config
 #include <OmakFxYO/core/SymbolClassVolatility.mqh> // Symbol-class ATR multipliers
 #include <OmakFxYO/core/FractalNarrative.mqh>   // Fractal narrative (v52.5+)
-#include <OmakFxYO/core/RiskManager.mqh>        // RM_ComputeEntryTFSL — Manipulation Leg SL (§V)
+#include <OmakFxYO/core/RiskManager.mqh>        // C2_SL_Calculator / C3_SL_Calculator / C4_SL_Calculator — Species-specific SL calculators (§V)
 
 //+------------------------------------------------------------------+
 //| SCISDResult — CISD Detection Result                            |
@@ -298,13 +298,16 @@ bool IsGuidInStoreSafe(ulong guid, ENUM_EXECUTION_BRANCH branch)
 {
     if(guid == 0) return false;
     
-    // Base index: 0 for Branch A, MAX_TOTAL_SIGNALS_PER_BRANCH for Branch B
-    int baseIdx = (branch == BRANCH_INTRADAY) ? 0 : MAX_TOTAL_SIGNALS_PER_BRANCH; 
+    int c2Base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C2_SIGNALS_PER_BRANCH;
+    int c3Base = (branch == BRANCH_INTRADAY) ? 0 : MAX_C3_SIGNALS_PER_BRANCH;
     
-    for(int i = 0; i < MAX_TOTAL_SIGNALS_PER_BRANCH; i++)
+    for(int i = 0; i < MAX_C2_SIGNALS_PER_BRANCH; i++)
     {
-        if(g_hasActiveSignal[baseIdx + i] && g_activeSignal[baseIdx + i].m_guid == guid)
-            return true;
+        if(g_activeC2[c2Base + i].m_guid == guid) return true;
+    }
+    for(int i = 0; i < MAX_C3_SIGNALS_PER_BRANCH; i++)
+    {
+        if(g_activeC3[c3Base + i].m_guid == guid) return true;
     }
     return false;
 }
@@ -956,15 +959,27 @@ datetime lastWarmup = g_sseContext.warmupTimestamp;
     SLockedSignal activeSignal;
     ZeroMemory(activeSignal);
     bool hasActiveSignal = false;
-    int baseIdx = GetSignalStoreIndex(ctx.branch);
-    for(int i = 0; i < MAX_TOTAL_SIGNALS_PER_BRANCH; i++)
+    int c2Base = GetSignalStoreIndex(ctx.branch, CLOSURE_C2);
+    int c3Base = GetSignalStoreIndex(ctx.branch, CLOSURE_C3);
+    for(int i = 0; i < MAX_C2_SIGNALS_PER_BRANCH; i++)
     {
-        int idx = baseIdx + i;
-        if(g_hasActiveSignal[idx] && g_activeSignal[idx].m_guid != 0)
+        if(g_activeC2[c2Base + i].m_guid != 0)
         {
-            activeSignal = g_activeSignal[idx];
+            activeSignal = g_activeC2[c2Base + i];
             hasActiveSignal = true;
             break;
+        }
+    }
+    if(!hasActiveSignal)
+    {
+        for(int i = 0; i < MAX_C3_SIGNALS_PER_BRANCH; i++)
+        {
+            if(g_activeC3[c3Base + i].m_guid != 0)
+            {
+                activeSignal = g_activeC3[c3Base + i];
+                hasActiveSignal = true;
+                break;
+            }
         }
     }
 
@@ -1028,14 +1043,26 @@ datetime lastWarmup = g_sseContext.warmupTimestamp;
           // BranchEvaluator does NOT own executionMode - log discrepancy for forensics only
           if(ctx.mode.mode != MODE_NONE && ctx.cachedMode != MODE_NONE)
           {
-              int updateBaseIdx = GetSignalStoreIndex(ctx.branch);
-              for(int si = 0; si < MAX_TOTAL_SIGNALS_PER_BRANCH; si++)
+              int c2BaseUpd = GetSignalStoreIndex(ctx.branch, CLOSURE_C2);
+              int c3BaseUpd = GetSignalStoreIndex(ctx.branch, CLOSURE_C3);
+              for(int si = 0; si < MAX_C2_SIGNALS_PER_BRANCH; si++)
               {
-                  int sidx = updateBaseIdx + si;
-                  if(g_hasActiveSignal[sidx] && g_activeSignal[sidx].executionMode != ctx.mode.mode)
+                  int sidx = c2BaseUpd + si;
+                  if(g_activeC2[sidx].m_guid != 0 && g_activeC2[sidx].executionMode != ctx.mode.mode)
                   {
-                      LogPrint("[MODE_DISCREPANCY] Mode mismatch detected | GUID=" + IntegerToString(g_activeSignal[sidx].m_guid) +
-                               " | signal.executionMode=" + IntegerToString(g_activeSignal[sidx].executionMode) +
+                      LogPrint("[MODE_DISCREPANCY] Mode mismatch detected | GUID=" + IntegerToString(g_activeC2[sidx].m_guid) +
+                               " | signal.executionMode=" + IntegerToString(g_activeC2[sidx].executionMode) +
+                               " | ctx.mode.mode=" + IntegerToString(ctx.mode.mode) +
+                               " | owner=LockedSignal (read-only)", LOG_LEVEL_WARN);
+                  }
+              }
+              for(int si = 0; si < MAX_C3_SIGNALS_PER_BRANCH; si++)
+              {
+                  int sidx = c3BaseUpd + si;
+                  if(g_activeC3[sidx].m_guid != 0 && g_activeC3[sidx].executionMode != ctx.mode.mode)
+                  {
+                      LogPrint("[MODE_DISCREPANCY] Mode mismatch detected | GUID=" + IntegerToString(g_activeC3[sidx].m_guid) +
+                               " | signal.executionMode=" + IntegerToString(g_activeC3[sidx].executionMode) +
                                " | ctx.mode.mode=" + IntegerToString(ctx.mode.mode) +
                                " | owner=LockedSignal (read-only)", LOG_LEVEL_WARN);
                   }
@@ -1653,278 +1680,364 @@ SContextTracker g_contextTracker;
  * @param symbol Trading symbol
  * @return true if all three tiers pass, false otherwise
  */
+//+------------------------------------------------------------------+
+//| ValidateTopDownContext - Isolated per registry                  |
+//| Three-tier validation (Bias → CISD → POI) + affordability gate   |
+//| C2 and C3/C4 processed in separate loops with species isolation. |
+//+------------------------------------------------------------------+
 bool ValidateTopDownContext(BranchContext &ctx, const string symbol)
 {
-    ENUM_EXECUTION_BRANCH branch = ctx.branch;
-    int baseIdx = GetSignalStoreIndex(branch);
+   bool anyValid = false;
+   ENUM_EXECUTION_BRANCH branch = ctx.branch;
+   int c2BaseV = GetSignalStoreIndex(branch, CLOSURE_C2);
+   int c3BaseV = GetSignalStoreIndex(branch, CLOSURE_C3);
 
-    for(int i = 0; i < MAX_TOTAL_SIGNALS_PER_BRANCH; i++)
-    {
-        int idx = baseIdx + i;
-        if(!g_hasActiveSignal[idx])
-            continue;
+   // ═══════════════════════════════════════════════════════════════
+   // C2 Registry — only CLOSURE_C2 signals
+   // ═══════════════════════════════════════════════════════════════
+   for(int i = c2BaseV; i < c2BaseV + MAX_C2_SIGNALS_PER_BRANCH; i++)
+   {
+      if(g_activeC2[i].m_guid == 0 || g_activeC2[i].stage == STAGE_NONE) continue;
 
-        SLockedSignal sig = g_activeSignal[idx];
+      // Species safety gate: reject any non-C2 signal in C2 registry
+      if(g_activeC2[i].closureType != CLOSURE_C2)
+      {
+         LogPrint("[VALIDATION_CLEAN] C2 registry slot contains non-C2 type=" +
+                  EnumToString(g_activeC2[i].closureType) + " | GUID=" +
+                  IntegerToString(g_activeC2[i].m_guid), LOG_LEVEL_WARN);
+         g_activeC2[i].Reset();
+         continue;
+      }
 
-        // Skip expired/executed signals, or signals already past the gate
-        if(sig.stage == STAGE_EXECUTED || sig.stage == STAGE_EXPIRED || sig.stage == STAGE_NONE)
-            continue;
+      SLockedSignal sig = g_activeC2[i];
 
-        // Skip signals already in READY state (already passed all gates)
-        if(sig.stage == STAGE_READY)
-            continue;
+      if(sig.stage == STAGE_EXECUTED || sig.stage == STAGE_EXPIRED || sig.stage == STAGE_NONE)
+         continue;
+      if(sig.stage == STAGE_READY)
+      {
+         anyValid = true;
+         continue;
+      }
 
-        // Determine trade direction from signal
-        ENUM_DIRECTION signalDir = sig.direction;
-        if(signalDir == DIRECTION_NONE)
-            continue;
+      ENUM_DIRECTION signalDir = sig.direction;
+      if(signalDir == DIRECTION_NONE) continue;
+      bool isBullish = (signalDir == DIRECTION_BUY);
 
-        bool isBullish = (signalDir == DIRECTION_BUY);
+      bool tier1Pass = false, tier2Pass = false, tier3Pass = false;
 
-        // REGRESSION_GUARD_STAGE_FSM: Explicit tier-tracking booleans for top-down gate
-        bool tier1Pass = false;
-        bool tier2Pass = false;
-        bool tier3Pass = false;
+      // TIER 1: D1 Bias — informational for C2
+      BiasType d1Bias = DailyClosureBias(symbol);
+      LogPrint("[C2_CONTEXT] GUID=" + IntegerToString(sig.m_guid) +
+               " | C2 Anticipation | signal=" + (isBullish ? "BULL" : "BEAR") +
+               " | d1Bias=" + EnumToString(d1Bias), LOG_LEVEL_INFO);
+      tier1Pass = true;
 
-        // ═══════════════════════════════════════════════════════════════
-        // TIER 1 — D1 Bias Check
-        // REGRESSION_GUARD_C3: C3-upgraded signals take independent C3 gate path
-        // ═══════════════════════════════════════════════════════════════
-        BiasType d1Bias = DailyClosureBias(symbol);
-        bool tier1ModeCheck = true;
+      // TIER 2: HTF CISD confirmation
+      ENUM_TIMEFRAMES htfTf = ctx.structureTF;
+      SSE_CISDResult htfCisdResult = SSE_DetectCISD(symbol, htfTf, signalDir, 20);
+      bool htfCisd = htfCisdResult.confirmed;
+      bool htfClosureAligned = false;
 
-        // Confirmation mode (C3): D1 bias alignment is REQUIRED
-        // REGRESSION_GUARD_C3: closureType already set to CLOSURE_C3 for upgraded signals
-      if((sig.closureType == CLOSURE_C3) || ctx.mode.mode == MODE_CONFIRMATION)
-        {
-            LogPrint("[C3_CONTEXT] GUID=" + IntegerToString(sig.m_guid) +
-                     " checking D1 bias=" + EnumToString(d1Bias) +
-                     " signal_dir=" + (isBullish ? "BUY" : "SELL"), LOG_LEVEL_INFO);
+      ENUM_TIMEFRAMES slItf = (sig.branchId == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4;
+      sig.stop_loss = C2_SL_Calculator(sig.direction == DIRECTION_BUY ? 1 : -1, sig.entry_price, slItf, InpMinStopBuffer);
 
-            tier1ModeCheck = (isBullish && d1Bias == BIAS_BULLISH) ||
-                             (!isBullish && d1Bias == BIAS_BEARISH);
+      if(ctx.structureSignal.valid)
+      {
+         htfClosureAligned = (isBullish && ctx.structureSignal.is_bullish) ||
+                             (!isBullish && !ctx.structureSignal.is_bullish);
+      }
 
-            if(!tier1ModeCheck)
+      if(!htfCisd && !htfClosureAligned)
+      {
+         LogPrint("[C2_REJECT] HTF_CONFIRMATION_MISSING | GUID=" + IntegerToString(sig.m_guid) +
+                  " | htfTf=" + EnumToString(htfTf), LOG_LEVEL_WARN);
+         g_activeC2[i].TransitionStage(STAGE_EXPIRED);
+         LogPrint("[CONTEXT_EXPIRED] GUID=" + IntegerToString(sig.m_guid) +
+                  " | reason=C2_Tier2_FAIL | htfTf=" + EnumToString(htfTf), LOG_LEVEL_INFO);
+         continue;
+      }
+
+      LogPrint("[CONTEXT] C2 Tier2_PASS | GUID=" + IntegerToString(sig.m_guid) +
+               " | htfTf=" + EnumToString(htfTf), LOG_LEVEL_INFO);
+      tier2Pass = true;
+
+      // TIER 3: POI validation
+      ENUM_TIMEFRAMES entryTf = ctx.entryTF;
+      bool poiAvailable = (sig.entry_price > 0.0);
+      bool poiWaitActive = (sig.stage == STAGE_WAITING_FOR_POI);
+
+      if(!poiAvailable && !poiWaitActive)
+      {
+         LogPrint("[C2_CONTEXT] Tier3_WAIT | GUID=" + IntegerToString(sig.m_guid) +
+                  " | POI not yet available | entryTf=" + EnumToString(entryTf), LOG_LEVEL_INFO);
+         continue;
+      }
+      tier3Pass = (poiAvailable || poiWaitActive);
+      LogPrint("[CONTEXT] C2 Tier3_PASS | GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_INFO);
+
+      // Pre-STAGE_READY affordability gate
+      if(tier1Pass && tier2Pass && tier3Pass && sig.stop_loss > 0.0 && sig.entry_price > 0.0)
+      {
+         SSymbolProfile spAR = SY_GetProfile(_Symbol);
+         double minLotAR = spAR.volumeMin;
+         double accountEqAR = AccountInfoDouble(ACCOUNT_EQUITY);
+         double riskAmtAR = accountEqAR * (InpRiskPercent / 100.0);
+
+         if(minLotAR > 0.0 && accountEqAR > 0.0 && riskAmtAR > 0.0)
+         {
+            double slDistAR = MathAbs(sig.entry_price - sig.stop_loss);
+            double minRiskAR = 0.0;
+
+            if(spAR.tickValue > 0.0 && spAR.tickSize > 0.0 && slDistAR > 0.0)
             {
-                LogPrint("[C3_REJECT] D1_BIAS_MISMATCH | GUID=" + IntegerToString(sig.m_guid) +
-                         " D1=" + EnumToString(d1Bias) +
-                         " signal=" + (isBullish ? "BUY" : "SELL"), LOG_LEVEL_WARN);
-                g_activeSignal[idx].TransitionStage(STAGE_EXPIRED);
-                LogPrint("[CONTEXT_EXPIRED] GUID=" + IntegerToString(sig.m_guid) +
-                         " | reason=C3_Tier1_FAIL | signal=" + (isBullish ? "BULL" : "BEAR"), LOG_LEVEL_INFO);
-                continue;
+               minRiskAR = (slDistAR / spAR.tickSize) * spAR.tickValue * minLotAR;
             }
 
-            // REGRESSION_GUARD_C3_BIAS: Log when C3 passes D1 bias alignment
-            LogPrint("[C3_BIAS_ALIGN_PASS] GUID=" + IntegerToString(sig.m_guid) +
-                     " | signal=" + (isBullish ? "BULL" : "BEAR") +
-                     " | d1Bias=" + EnumToString(d1Bias) +
-                     " | Tier1 C3 confirmation bias check passed", LOG_LEVEL_INFO);
-        }
-        else
-        {
-            // Anticipation mode (C2): D1 bias is informational only
-            LogPrint("[CONTEXT] Tier1_INFO | GUID=" + IntegerToString(sig.m_guid) +
-                     " | C2 Anticipation | signal=" + (isBullish ? "BULL" : "BEAR") +
-                     " | d1Bias=" + EnumToString(d1Bias), LOG_LEVEL_INFO);
-        }
-
-        LogPrint("[CONTEXT] Tier1_PASS | GUID=" + IntegerToString(sig.m_guid) +
-                 " | d1Bias=" + EnumToString(d1Bias) +
-                 " | signal=" + (isBullish ? "BULL" : "BEAR"), LOG_LEVEL_INFO);
-        tier1Pass = true;
-
-        // ═══════════════════════════════════════════════════════════════
-        // TIER 2 — HTF Confirmation Check
-        // ═══════════════════════════════════════════════════════════════
-        ENUM_TIMEFRAMES htfTf = ctx.structureTF;
-        SSE_CISDResult htfCisdResult = SSE_DetectCISD(symbol, htfTf, signalDir, 20);
-        bool htfCisd = htfCisdResult.confirmed;
-        bool htfClosureAligned = false;
-
-        // VERBATIM REPAIR: Manipulation Leg SL (§V) — Entry TF extreme
-        sig.stop_loss = RM_ComputeEntryTFSL(symbol, sig.branchId, sig.direction == DIRECTION_BUY, sig.entry_price);
-
-        // Also check the structure signal for alignment
-        if(ctx.structureSignal.valid)
-        {
-            htfClosureAligned = (isBullish && ctx.structureSignal.is_bullish) ||
-                                (!isBullish && !ctx.structureSignal.is_bullish);
-        }
-
-      if(sig.closureType == CLOSURE_C3)
-        {
-            LogPrint("[C3_CONTEXT] GUID=" + IntegerToString(sig.m_guid) +
-                     " HTF_CISD=" + (htfCisd ? "PASS" : "WAIT"), LOG_LEVEL_INFO);
-
-            if(htfCisd)
-                LogPrint(StringFormat("[CISD_CONFIRMED] C3 context gate | GUID=%I64u | HTF_CISD=CONFIRMED", sig.m_guid), LOG_LEVEL_INFO);
-        }
-
-        if(!htfCisd && !htfClosureAligned)
-        {
-            if(sig.closureType == CLOSURE_C3)
+            if(minRiskAR > 0.0)
             {
-                LogPrint("[C3_REJECT] HTF_CONFIRMATION_MISSING | GUID=" + IntegerToString(sig.m_guid) +
-                         " | htfTf=" + EnumToString(htfTf), LOG_LEVEL_WARN);
-                g_activeSignal[idx].TransitionStage(STAGE_WAITING_FOR_CISD);
-                LogPrint("[CONTEXT_EXPIRED] GUID=" + IntegerToString(sig.m_guid) +
-                         " | reason=C3_Tier2_WAIT | htfTf=" + EnumToString(htfTf), LOG_LEVEL_INFO);
-                continue;
+               if(minRiskAR > riskAmtAR)
+               {
+                  LogPrint("[AFFORD_CHECK_BLOCK] C2 | GUID=" + IntegerToString(sig.m_guid) +
+                           " | minRisk=" + DoubleToString(minRiskAR, 2) +
+                           " > budget=" + DoubleToString(riskAmtAR, 2), LOG_LEVEL_WARN);
+                  g_activeC2[i].TransitionStage(STAGE_EXPIRED);
+                  continue;
+               }
+               LogPrint("[AFFORD_CHECK_PASS] C2 | GUID=" + IntegerToString(sig.m_guid) +
+                        " | minRisk=" + DoubleToString(minRiskAR, 2) +
+                        " <= budget=" + DoubleToString(riskAmtAR, 2), LOG_LEVEL_INFO);
             }
-            LogPrint("[CONTEXT] Tier2_FAIL | GUID=" + IntegerToString(sig.m_guid) +
-                     " | HTF_CONFIRMATION_MISSING" +
-                     " | htfTf=" + EnumToString(htfTf) +
-                     " | cisd=" + (htfCisd ? "T" : "F") +
-                     " | closureAligned=" + (htfClosureAligned ? "T" : "F") +
-                     " | action=REJECTED", LOG_LEVEL_WARN);
-            g_activeSignal[idx].TransitionStage(STAGE_EXPIRED);
-            LogPrint("[CONTEXT_EXPIRED] GUID=" + IntegerToString(sig.m_guid) +
-                     " | reason=Tier2_FAIL | htfTf=" + EnumToString(htfTf), LOG_LEVEL_INFO);
+         }
+      }
+
+      // Pre-STAGE_READY: Check if HTF target already hit before entry (§XIX)
+      {
+          ENUM_TIMEFRAMES htfTargetTF = (branch == BRANCH_SWING) ? PERIOD_W1 : PERIOD_D1;
+          double htfLevel = (signalDir == DIRECTION_BUY)
+              ? iHigh(_Symbol, htfTargetTF, 1)
+              : iLow(_Symbol, htfTargetTF, 1);
+          double currentPrice = (signalDir == DIRECTION_BUY)
+              ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+              : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+          if(htfLevel > 0.0 &&
+             ((signalDir == DIRECTION_BUY && currentPrice >= htfLevel) ||
+              (signalDir == DIRECTION_SELL && currentPrice <= htfLevel)))
+          {
+              LogPrint("[HTF_TARGET_HIT] GUID=" + IntegerToString(sig.m_guid) +
+                       " | dir=" + EnumToString(signalDir) +
+                       " | target=" + DoubleToString(htfLevel, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)) +
+                       " | price=" + DoubleToString(currentPrice, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)) +
+                       " | TF=" + EnumToString(htfTargetTF), LOG_LEVEL_WARN);
+              g_activeC2[i].TransitionStage(STAGE_EXPIRED);
+              LogPrint(StringFormat("[HTF_TARGET_HIT_EXPIRED] GUID=%I64u | reason=HTF_TARGET_HIT_BEFORE_ENTRY", sig.m_guid), LOG_LEVEL_INFO);
+              continue;
+          }
+      }
+
+      // Promote to STAGE_READY if all tiers passed
+      if((g_activeC2[i].stage == STAGE_WAITING_FOR_POI || g_activeC2[i].stage == STAGE_WAITING_FOR_CISD)
+         && tier1Pass && tier2Pass && tier3Pass)
+      {
+         g_activeC2[i].TransitionStage(STAGE_READY);
+         LogPrint(StringFormat("[STAGE_READY] C2 | GUID=%I64u branch=%s", sig.m_guid,
+                  (branch==BRANCH_INTRADAY)?"A (D1-H1-M5)":"B (D1-H4-M15)"), LOG_LEVEL_INFO);
+      }
+
+      anyValid = true;
+   }
+
+   // ═══════════════════════════════════════════════════════════════
+   // C3/C4 Registry — only CLOSURE_C3 and CLOSURE_C4 signals
+   // ═══════════════════════════════════════════════════════════════
+   for(int i = c3BaseV; i < c3BaseV + MAX_C3_SIGNALS_PER_BRANCH; i++)
+   {
+      if(g_activeC3[i].m_guid == 0 || g_activeC3[i].stage == STAGE_NONE) continue;
+
+      // Species safety gate: reject C2 in C3/C4 registry
+      if(g_activeC3[i].closureType != CLOSURE_C3 && g_activeC3[i].closureType != CLOSURE_C4)
+      {
+         LogPrint("[VALIDATION_CLEAN] C3 registry contains non-C3/C4 type=" +
+                  EnumToString(g_activeC3[i].closureType) + " | GUID=" +
+                  IntegerToString(g_activeC3[i].m_guid), LOG_LEVEL_WARN);
+         g_activeC3[i].Reset();
+         continue;
+      }
+
+      SLockedSignal sig = g_activeC3[i];
+
+      if(sig.stage == STAGE_EXECUTED || sig.stage == STAGE_EXPIRED || sig.stage == STAGE_NONE)
+         continue;
+      if(sig.stage == STAGE_READY)
+      {
+         anyValid = true;
+         continue;
+      }
+
+      ENUM_DIRECTION signalDir = sig.direction;
+      if(signalDir == DIRECTION_NONE) continue;
+      bool isBullish = (signalDir == DIRECTION_BUY);
+
+      bool tier1Pass = false, tier2Pass = false, tier3Pass = false;
+
+      // TIER 1: D1 Bias — mandatory for C3/C4 (Confirmation mode)
+      BiasType d1Bias = DailyClosureBias(symbol);
+      bool tier1ModeCheck = (isBullish && d1Bias == BIAS_BULLISH) ||
+                            (!isBullish && d1Bias == BIAS_BEARISH);
+
+      LogPrint("[C3_CONTEXT] GUID=" + IntegerToString(sig.m_guid) +
+               " checking D1 bias=" + EnumToString(d1Bias) +
+               " signal_dir=" + (isBullish ? "BUY" : "SELL"), LOG_LEVEL_INFO);
+
+      if(!tier1ModeCheck)
+      {
+         // Grace period: allow C3 signal to wait for D1 bias alignment
+         // before expiring. Uses TimeCurrent()-m_detectionTime anchored to
+         // structure TF bars (Law of Single-Clock Synchronization §XII).
+         int graceBars = (ctx.entryTF == PERIOD_M15)
+             ? MathMax(3, InpGraceBarsConfirmation / 3)
+             : InpGraceBarsConfirmation;
+         int structTFSeconds = PeriodSeconds(ctx.structureTF);
+         int ageBars = (structTFSeconds > 0 && sig.m_detectionTime > 0)
+             ? (int)((TimeCurrent() - sig.m_detectionTime) / structTFSeconds)
+             : 0;
+         if(ageBars < graceBars)
+         {
+            LogPrint("[C3_TIER1_GRACE] GUID=" + IntegerToString(sig.m_guid) +
+                     " | ageBars=" + IntegerToString(ageBars) +
+                     " | graceBars=" + IntegerToString(graceBars) +
+                     " | D1 bias mismatch, within grace period", LOG_LEVEL_INFO);
             continue;
-        }
+         }
 
-        LogPrint("[CONTEXT] Tier2_PASS | GUID=" + IntegerToString(sig.m_guid) +
-                 " | htfTf=" + EnumToString(htfTf) +
-                 " | cisd=" + (htfCisd ? "T" : "F") +
-                 " | closure=" + (htfClosureAligned ? "T" : "F"), LOG_LEVEL_INFO);
-        tier2Pass = true;
+         LogPrint("[C3_REJECT] D1_BIAS_MISMATCH | GUID=" + IntegerToString(sig.m_guid) +
+                  " D1=" + EnumToString(d1Bias) +
+                  " signal=" + (isBullish ? "BUY" : "SELL"), LOG_LEVEL_WARN);
+         g_activeC3[i].TransitionStage(STAGE_EXPIRED);
+         LogPrint("[CONTEXT_EXPIRED] GUID=" + IntegerToString(sig.m_guid) +
+                  " | reason=C3_Tier1_FAIL | signal=" + (isBullish ? "BULL" : "BEAR"), LOG_LEVEL_INFO);
+         continue;
+      }
+      LogPrint("[C3_BIAS_ALIGN_PASS] GUID=" + IntegerToString(sig.m_guid) +
+               " | signal=" + (isBullish ? "BULL" : "BEAR") +
+               " | d1Bias=" + EnumToString(d1Bias) +
+               " | Tier1 C3 confirmation bias check passed", LOG_LEVEL_INFO);
+      tier1Pass = true;
 
-        // ═══════════════════════════════════════════════════════════════
-        // TIER 3 — Entry/POI Validation (Entry TF)
-        // VERBATIM REPAIR: 3-Tier TF Mapping (§XVII)
-        // Tier 2 already confirmed CISD on Structure TF. Tier 3 operates
-        // on Entry TF for POI validation only — NO CISD check on Entry TF.
-        // ═══════════════════════════════════════════════════════════════
-        ENUM_TIMEFRAMES entryTf = ctx.entryTF;
+      // TIER 2: HTF CISD confirmation
+      ENUM_TIMEFRAMES htfTf = ctx.structureTF;
+      SSE_CISDResult htfCisdResult = SSE_DetectCISD(symbol, htfTf, signalDir, 20);
+      bool htfCisd = htfCisdResult.confirmed;
+      bool htfClosureAligned = false;
 
-        // VERBATIM REPAIR: Manipulation Leg SL (§V) — Entry TF extreme
-        sig.stop_loss = RM_ComputeEntryTFSL(symbol, sig.branchId, sig.direction == DIRECTION_BUY, sig.entry_price);
+      ENUM_TIMEFRAMES slItf = (sig.branchId == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4;
+      sig.stop_loss = C3_SL_Calculator(sig.direction == DIRECTION_BUY ? 1 : -1, sig.entry_price, slItf, InpMinStopBuffer);
 
-        // Tier 3: Verify POI is mapped (entry_price > 0) or signal is in POI-wait state
-        bool poiAvailable = (sig.entry_price > 0.0);
-        bool poiWaitActive = (sig.stage == STAGE_WAITING_FOR_POI);
+      if(ctx.structureSignal.valid)
+      {
+         htfClosureAligned = (isBullish && ctx.structureSignal.is_bullish) ||
+                             (!isBullish && !ctx.structureSignal.is_bullish);
+      }
 
-        if(!poiAvailable && !poiWaitActive)
-        {
-            LogPrint("[CONTEXT] Tier3_WAIT | GUID=" + IntegerToString(sig.m_guid) +
-                     " | POI not yet available" +
-                     " | entryTf=" + EnumToString(entryTf) +
-                     " | signal=" + (isBullish ? "BULL" : "BEAR") +
-                     " | stage=" + EnumToString(sig.stage), LOG_LEVEL_INFO);
-            continue;
-        }
+      if(!htfCisd && !htfClosureAligned)
+      {
+         LogPrint("[C3_REJECT] HTF_CONFIRMATION_MISSING | GUID=" + IntegerToString(sig.m_guid) +
+                  " | htfTf=" + EnumToString(htfTf), LOG_LEVEL_WARN);
+         g_activeC3[i].TransitionStage(STAGE_WAITING_FOR_CISD);
+         LogPrint("[CONTEXT_EXPIRED] GUID=" + IntegerToString(sig.m_guid) +
+                  " | reason=C3_Tier2_WAIT | htfTf=" + EnumToString(htfTf), LOG_LEVEL_INFO);
+         continue;
+      }
+      LogPrint("[CONTEXT] C3 Tier2_PASS | GUID=" + IntegerToString(sig.m_guid) +
+               " | htfTf=" + EnumToString(htfTf), LOG_LEVEL_INFO);
+      tier2Pass = true;
 
-        LogPrint("[CONTEXT] Tier3_PASS | GUID=" + IntegerToString(sig.m_guid) +
-                 " | POI validated on Entry TF " + EnumToString(entryTf) +
-                 " | stage=" + EnumToString(sig.stage), LOG_LEVEL_INFO);
-        tier3Pass = (poiAvailable || poiWaitActive);
+      // TIER 3: POI validation
+      ENUM_TIMEFRAMES entryTf = ctx.entryTF;
+      bool poiAvailable = (sig.entry_price > 0.0);
+      bool poiWaitActive = (sig.stage == STAGE_WAITING_FOR_POI);
 
-        // ═══════════════════════════════════════════════════════════════
-        // ALL THREE TIERS PASSED — Pre-STAGE_READY Affordability Gate
-        // ═══════════════════════════════════════════════════════════════
-        // Per AGENTS.md §VII and Prompt 5: Use OrderCalcProfit to verify
-        // that the structural SL distance is affordable under the
-        // synchronized 1% risk budget BEFORE allowing STAGE_READY.
-        // This prevents signals from reaching execution readiness with
-        // an unaffordable stop loss (the "hollow readiness" problem).
-        if(tier1Pass && tier2Pass && tier3Pass && sig.stop_loss > 0.0 && sig.entry_price > 0.0)
-        {
-            SSymbolProfile spAR = SY_GetProfile(_Symbol);
-            double minLotAR = spAR.volumeMin;
-            double accountEqAR = AccountInfoDouble(ACCOUNT_EQUITY);
-            double riskAmtAR = accountEqAR * (InpRiskPercent / 100.0);
+      if(!poiAvailable && !poiWaitActive)
+      {
+         LogPrint("[C3_CONTEXT] Tier3_WAIT | GUID=" + IntegerToString(sig.m_guid) +
+                  " | POI not yet available | entryTf=" + EnumToString(entryTf), LOG_LEVEL_INFO);
+         continue;
+      }
+      tier3Pass = (poiAvailable || poiWaitActive);
+      LogPrint("[CONTEXT] C3 Tier3_PASS | GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_INFO);
 
-            if(minLotAR > 0.0 && accountEqAR > 0.0 && riskAmtAR > 0.0)
+      // Pre-STAGE_READY affordability gate
+      if(tier1Pass && tier2Pass && tier3Pass && sig.stop_loss > 0.0 && sig.entry_price > 0.0)
+      {
+         SSymbolProfile spAR = SY_GetProfile(_Symbol);
+         double minLotAR = spAR.volumeMin;
+         double accountEqAR = AccountInfoDouble(ACCOUNT_EQUITY);
+         double riskAmtAR = accountEqAR * (InpRiskPercent / 100.0);
+
+         if(minLotAR > 0.0 && accountEqAR > 0.0 && riskAmtAR > 0.0)
+         {
+            double slDistAR = MathAbs(sig.entry_price - sig.stop_loss);
+            double minRiskAR = 0.0;
+
+            if(spAR.tickValue > 0.0 && spAR.tickSize > 0.0 && slDistAR > 0.0)
             {
-                // VERBATIM REPAIR: Manual tickValue/tickSize formula — no OrderCalcProfit
-                double tickValAR = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-                double tickSzAR = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-                double slDistAR = MathAbs(sig.entry_price - sig.stop_loss);
-                double minRiskAR = 0.0;
-
-                if(tickValAR > 0.0 && tickSzAR > 0.0 && slDistAR > 0.0)
-                {
-                    minRiskAR = (slDistAR / tickSzAR) * tickValAR * minLotAR;
-                }
-
-                if(minRiskAR > 0.0)
-                {
-                    LogPrint("[AFFORD_CHECK] GUID=" + IntegerToString(sig.m_guid) +
-                             " | entry=" + DoubleToString(sig.entry_price, _Digits) +
-                             " | sl=" + DoubleToString(sig.stop_loss, _Digits) +
-                             " | minLot=" + DoubleToString(minLotAR, 4) +
-                             " | minRisk=" + DoubleToString(minRiskAR, 2) +
-                             " | budget=" + DoubleToString(riskAmtAR, 2) +
-                             " | method=formula", LOG_LEVEL_INFO);
-
-                    if(minRiskAR > riskAmtAR)
-                    {
-                        LogPrint("[AFFORD_CHECK_BLOCK] GUID=" + IntegerToString(sig.m_guid) +
-                                 " | reason=MINLOT_RISK_EXCEEDS_BUDGET" +
-                                 " | minRisk=" + DoubleToString(minRiskAR, 2) +
-                                 " > budget=" + DoubleToString(riskAmtAR, 2), LOG_LEVEL_WARN);
-                        g_activeSignal[idx].TransitionStage(STAGE_EXPIRED);
-                        continue;
-                    }
-
-                    LogPrint("[AFFORD_CHECK_PASS] GUID=" + IntegerToString(sig.m_guid) +
-                             " | minRisk=" + DoubleToString(minRiskAR, 2) +
-                             " <= budget=" + DoubleToString(riskAmtAR, 2), LOG_LEVEL_INFO);
-                }
-                else
-                {
-                    LogPrint("[AFFORD_CHECK_FAIL] Manual calc failed for affordability check | GUID=" +
-                             IntegerToString(sig.m_guid) +
-                             " | tickVal=" + DoubleToString(tickValAR, 8) +
-                             " | tickSz=" + DoubleToString(tickSzAR, 8) +
-                             " | slDist=" + DoubleToString(slDistAR, _Digits), LOG_LEVEL_WARN);
-                }
+               minRiskAR = (slDistAR / spAR.tickSize) * spAR.tickValue * minLotAR;
             }
-        }
 
-        // ═══════════════════════════════════════════════════════════════
-        // ALL THREE TIERS PASSED
-        // ═══════════════════════════════════════════════════════════════
-        // REGRESSION_GUARD_STAGE_FSM: Branch-aware transition per TTFM top-down
-      bool isC3 = (sig.closureType == CLOSURE_C3);
-        if((g_activeSignal[idx].stage == STAGE_WAITING_FOR_POI || g_activeSignal[idx].stage == STAGE_WAITING_FOR_CISD)
-           && tier1Pass && tier2Pass && tier3Pass)
-        {
-            g_activeSignal[idx].TransitionStage(STAGE_READY);
-            PrintFormat("[STAGE_READY] GUID=%I64u branch=%s closure=%s", sig.m_guid,
-                        (branch==BRANCH_INTRADAY)?"A (D1-H1-M5)":"B (D1-H4-M15)",
-                        GetClosureTypeString(sig.closureType));
-
-            if(sig.closureType == CLOSURE_C3)
+            if(minRiskAR > 0.0)
             {
-               LogPrint("[C3_READY] GUID=" + IntegerToString(sig.m_guid) +
-                      " all context aligned -> STAGE_READY", LOG_LEVEL_INFO);
+               if(minRiskAR > riskAmtAR)
+               {
+                  LogPrint("[AFFORD_CHECK_BLOCK] C3 | GUID=" + IntegerToString(sig.m_guid) +
+                           " | minRisk=" + DoubleToString(minRiskAR, 2) +
+                           " > budget=" + DoubleToString(riskAmtAR, 2), LOG_LEVEL_WARN);
+                  g_activeC3[i].TransitionStage(STAGE_EXPIRED);
+                  continue;
+               }
+               LogPrint("[AFFORD_CHECK_PASS] C3 | GUID=" + IntegerToString(sig.m_guid) +
+                        " | minRisk=" + DoubleToString(minRiskAR, 2) +
+                        " <= budget=" + DoubleToString(riskAmtAR, 2), LOG_LEVEL_INFO);
             }
-        }
+         }
+      }
 
-        LogPrint("[CONTEXT] TOP_DOWN_CONTEXT_PASS | GUID=" + IntegerToString(sig.m_guid) +
-                 " | All three tiers confirmed | branch=" + (branch == BRANCH_INTRADAY ? "A" : "B"), LOG_LEVEL_INFO);
+      // Pre-STAGE_READY: Check if HTF target already hit before entry (§XIX)
+      {
+          ENUM_TIMEFRAMES htfTargetTF = (branch == BRANCH_SWING) ? PERIOD_W1 : PERIOD_D1;
+          double htfLevel = (signalDir == DIRECTION_BUY)
+              ? iHigh(_Symbol, htfTargetTF, 1)
+              : iLow(_Symbol, htfTargetTF, 1);
+          double currentPrice = (signalDir == DIRECTION_BUY)
+              ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+              : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+          if(htfLevel > 0.0 &&
+             ((signalDir == DIRECTION_BUY && currentPrice >= htfLevel) ||
+              (signalDir == DIRECTION_SELL && currentPrice <= htfLevel)))
+          {
+              LogPrint("[HTF_TARGET_HIT] GUID=" + IntegerToString(sig.m_guid) +
+                       " | dir=" + EnumToString(signalDir) +
+                       " | target=" + DoubleToString(htfLevel, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)) +
+                       " | price=" + DoubleToString(currentPrice, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)) +
+                       " | TF=" + EnumToString(htfTargetTF), LOG_LEVEL_WARN);
+              g_activeC3[i].TransitionStage(STAGE_EXPIRED);
+              LogPrint(StringFormat("[HTF_TARGET_HIT_EXPIRED] GUID=%I64u | reason=HTF_TARGET_HIT_BEFORE_ENTRY", sig.m_guid), LOG_LEVEL_INFO);
+              continue;
+          }
+      }
 
-        // Populate context tracker for telemetry exposure
-        g_contextTracker.d1Bias = d1Bias;
-        g_contextTracker.htfCisdConfirmed = htfCisd;
-        g_contextTracker.ltfCisdConfirmed = poiAvailable;
-        g_contextTracker.activeTier = 3;
+      // Promote to STAGE_READY if all tiers passed
+      if((g_activeC3[i].stage == STAGE_WAITING_FOR_POI || g_activeC3[i].stage == STAGE_WAITING_FOR_CISD)
+         && tier1Pass && tier2Pass && tier3Pass)
+      {
+         g_activeC3[i].TransitionStage(STAGE_READY);
+         string cType = (sig.closureType == CLOSURE_C3) ? "C3" : "C4";
+         LogPrint(StringFormat("[STAGE_READY] " + cType + " | GUID=%I64u branch=%s", sig.m_guid,
+                  (branch==BRANCH_INTRADAY)?"A (D1-H1-M5)":"B (D1-H4-M15)"), LOG_LEVEL_INFO);
+      }
 
-        if(htfCisd)
-            LogPrint(StringFormat("[CISD_CONFIRMED] C3 top-down gate | GUID=%I64u | HTF_CISD=CONFIRMED", sig.m_guid), LOG_LEVEL_INFO);
-    }
+      anyValid = true;
+   }
 
-    // Tier gate telemetry exposure
-    string d1BiasStr = (g_contextTracker.d1Bias == BIAS_BULLISH) ? "BULLISH" : ((g_contextTracker.d1Bias == BIAS_BEARISH) ? "BEARISH" : "ORDERFLOW_FLUID");
-    string htfCisdStr = g_contextTracker.htfCisdConfirmed ? "CONFIRMED" : "WAITING_STRUCT_SHIFT";
-    string ltfCisdStr = g_contextTracker.ltfCisdConfirmed ? "ALIGN_VALID" : "NO_ALIGNMENT";
-
-    LogPrint("[CONTEXT] Top-Down Gate Passed | D1_BIAS=" + d1BiasStr + " | HTF_CISD=" + htfCisdStr + " | LTF_CISD=" + ltfCisdStr + " | Active Tier=" + IntegerToString(g_contextTracker.activeTier), LOG_LEVEL_INFO);
-
-    // REGRESSION_GUARD_V52_5_C3_CONTEXT: C3-specific markers added
-    return true;
+   return anyValid;
 }
 
 //+------------------------------------------------------------------+

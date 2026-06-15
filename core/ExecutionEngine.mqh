@@ -35,18 +35,6 @@ enum ENUM_POI_STATUS
 };
 
 //+------------------------------------------------------------------+
-//| ENUM_PD_ARRAY_TYPE — PD Array classification                     |
-//+------------------------------------------------------------------+
-enum ENUM_PD_ARRAY_TYPE
-{
-   PD_NONE        = 0,
-   PD_BREAKER_BLOCK,   // Priority 1 — highest
-   PD_FVG,              // Priority 2
-   PD_ORDER_BLOCK,      // Priority 3
-   PD_INVERSION_FVG     // Priority 4
-};
-
-//+------------------------------------------------------------------+
 //| SPDArrayResult — Result from zone scan                           |
 //+------------------------------------------------------------------+
 struct SPDArrayResult
@@ -295,20 +283,23 @@ bool ScanForBreakerBlock(const string symbol, ENUM_TIMEFRAMES tf, double low, do
 }
 
 // VERBATIM REPAIR: Trinity Scanner Sequence (§3)
-bool EE_ScanPDArray(const string symbol, ENUM_TIMEFRAMES tf, double low, double high, double &outEntry) {
+bool EE_ScanPDArray(const string symbol, ENUM_TIMEFRAMES tf, double low, double high, double &outEntry, ENUM_PD_ARRAY_TYPE &outType) {
     // Priority 1: Breaker Block (BK)
-    if (ScanForBreakerBlock(symbol, tf, low, high, outEntry)) return true;
+    if (ScanForBreakerBlock(symbol, tf, low, high, outEntry)) { outType = PD_BREAKER_BLOCK; return true; }
     
     // Priority 2: Order Block (OB)
-    if (ScanForOB(symbol, tf, low, high, outEntry)) return true;
+    if (ScanForOB(symbol, tf, low, high, outEntry)) { outType = PD_ORDER_BLOCK; return true; }
     
     // Priority 3: FVG (0.5 Midpoint)
-    if (ScanForFVG(symbol, tf, low, high, outEntry)) return true;
+    if (ScanForFVG(symbol, tf, low, high, outEntry)) { outType = PD_FVG; return true; }
     
     // Priority 4: Inversion FVG (IFVG)
-    if (ScanForIFVG(symbol, tf, low, high, outEntry)) return true;
+    if (ScanForIFVG(symbol, tf, low, high, outEntry)) { outType = PD_INVERSION_FVG; return true; }
 
     outEntry = 0.0;
+    outType = PD_NONE;
+    LogPrint("[POI_SCAN_FAIL] symbol=" + symbol + " | zoneMin=" + DoubleToString(low) +
+             " | zoneMax=" + DoubleToString(high), LOG_LEVEL_DEBUG);
     return false; // Hard Reject: No PD Array Oxygen found
 }
 
@@ -347,7 +338,8 @@ ENUM_POI_STATUS EE_MapPOI(
 
    // Step 2: Scan for PD Array using Trinity scanner
    double outEntry = 0.0;
-   bool found = EE_ScanPDArray(symbol, entryTf, zone.low, zone.high, outEntry);
+   ENUM_PD_ARRAY_TYPE outType = PD_NONE;
+   bool found = EE_ScanPDArray(symbol, entryTf, zone.low, zone.high, outEntry, outType);
 
    if(!found)
    {
@@ -363,10 +355,10 @@ ENUM_POI_STATUS EE_MapPOI(
       return POI_MISSING;
    }
 
-   // Step 3: Assign entry price
+   // Step 3: Assign entry price and POI type
    candidateEntryPrice = outEntry;
    mappedPrice = outEntry;
-   mappedType = PD_NONE;
+   mappedType = outType;
 
    // Step 4: Log the mapping
    LogPrint("[TSPOT_POI_MAPPED] on " + EnumToString(entryTf) +
@@ -500,7 +492,8 @@ double ScanForPDArray(double tSpotMin, double tSpotMax, bool bullish, const stri
       return 0.0;
 
    double outPrice = 0.0;
-   if(!EE_ScanPDArray(symbol, entryTf, zoneLow, zoneHigh, outPrice))
+   ENUM_PD_ARRAY_TYPE outType;
+   if(!EE_ScanPDArray(symbol, entryTf, zoneLow, zoneHigh, outPrice, outType))
       return 0.0;
 
    return outPrice;
@@ -512,7 +505,7 @@ double ScanForPDArray(double tSpotMin, double tSpotMax, bool bullish, const stri
 //| SURGICAL LOGIC: No midpoints allowed. Strict PD Array scan per   |
 //| Prompt 6 / §XVII Gate 4. Sets signal.entry_price directly.       |
 //+------------------------------------------------------------------+
-void EE_MapC3POI(SLockedSignal &sig) {
+bool EE_MapC3POI(SLockedSignal &sig) {
     ENUM_TIMEFRAMES entryTf = (sig.branchId == BRANCH_INTRADAY) ? PERIOD_M5 : PERIOD_M15;
     bool bullish = (sig.direction == DIRECTION_BUY);
     double mappedPrice = ScanForPDArray(sig.tSpotMin, sig.tSpotMax, bullish, sig.symbol, entryTf);
@@ -521,7 +514,9 @@ void EE_MapC3POI(SLockedSignal &sig) {
         sig.requestedEntryPrice = mappedPrice; // CRITICAL: Pipeline check
         sig.candidateEntryPrice = mappedPrice;
         LogPrint("[TSPOT_POI_MAPPED] C3 | Price: " + DoubleToString(mappedPrice, _Digits) + " | Branch " + IntegerToString(g_activeBranch), LOG_LEVEL_INFO);
+        return true;
     }
+    return false;
 }
 
 //+------------------------------------------------------------------+
@@ -564,11 +559,14 @@ bool EE_MapTSpotPOI(SLockedSignal &sig)
    }
 
    double mappedPrice = 0.0;
-   if(!EE_ScanPDArray(sig.symbol, entryTf, zoneLow, zoneHigh, mappedPrice))
+   ENUM_PD_ARRAY_TYPE mappedType = PD_NONE;
+   if(!EE_ScanPDArray(sig.symbol, entryTf, zoneLow, zoneHigh, mappedPrice, mappedType))
    {
       sig.entry_price = 0.0;
       sig.requestedEntryPrice = 0.0;
       sig.candidateEntryPrice = 0.0;
+      sig.poi_type = PD_NONE;
+      sig.poi_price = 0.0;
       LogPrint("[GATE_4_REJECT] T-Spot zone empty. Entry denied.", LOG_LEVEL_INFO);
       return false;
    }
@@ -576,7 +574,10 @@ bool EE_MapTSpotPOI(SLockedSignal &sig)
    sig.entry_price = mappedPrice;
    sig.requestedEntryPrice = mappedPrice;
    sig.candidateEntryPrice = mappedPrice;
-   LogPrint("[TSPOT_POI_MAPPED] Trinity scan | Price=" + DoubleToString(mappedPrice, _Digits), LOG_LEVEL_INFO);
+   sig.poi_type = mappedType;
+   sig.poi_price = mappedPrice;
+   LogPrint("[TSPOT_POI_MAPPED] Trinity scan | Price=" + DoubleToString(mappedPrice, _Digits) +
+            " | type=" + IntegerToString(mappedType), LOG_LEVEL_INFO);
    return true;
 }
 
@@ -640,7 +641,8 @@ ENUM_POI_STATUS EE_ResolvePOIWait(
    zone.Compute(htfHigh, htfLow, bullish);
 
    double outPrice = 0.0;
-   bool found = EE_ScanPDArray(signal.symbol, entryTf, zone.low, zone.high, outPrice);
+   ENUM_PD_ARRAY_TYPE outType;
+   bool found = EE_ScanPDArray(signal.symbol, entryTf, zone.low, zone.high, outPrice, outType);
 
    if(found)
    {
