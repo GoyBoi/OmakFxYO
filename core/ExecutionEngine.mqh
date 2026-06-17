@@ -98,7 +98,9 @@ bool InZone(double price, const STSpotZone &zone)
 //+------------------------------------------------------------------+
 //| ScanForOB — Scan entry TF for Order Block inside zone            |
 //|                                                                  |
-//| OB: Candle whose open is inside the zone.                        |
+//| OB: Candle whose open or close is inside the zone.               |
+//| FIX: Accept close-in-zone as fallback (catches mid-bar entry).   |
+//| FIX: Include index 0 (current forming candle).                   |
 //+------------------------------------------------------------------+
 bool ScanForOB(const string symbol, ENUM_TIMEFRAMES entryTF, double zoneLow, double zoneHigh, double &outPrice)
 {
@@ -108,17 +110,24 @@ bool ScanForOB(const string symbol, ENUM_TIMEFRAMES entryTF, double zoneLow, dou
    if(copied < 5) return false;
 
    int maxBars = MathMin(50, copied - 1);
-   for(int i = 1; i < maxBars; i++)
+   for(int i = 0; i < maxBars; i++)
    {
+      double obBody = rates[i].close;
+      bool hasBody = (obBody != rates[i].open);
+      if(!hasBody) continue;
+
       double obOpen = rates[i].open;
-      if(obOpen < zoneLow || obOpen > zoneHigh) continue;
+      if(obOpen >= zoneLow && obOpen <= zoneHigh)
+      {
+         outPrice = obOpen;
+         return true;
+      }
 
-      bool isDownClose = (rates[i].close < rates[i].open);
-      bool isUpClose   = (rates[i].close > rates[i].open);
-      if(!isDownClose && !isUpClose) continue;
-
-      outPrice = obOpen;
-      return true;
+      if(obBody >= zoneLow && obBody <= zoneHigh)
+      {
+         outPrice = obBody;
+         return true;
+      }
    }
    return false;
 }
@@ -127,6 +136,8 @@ bool ScanForOB(const string symbol, ENUM_TIMEFRAMES entryTF, double zoneLow, dou
 //| ScanForFVG — Scan entry TF for Fair Value Gap (0.5 midpoint)     |
 //|                                                                  |
 //| FVG: Three-candle imbalance. Entry price = gap midpoint (0.5).   |
+//| FIX: Use zone overlap (not strict midpoint containment) — same   |
+//|      pattern as IFVG. Accepts gaps straddling zone boundary.     |
 //+------------------------------------------------------------------+
 bool ScanForFVG(const string symbol, ENUM_TIMEFRAMES entryTF, double zoneLow, double zoneHigh, double &outPrice)
 {
@@ -147,7 +158,7 @@ bool ScanForFVG(const string symbol, ENUM_TIMEFRAMES entryTF, double zoneLow, do
       if(!isBullishGap && !isBearishGap) continue;
 
       double fvgMid = (gapHigh + gapLow) / 2.0;
-      if(fvgMid < zoneLow || fvgMid > zoneHigh) continue;
+      if(gapHigh <= zoneLow || gapLow >= zoneHigh) continue;
 
       outPrice = fvgMid;
       return true;
@@ -271,11 +282,12 @@ bool CheckBreakerCondition(const string symbol, ENUM_TIMEFRAMES tf, int bar, dou
 //| VERBATIM REPAIR: Investigation VIII - Breaker Block Priority     |
 //| Scans the last 20 bars on the entry TF for a Breaker Block       |
 //| within the T-Spot zone. BK is the highest-priority PD Array.     |
+//| FIX: Include index 0 (current forming candle).                   |
 //+------------------------------------------------------------------+
 bool ScanForBreakerBlock(const string symbol, ENUM_TIMEFRAMES tf, double low, double high, double &outEntry)
 {
    int total = iBars(symbol, tf);
-   for(int i = 1; i < 20 && i < total; i++)
+   for(int i = 0; i < 20 && i < total; i++)
    {
       if(CheckBreakerCondition(symbol, tf, i, low, high, outEntry)) return true;
    }
@@ -284,23 +296,32 @@ bool ScanForBreakerBlock(const string symbol, ENUM_TIMEFRAMES tf, double low, do
 
 // VERBATIM REPAIR: Trinity Scanner Sequence (§3)
 bool EE_ScanPDArray(const string symbol, ENUM_TIMEFRAMES tf, double low, double high, double &outEntry, ENUM_PD_ARRAY_TYPE &outType) {
+    bool found = false;
+
     // Priority 1: Breaker Block (BK)
-    if (ScanForBreakerBlock(symbol, tf, low, high, outEntry)) { outType = PD_BREAKER_BLOCK; return true; }
-    
+    if (ScanForBreakerBlock(symbol, tf, low, high, outEntry)) { outType = PD_BREAKER_BLOCK; found = true; }
+
     // Priority 2: Order Block (OB)
-    if (ScanForOB(symbol, tf, low, high, outEntry)) { outType = PD_ORDER_BLOCK; return true; }
-    
+    if (!found && ScanForOB(symbol, tf, low, high, outEntry)) { outType = PD_ORDER_BLOCK; found = true; }
+
     // Priority 3: FVG (0.5 Midpoint)
-    if (ScanForFVG(symbol, tf, low, high, outEntry)) { outType = PD_FVG; return true; }
-    
+    if (!found && ScanForFVG(symbol, tf, low, high, outEntry)) { outType = PD_FVG; found = true; }
+
     // Priority 4: Inversion FVG (IFVG)
-    if (ScanForIFVG(symbol, tf, low, high, outEntry)) { outType = PD_INVERSION_FVG; return true; }
+    if (!found && ScanForIFVG(symbol, tf, low, high, outEntry)) { outType = PD_INVERSION_FVG; found = true; }
+
+    if (found) {
+        LogPrint("[POI_SCAN_SUCCESS] zoneMin=" + DoubleToString(low, _Digits) +
+                 " zoneMax=" + DoubleToString(high, _Digits) +
+                 " | found=" + EnumToString(outType), LOG_LEVEL_DEBUG);
+        return true;
+    }
 
     outEntry = 0.0;
     outType = PD_NONE;
-    LogPrint("[POI_SCAN_FAIL] symbol=" + symbol + " | zoneMin=" + DoubleToString(low) +
+    LogPrint("[POI_SCAN_FAIL] No PD Array in T-Spot zone | zoneMin=" + DoubleToString(low) +
              " | zoneMax=" + DoubleToString(high), LOG_LEVEL_DEBUG);
-    return false; // Hard Reject: No PD Array Oxygen found
+    return false;
 }
 
 //+------------------------------------------------------------------+

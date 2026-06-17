@@ -2720,9 +2720,7 @@ bool c3_displacement_valid = (InpUseDisplacementEngine && c3_displacement && c3_
 signal_c3.c3_open = c3_open;
         signal_c3.c3_close = c3_close;
 
-      ENUM_TIMEFRAMES slItf = (g_activeBranch == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4;
-           signal_c3.stop_loss = C3_SL_Calculator(signal_c3.is_bullish ? 1 : -1, signal_c3.entry_price, slItf, InpMinStopBuffer);
-            signal_c3.equilibrium = (c1_high + c1_low) / 2.0;
+      signal_c3.equilibrium = (c1_high + c1_low) / 2.0;
             signal_c3.c3_wick_ratio = ComputeWickRatio(c3_open, c3_close, c3_high, c3_low);
             // VERBATIM REPAIR: Use Anchor TF boundaries for T-Spot 
             {   SLockedSignal tmpC3; tmpC3.Reset();
@@ -2741,6 +2739,9 @@ signal_c3.c3_open = c3_open;
                 EE_MapTSpotPOI(tmpC3);
                 if(tmpC3.entry_price > 0.0) signal_c3.entry_price = tmpC3.entry_price;
                 signal_c3.tSpotMin = tmpC3.tSpotMin; signal_c3.tSpotMax = tmpC3.tSpotMax; }
+            ENUM_TIMEFRAMES slItf = (g_activeBranch == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4;
+            if(signal_c3.entry_price > 0.0)
+               signal_c3.stop_loss = C3_SL_Calculator(signal_c3.is_bullish ? 1 : -1, signal_c3.entry_price, slItf, InpMinStopBuffer);
             LogPrint("[C3_TSPOT_ZONE_SET] Displacement | tSpotMin=" + DoubleToString(signal_c3.tSpotMin, _Digits) +
                      " | tSpotMax=" + DoubleToString(signal_c3.tSpotMax, _Digits) +
                      " | entry=" + DoubleToString(signal_c3.entry_price, _Digits), LOG_LEVEL_INFO);
@@ -2780,9 +2781,7 @@ signal_c3.c3_open = c3_open;
        signal_c3.c3_open  = c3_open;
        signal_c3.c3_close = c3_close;
 
-       ENUM_TIMEFRAMES slItf = (g_activeBranch == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4;
-signal_c3.stop_loss     = C3_SL_Calculator(signal_c3.is_bullish ? 1 : -1, signal_c3.entry_price, slItf, InpMinStopBuffer);
-           signal_c3.equilibrium   = (c1_high + c1_low) / 2.0;
+      signal_c3.equilibrium   = (c1_high + c1_low) / 2.0;
            signal_c3.c3_wick_ratio = c3_wick_ratio;
            signal_c3.c2_wick_ratio = ComputeWickRatio(c2_open, c2_close, c2_high, c2_low);
             // VERBATIM REPAIR: Use Anchor TF boundaries for T-Spot 
@@ -2802,6 +2801,9 @@ signal_c3.stop_loss     = C3_SL_Calculator(signal_c3.is_bullish ? 1 : -1, signal
                 EE_MapTSpotPOI(tmpC3);
                 if(tmpC3.entry_price > 0.0) signal_c3.entry_price = tmpC3.entry_price;
                 signal_c3.tSpotMin = tmpC3.tSpotMin; signal_c3.tSpotMax = tmpC3.tSpotMax; }
+            ENUM_TIMEFRAMES slItf = (g_activeBranch == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4;
+            if(signal_c3.entry_price > 0.0)
+               signal_c3.stop_loss = C3_SL_Calculator(signal_c3.is_bullish ? 1 : -1, signal_c3.entry_price, slItf, InpMinStopBuffer);
             LogPrint("[C3_TSPOT_ZONE_SET] Classic fallback | tSpotMin=" + DoubleToString(signal_c3.tSpotMin, _Digits) +
                      " | tSpotMax=" + DoubleToString(signal_c3.tSpotMax, _Digits) +
                      " | entry=" + DoubleToString(signal_c3.entry_price, _Digits), LOG_LEVEL_INFO);
@@ -2835,8 +2837,6 @@ signal_c3.stop_loss     = C3_SL_Calculator(signal_c3.is_bullish ? 1 : -1, signal
       signal_c2.c2_open  = c2_open;
       signal_c2.c2_close = c2_close;
 
-      ENUM_TIMEFRAMES slItf = (g_activeBranch == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4;
-      signal_c2.stop_loss = C2_SL_Calculator(signal_c2.is_bullish ? 1 : -1, signal_c2.entry_price, slItf, InpMinStopBuffer);
       signal_c2.equilibrium   = (c1_high + c1_low) / 2.0;
       signal_c2.c2_wick_ratio = ComputeWickRatio(c2_open, c2_close, c2_high, c2_low);
       // VERBATIM REPAIR: Use Anchor TF boundaries for T-Spot 
@@ -2856,6 +2856,9 @@ signal_c3.stop_loss     = C3_SL_Calculator(signal_c3.is_bullish ? 1 : -1, signal
           EE_MapTSpotPOI(tmpC2);
           if(tmpC2.entry_price > 0.0) signal_c2.entry_price = tmpC2.entry_price;
           signal_c2.tSpotMin = tmpC2.tSpotMin; signal_c2.tSpotMax = tmpC2.tSpotMax; }
+      ENUM_TIMEFRAMES slItf = (g_activeBranch == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4;
+      if(signal_c2.entry_price > 0.0)
+         signal_c2.stop_loss = C2_SL_Calculator(signal_c2.is_bullish ? 1 : -1, signal_c2.entry_price, slItf, InpMinStopBuffer);
       LogPrint("[ENTRY_CANDIDATE_SET] C2 classic fallback T-Spot | GUID_pre=" + IntegerToString(signal_c2.m_guid) +
                " entry=" + DoubleToString(signal_c2.entry_price, _Digits) +
                " tspotMin=" + DoubleToString(signal_c2.tSpotMin, _Digits) +
@@ -3104,20 +3107,93 @@ signal_c3.c2_wick_ratio = c2WickRatio;
          }
      }
 
-    // Attempt C4 detection if:
-    // 1. An active narrative exists with a C3 event registered
-    // 2. No C4 event already registered
+    // C4 detection: independent of narrative, requires C3 reference data
     bool c4Evaluated = false;
+    double c4NarC3High = 0.0;
+    double c4NarC3Low = 0.0;
+    bool c4HasC3Data = false;
+
+    // Extract C3 extremes from active narrative if available
     if(hasActiveNarrative)
+    {
+        bool _c4ExtractIsBrA = (ctx.branch == BRANCH_INTRADAY);
+        int _c4ExtractNIdx = narrativeIdx;
+        c4NarC3High = _c4ExtractIsBrA ? g_branchANarratives[_c4ExtractNIdx].c3Event.event_high : g_branchBNarratives[_c4ExtractNIdx].c3Event.event_high;
+        c4NarC3Low = _c4ExtractIsBrA ? g_branchANarratives[_c4ExtractNIdx].c3Event.event_low : g_branchBNarratives[_c4ExtractNIdx].c3Event.event_low;
+        c4HasC3Data = (c4NarC3High > 0.0 && c4NarC3Low > 0.0);
+    }
+
+    // Fallback: scan g_activeC3[] directly if narrative C3 data is missing
+    if(!c4HasC3Data)
+    {
+        int c3BaseIdx = GetSignalStoreIndex(ctx.branch, CLOSURE_C3);
+        int c3MaxSlots = GetMaxSignalsForClosureType(CLOSURE_C3);
+        for(int c3si = 0; c3si < c3MaxSlots; c3si++)
+        {
+            int c3idx = c3BaseIdx + c3si;
+            if(g_activeC3[c3idx].m_guid != 0 && g_activeC3[c3idx].c3_high > 0.0 && g_activeC3[c3idx].c3_low > 0.0)
+            {
+                c4NarC3High = g_activeC3[c3idx].c3_high;
+                c4NarC3Low = g_activeC3[c3idx].c3_low;
+                c4HasC3Data = true;
+                LogPrint("[C4_C3_FALLBACK] GUID=" + IntegerToString(g_activeC3[c3idx].m_guid) +
+                         " | c3_high=" + DoubleToString(c4NarC3High, _Digits) +
+                         " | c3_low=" + DoubleToString(c4NarC3Low, _Digits), LOG_LEVEL_DEBUG);
+                break;
+            }
+        }
+    }
+
+    if(c4HasC3Data)
     {
        bool _c4IsBrA = (ctx.branch == BRANCH_INTRADAY);
        int _c4NIdx = narrativeIdx;
 
-       // C4 is a continuation expansion event within an existing C3 narrative.
-        // C4 always requires a confirmed C3 parent signal (stage >= STAGE_READY).
-        bool c4Permitted = (_c4IsBrA ? g_branchANarratives[_c4NIdx].IsWindowOpenOrDeferred() : g_branchBNarratives[_c4NIdx].IsWindowOpenOrDeferred())
-                        && ((_c4IsBrA ? (int)g_branchANarratives[_c4NIdx].c4EventCount : (int)g_branchBNarratives[_c4NIdx].c4EventCount) < 3);
-        bool c4FromC3 = ((_c4IsBrA ? (int)g_branchANarratives[_c4NIdx].c3EventCount : (int)g_branchBNarratives[_c4NIdx].c3EventCount) > 0);
+       // C4 is a continuation expansion event. When narrative exists, use narrative permissions.
+       // When narrative is absent, C4 may still fire from a confirmed C3 signal (g_activeC3[] fallback).
+       bool c4FromNarrative = hasActiveNarrative && _c4NIdx >= 0;
+       bool c4FromDirectC3 = !c4FromNarrative && c4HasC3Data;
+
+       // CONSTITUTION: C4 requires parent C3 signal to be confirmed (stage >= STAGE_READY)
+       bool c3ParentConfirmed = false;
+       int c3BaseIdx = GetSignalStoreIndex(ctx.branch, CLOSURE_C3);
+       int c3MaxSlots = GetMaxSignalsForClosureType(CLOSURE_C3);
+       for(int ci = 0; ci < c3MaxSlots; ci++)
+       {
+           int idx = c3BaseIdx + ci;
+           if(g_activeC3[idx].m_guid != 0)
+           {
+               ENUM_SIGNAL_STAGE sigStage = g_activeC3[idx].stage;
+               if(sigStage == STAGE_READY || sigStage == STAGE_EXECUTED)
+               {
+                   c3ParentConfirmed = true;
+                   // When C3 data came from direct scan and no narrative values exist,
+                   // use the active C3 signal's extremes
+                   if(c4FromDirectC3)
+                   {
+                       c4NarC3High = g_activeC3[idx].c3_high;
+                       c4NarC3Low = g_activeC3[idx].c3_low;
+                   }
+                   break;
+               }
+           }
+       }
+
+       // Permission gates: narrative path vs direct C3 path
+       bool c4Permitted = false;
+       bool c4FromC3 = c3ParentConfirmed;
+
+       if(c4FromNarrative)
+       {
+           c4Permitted = g_branchANarratives[_c4NIdx].IsWindowOpenOrDeferred()
+                      && ((int)g_branchANarratives[_c4NIdx].c4EventCount < 3);
+           if(!c4Permitted)
+               c4FromC3 = false;
+       }
+       else
+       {
+           c4Permitted = c3ParentConfirmed;
+       }
 
         static datetime s_lastC4BlockedLog[2] = {0, 0};
         int c4BlockedBranchIdx = (ctx.branch == BRANCH_INTRADAY) ? 0 : 1;
@@ -3138,47 +3214,41 @@ signal_c3.c2_wick_ratio = c2WickRatio;
             }
         }
 
-        // CONSTITUTION: C4 requires parent C3 signal to be confirmed (stage >= STAGE_READY)
-        if(c4FromC3)
-        {
-            bool c3ParentConfirmed = false;
-            int c3BaseIdx = GetSignalStoreIndex(ctx.branch, CLOSURE_C3);
-            int c3MaxSlots = GetMaxSignalsForClosureType(CLOSURE_C3);
-            for(int ci = 0; ci < c3MaxSlots; ci++)
-            {
-                int idx = c3BaseIdx + ci;
-                if(g_activeC3[idx].m_guid != 0)
-                {
-                    ENUM_SIGNAL_STAGE sigStage = g_activeC3[idx].stage;
-                    if(sigStage == STAGE_READY || sigStage == STAGE_EXECUTED)
-                    {
-                        c3ParentConfirmed = true;
-                        break;
-                    }
-                }
-            }
-            if(!c3ParentConfirmed)
-            {
-                LogPrint("[C4_BLOCKED] C3 parent not confirmed | branch=" + (ctx.branch == BRANCH_INTRADAY ? "A" : "B") +
-                         " | c3EventCount=" + IntegerToString(_c4IsBrA ? (int)g_branchANarratives[_c4NIdx].c3EventCount : (int)g_branchBNarratives[_c4NIdx].c3EventCount), LOG_LEVEL_WARN);
-                c4FromC3 = false;
-            }
-        }
-
 if(c4Permitted && c4FromC3)
         {
-           double c4NarC2High = _c4IsBrA ? g_branchANarratives[_c4NIdx].c2Event.c2_high : g_branchBNarratives[_c4NIdx].c2Event.c2_high;
-           double c4NarC2Low = _c4IsBrA ? g_branchANarratives[_c4NIdx].c2Event.c2_low : g_branchBNarratives[_c4NIdx].c2Event.c2_low;
-           double c4NarC2Open = _c4IsBrA ? g_branchANarratives[_c4NIdx].c2Event.c2_open : g_branchBNarratives[_c4NIdx].c2Event.c2_open;
-           double c4NarC2Close = _c4IsBrA ? g_branchANarratives[_c4NIdx].c2Event.c2_close : g_branchBNarratives[_c4NIdx].c2Event.c2_close;
-           double c4NarC3High = _c4IsBrA ? g_branchANarratives[_c4NIdx].c3Event.event_high : g_branchBNarratives[_c4NIdx].c3Event.event_high;
-           double c4NarC3Low = _c4IsBrA ? g_branchANarratives[_c4NIdx].c3Event.event_low : g_branchBNarratives[_c4NIdx].c3Event.event_low;
-           double c4NarC3Open = _c4IsBrA ? g_branchANarratives[_c4NIdx].c3Event.event_open : g_branchBNarratives[_c4NIdx].c3Event.event_open;
-           double c4NarC3Close = _c4IsBrA ? g_branchANarratives[_c4NIdx].c3Event.event_close : g_branchBNarratives[_c4NIdx].c3Event.event_close;
-           ENUM_DIRECTION c4NarDir = _c4IsBrA ? g_branchANarratives[_c4NIdx].narrativeDirection : g_branchBNarratives[_c4NIdx].narrativeDirection;
-           ulong c4NarGUID = _c4IsBrA ? g_branchANarratives[_c4NIdx].narrativeGUID : g_branchBNarratives[_c4NIdx].narrativeGUID;
-           datetime c4NarC1BarTime = _c4IsBrA ? g_branchANarratives[_c4NIdx].c1_barTime : g_branchBNarratives[_c4NIdx].c1_barTime;
-           bool c4NarCisdConfirmed = _c4IsBrA ? g_branchANarratives[_c4NIdx].cisdConfirmed : g_branchBNarratives[_c4NIdx].cisdConfirmed;
+           double c4NarC2High = 0.0, c4NarC2Low = 0.0, c4NarC2Open = 0.0, c4NarC2Close = 0.0;
+           double c4NarC3Open = 0.0, c4NarC3Close = 0.0;
+           ENUM_DIRECTION c4NarDir = DIRECTION_NONE;
+           ulong c4NarGUID = 0;
+           datetime c4NarC1BarTime = 0;
+           bool c4NarCisdConfirmed = false;
+
+           if(c4FromNarrative)
+           {
+               c4NarC2High = _c4IsBrA ? g_branchANarratives[_c4NIdx].c2Event.c2_high : g_branchBNarratives[_c4NIdx].c2Event.c2_high;
+               c4NarC2Low = _c4IsBrA ? g_branchANarratives[_c4NIdx].c2Event.c2_low : g_branchBNarratives[_c4NIdx].c2Event.c2_low;
+               c4NarC2Open = _c4IsBrA ? g_branchANarratives[_c4NIdx].c2Event.c2_open : g_branchBNarratives[_c4NIdx].c2Event.c2_open;
+               c4NarC2Close = _c4IsBrA ? g_branchANarratives[_c4NIdx].c2Event.c2_close : g_branchBNarratives[_c4NIdx].c2Event.c2_close;
+               if(c4NarC3High <= 0.0) c4NarC3High = _c4IsBrA ? g_branchANarratives[_c4NIdx].c3Event.event_high : g_branchBNarratives[_c4NIdx].c3Event.event_high;
+               if(c4NarC3Low <= 0.0) c4NarC3Low = _c4IsBrA ? g_branchANarratives[_c4NIdx].c3Event.event_low : g_branchBNarratives[_c4NIdx].c3Event.event_low;
+               c4NarC3Open = _c4IsBrA ? g_branchANarratives[_c4NIdx].c3Event.event_open : g_branchBNarratives[_c4NIdx].c3Event.event_open;
+               c4NarC3Close = _c4IsBrA ? g_branchANarratives[_c4NIdx].c3Event.event_close : g_branchBNarratives[_c4NIdx].c3Event.event_close;
+               c4NarDir = _c4IsBrA ? g_branchANarratives[_c4NIdx].narrativeDirection : g_branchBNarratives[_c4NIdx].narrativeDirection;
+               c4NarGUID = _c4IsBrA ? g_branchANarratives[_c4NIdx].narrativeGUID : g_branchBNarratives[_c4NIdx].narrativeGUID;
+               c4NarC1BarTime = _c4IsBrA ? g_branchANarratives[_c4NIdx].c1_barTime : g_branchBNarratives[_c4NIdx].c1_barTime;
+               c4NarCisdConfirmed = _c4IsBrA ? g_branchANarratives[_c4NIdx].cisdConfirmed : g_branchBNarratives[_c4NIdx].cisdConfirmed;
+           }
+           else
+           {
+               c4NarDir = DIRECTION_BUY;
+               if(c4NarC3High > c4NarC3Low)
+                   c4NarDir = DIRECTION_BUY;
+               else
+                   c4NarDir = DIRECTION_SELL;
+               c4NarGUID = 0;
+               c4NarC1BarTime = TimeCurrent();
+               c4NarCisdConfirmed = true;
+           }
 
            double cur_high = highs[0];
            double cur_low = lows[0];
@@ -3242,20 +3312,23 @@ if(c4Permitted && c4FromC3)
                 lineage.anchorBarTime = c4NarC1BarTime;
                 lineage.detectionTime = TimeCurrent();
 
-                SClosureEvent c4Event = SFractalNarrative::BuildEvent(
-                   CLOSURE_C4, c4NarDir,
-                   c4NarC2High, c4NarC2Low, c4NarC2Open, c4NarC2Close,
-                   cur_high, cur_low, cur_open, cur_close,
-                   cur_open,
-                   c4NarDir == DIRECTION_BUY ? c4NarC2Low : c4NarC2High,
-                   0.0,
-                   ComputeWickRatio(cur_open, cur_close, cur_high, cur_low),
-                   c4NarCisdConfirmed, true, 0, lineage
-                );
-                if(_c4IsBrA)
-                   g_branchANarratives[_c4NIdx].RegisterC4Event(c4Event);
-                else
-                   g_branchBNarratives[_c4NIdx].RegisterC4Event(c4Event);
+                if(c4FromNarrative)
+                {
+                   SClosureEvent c4Event = SFractalNarrative::BuildEvent(
+                      CLOSURE_C4, c4NarDir,
+                      c4NarC2High, c4NarC2Low, c4NarC2Open, c4NarC2Close,
+                      cur_high, cur_low, cur_open, cur_close,
+                      cur_open,
+                      c4NarDir == DIRECTION_BUY ? c4NarC2Low : c4NarC2High,
+                      0.0,
+                      ComputeWickRatio(cur_open, cur_close, cur_high, cur_low),
+                      c4NarCisdConfirmed, true, 0, lineage
+                   );
+                   if(_c4IsBrA)
+                      g_branchANarratives[_c4NIdx].RegisterC4Event(c4Event);
+                   else
+                      g_branchBNarratives[_c4NIdx].RegisterC4Event(c4Event);
+                }
 
                 // ── STANDALONE C4 LOCK + COMMIT (decoupled from C3 pipeline) ──
                 SLockedSignal c4Signal;

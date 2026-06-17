@@ -404,12 +404,13 @@ double C3_SL_Calculator(int direction, double entryPrice,
          }
       }
       
-       double finalSL = protectedSwing - buffer;
-       if(finalSL >= entryPrice)
-       {
-          LogPrint("[C3_SL] BUY SL on wrong side, rejecting", LOG_LEVEL_ERROR);
-          return 0.0;
-       }
+        double finalSL = protectedSwing - buffer;
+        if(finalSL >= entryPrice)
+        {
+           LogPrint("[SL_WRONG_SIDE] BUY: sl=" + DoubleToString(finalSL, _Digits) +
+                    " >= entry=" + DoubleToString(entryPrice, _Digits), LOG_LEVEL_ERROR);
+           return 0.0;
+        }
         // Enforce broker minimum stop distance
         {
            long sl = prof.stopsLevel; if(sl <= 0) sl = 10;
@@ -440,12 +441,13 @@ double C3_SL_Calculator(int direction, double entryPrice,
          }
       }
       
-       double finalSL = protectedSwing + buffer;
-       if(finalSL <= entryPrice)
-       {
-          LogPrint("[C3_SL] SELL SL on wrong side, rejecting", LOG_LEVEL_ERROR);
-          return 0.0;
-       }
+        double finalSL = protectedSwing + buffer;
+        if(finalSL <= entryPrice)
+        {
+           LogPrint("[SL_WRONG_SIDE] SELL: sl=" + DoubleToString(finalSL, _Digits) +
+                    " <= entry=" + DoubleToString(entryPrice, _Digits), LOG_LEVEL_ERROR);
+           return 0.0;
+        }
         // Enforce broker minimum stop distance
         {
            long sl = prof.stopsLevel; if(sl <= 0) sl = 10;
@@ -502,12 +504,13 @@ double C2_SL_Calculator(int direction, double entryPrice,
          }
       }
       
-       double finalSL = sweptExtreme - buffer;
-       if(finalSL >= entryPrice)
-       {
-          LogPrint("[C2_SL] BUY SL on wrong side, rejecting", LOG_LEVEL_ERROR);
-          return 0.0;
-       }
+        double finalSL = sweptExtreme - buffer;
+        if(finalSL >= entryPrice)
+        {
+           LogPrint("[SL_WRONG_SIDE] BUY: sl=" + DoubleToString(finalSL, _Digits) +
+                    " >= entry=" + DoubleToString(entryPrice, _Digits), LOG_LEVEL_ERROR);
+           return 0.0;
+        }
         // Enforce broker minimum stop distance
         {
            long sl = prof.stopsLevel; if(sl <= 0) sl = 10;
@@ -538,12 +541,13 @@ double C2_SL_Calculator(int direction, double entryPrice,
          }
       }
       
-       double finalSL = sweptExtreme + buffer;
-       if(finalSL <= entryPrice)
-       {
-          LogPrint("[C2_SL] SELL SL on wrong side, rejecting", LOG_LEVEL_ERROR);
-          return 0.0;
-       }
+        double finalSL = sweptExtreme + buffer;
+        if(finalSL <= entryPrice)
+        {
+           LogPrint("[SL_WRONG_SIDE] SELL: sl=" + DoubleToString(finalSL, _Digits) +
+                    " <= entry=" + DoubleToString(entryPrice, _Digits), LOG_LEVEL_ERROR);
+           return 0.0;
+        }
        // Enforce broker minimum stop distance
        {
            long sl = prof.stopsLevel; if(sl <= 0) sl = 10;
@@ -593,18 +597,26 @@ double C4_SL_Calculator(int direction,           // +1 = BUY, -1 = SELL
 
    double finalSL = (direction == 1) ? c3Extreme - buffer : c3Extreme + buffer;
 
-   // Ensure SL is on correct side of entry
-   if((direction == 1 && finalSL >= entryPrice) ||
-      (direction == -1 && finalSL <= entryPrice))
+   if(direction == 1)
    {
-      LogPrint("[C4_SL_WRONG_SIDE] SL on wrong side of entry | direction=" + (direction == 1 ? "BUY" : "SELL") +
-               " | entry=" + DoubleToString(entryPrice, _Digits) +
-               " | sl=" + DoubleToString(finalSL, _Digits) +
-               " | c3Extreme=" + DoubleToString(c3Extreme, _Digits), LOG_LEVEL_WARN);
-      return 0.0;
+      if(finalSL >= entryPrice)
+      {
+         LogPrint("[SL_WRONG_SIDE] BUY: sl=" + DoubleToString(finalSL, _Digits) +
+                  " >= entry=" + DoubleToString(entryPrice, _Digits), LOG_LEVEL_ERROR);
+         return 0.0;
+      }
+   }
+   else
+   {
+      if(finalSL <= entryPrice)
+      {
+         LogPrint("[SL_WRONG_SIDE] SELL: sl=" + DoubleToString(finalSL, _Digits) +
+                  " <= entry=" + DoubleToString(entryPrice, _Digits), LOG_LEVEL_ERROR);
+         return 0.0;
+      }
    }
 
-   LogPrint("[C4_SL] direction=" + (direction == 1 ? "BUY" : "SELL") +
+   LogPrint("[C4_SL_VALID] direction=" + (direction == 1 ? "BUY" : "SELL") +
             " | entry=" + DoubleToString(entryPrice, _Digits) +
             " | sl=" + DoubleToString(finalSL, _Digits) +
             " | c3_high=" + DoubleToString(c3_high, _Digits) +

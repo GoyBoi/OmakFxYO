@@ -840,6 +840,16 @@ bool ExecutionGatePass(SLockedSignal &signal, ENUM_EXECUTION_BRANCH branch, doub
                  signal.branchId == BRANCH_INTRADAY ? "A" : "B"), LOG_LEVEL_INFO);
     }
     
+    // Store GUID for deal tracking
+    {
+        int mapIdx = ArraySize(g_orderToGuidMap);
+        ArrayResize(g_orderToGuidMap, mapIdx + 1);
+        g_orderToGuidMap[mapIdx].ticket = result.order;
+        g_orderToGuidMap[mapIdx].guid = signal.m_guid;
+        LogPrint("[ORDER_GUID_MAP] ticket=" + IntegerToString(result.order) +
+                 " | GUID=" + IntegerToString(signal.m_guid), LOG_LEVEL_DEBUG);
+    }
+    
     g_totalOrdersSent++;
     LogPrint("[ORDER_SENT] GUID=" + IntegerToString(signal.m_guid) +
              " | type=" + EnumToString(request.type) +
@@ -1089,6 +1099,16 @@ request.action = TRADE_ACTION_PENDING;
                g_pendingLinks[linkIdx].branch = linkBranch;
             }
             LogPrint(StringFormat("[GUID_BRIDGE_SET] ID:%u -> GUID:%I64u", result.request_id, g_current_signal_guid), LOG_LEVEL_INFO);
+        }
+
+        // Store GUID for deal tracking
+        {
+            int mapIdx = ArraySize(g_orderToGuidMap);
+            ArrayResize(g_orderToGuidMap, mapIdx + 1);
+            g_orderToGuidMap[mapIdx].ticket = result.order;
+            g_orderToGuidMap[mapIdx].guid = g_current_signal_guid;
+            LogPrint("[ORDER_GUID_MAP] ticket=" + IntegerToString(result.order) +
+                     " | GUID=" + IntegerToString(g_current_signal_guid), LOG_LEVEL_DEBUG);
         }
 
         // [ENTRY_TRUTH] Set fill price on the signal (via store)

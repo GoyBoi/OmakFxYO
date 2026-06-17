@@ -36,7 +36,7 @@ input double InpMaxMinLotRiskPercent = 20.0; // Affordability bridge: max minLot
 input double InpMaxRiskDeviation = 0.25; // Max allowed risk deviation after lot adjustment (%)
     input double InpMinStopBuffer = 1.0;      // Minimum SL buffer as multiplier of broker's SYMBOL_TRADE_STOPS_LEVEL (0=use broker minimum)
    input double InpStopsBuffer = 1.0;        // Multiplier for broker stops level enforcement
-  input int InpMaxPoiWaitBars = 10;         // Max bars to wait for POI touch before expiring (PROMPT_E3: was 5)
+  input int InpMaxPoiWaitBars = 20;         // Max M5 bars to wait for POI (was 10)
   input int    InpMagicNumber = 88001;
  input bool   InpEnableTrace = true;
 
@@ -301,6 +301,14 @@ struct PendingGUIDLink
    }
 };
 PendingGUIDLink g_pendingLinks[];      // dynamic array
+
+// Order ticket → GUID map for DEAL_TRACK correlation
+struct OrderGUIDMapEntry
+{
+    ulong ticket;
+    ulong guid;
+};
+OrderGUIDMapEntry g_orderToGuidMap[];
 
 //+------------------------------------------------------------------+
 //| GetPendingOrderTimeoutSeconds - §XII Compliance                 |
@@ -4251,6 +4259,25 @@ void ProcessPipelineSignal(SLockedSignal &sig,
         int sigMode = execSig.executionMode;
         EntryMode mode = (sigMode == 1) ? MODE_ANTICIPATION : MODE_CONFIRMATION;
         execSig.riskProfile = GetRiskProfile(mode);
+        // ===== STEP 1: POI mapping FIRST (entry_price finalisation) =====
+        if(!EE_MapTSpotPOI(sig))
+        {
+            LogPrint("[POI_MAPPING_FAIL] GUID=" + IntegerToString(execSig.m_guid), LOG_LEVEL_WARN);
+            sig.hasFailedRG = true;
+            ClearSignalByGUID(ctx.branch, execSig.m_guid, "POI_MAPPING_FAIL");
+            return;
+        }
+        // Sync the finalised entry_price to the execution copy
+        execSig.entry_price = sig.entry_price;
+        if(execSig.entry_price <= 0.0)
+        {
+            LogPrint("[POI_MAPPING_FAIL] entry_price zero after mapping | GUID=" + IntegerToString(execSig.m_guid), LOG_LEVEL_ERROR);
+            sig.hasFailedRG = true;
+            ClearSignalByGUID(ctx.branch, execSig.m_guid, "ENTRY_PRICE_ZERO_AFTER_POI");
+            return;
+        }
+
+        // ===== STEP 2: SL computation using finalised entry_price =====
         string slCalcError = "";
         double stopLoss = 0.0;
         bool slValid = (execSig.stop_loss > 0.0 && execSig.stop_loss != execSig.entry_price);
@@ -4291,13 +4318,17 @@ void ProcessPipelineSignal(SLockedSignal &sig,
             }
             if (stopLoss <= 0.0 || stopLoss == execSig.entry_price) {
                 LogPrint("[SL_FALLBACK_FAIL] GUID=" + IntegerToString(execSig.m_guid), LOG_LEVEL_ERROR);
+                sig.hasFailedRG = true;
+                ClearSignalByGUID(ctx.branch, execSig.m_guid, "SL_FALLBACK_FAIL");
                 return;
             }
         }
         if (!slValid && stopLoss > 0.0 && stopLoss != execSig.entry_price) {
             execSig.stop_loss = stopLoss;
+            sig.stop_loss = stopLoss;
         }
-        
+
+        // ===== STEP 3: TP computation =====
         string tpCalcError = "";
         double tp1Price = 0.0, tp2Price = 0.0, tp3Price = 0.0;
         if(!CalculateProjectionTPs(execSig, stopLoss, tp1Price, tp2Price, tp3Price, tpCalcError))
@@ -4306,87 +4337,25 @@ void ProcessPipelineSignal(SLockedSignal &sig,
             ClearSignalByGUID(ctx.branch, execSig.m_guid, "TP_INVALID_NO_FALLBACK");
             return;
         }
-        
         sig.tp = tp1Price;
         execSig.tp = tp1Price;
-        
+
+        // ===== STEP 4: SL distance validation =====
         double slDistancePoints = MathAbs(execSig.entry_price - stopLoss) / _Point;
         if(slDistancePoints <= 0)
         {
             LogPrint("[SL_DISTANCE_ZERO] GUID=" + IntegerToString(execSig.m_guid) +
                      " entry=" + DoubleToString(execSig.entry_price) +
                      " sl=" + DoubleToString(stopLoss), LOG_LEVEL_ERROR);
+            sig.hasFailedRG = true;
+            ClearSignalByGUID(ctx.branch, execSig.m_guid, "SL_DISTANCE_ZERO");
             return;
         }
-        
-        // ===== SPECIES-AWARE SL ASSIGNMENT (NO BLANKET OVERWRITE) =====
-        // Each species already has its SL assigned in its pipeline.
-        // Only fallback if SL is invalid, and never overwrite a valid SL.
-        
-        if(EE_MapTSpotPOI(sig))
-        {
-            // Do NOT automatically overwrite SL with manipulation leg.
-            // Instead, check if the current SL is valid.
-            bool slValid = (execSig.stop_loss > 0.0 && execSig.stop_loss != execSig.entry_price);
-            
-            if(!slValid)
-            {
-                LogPrint("[SL_FALLBACK] Species=" + EnumToString(execSig.closureType) +
-                      " had invalid SL, computing fresh...", LOG_LEVEL_WARN);
-                
-                double minStopMult = InpMinStopBuffer;  // Use your input parameter
-                double newSL = 0.0;
-                
-                switch(execSig.closureType)
-                {
-                    case CLOSURE_C2:
-                        newSL = C2_SL_Calculator(
-                            (execSig.direction == DIRECTION_BUY) ? 1 : -1,
-                            execSig.entry_price,
-                            (execSig.branch == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4,
-                            minStopMult
-                        );
-                        break;
-                        
-                    case CLOSURE_C3:
-                        newSL = C3_SL_Calculator(
-                            (execSig.direction == DIRECTION_BUY) ? 1 : -1,
-                            execSig.entry_price,
-                            (execSig.branch == BRANCH_INTRADAY) ? PERIOD_H1 : PERIOD_H4,
-                            minStopMult
-                        );
-                        break;
-                        
-                    case CLOSURE_C4:
-                        newSL = C4_SL_Calculator(
-                            (execSig.direction == DIRECTION_BUY) ? 1 : -1,
-                            execSig.entry_price,
-                            execSig.c3_high,
-                            execSig.c3_low,
-                            minStopMult
-                        );
-                        break;
-                        
-                    default:
-                        LogPrint("[SL_FALLBACK] Unknown closureType, using CalculateClosureTypeSL", LOG_LEVEL_WARN);
-                        newSL = CalculateClosureTypeSL(execSig, slCalcError);
-                        break;
-                }
-                
-                if(newSL > 0.0 && newSL != execSig.entry_price)
-                {
-                    sig.stop_loss = newSL;
-                    execSig.stop_loss = newSL;
-                    LogPrint("[SL_ASSIGNED] " + EnumToString(execSig.closureType) +
-                          " newSL=" + DoubleToString(newSL), LOG_LEVEL_INFO);
-                }
-            }
-            
-            // Now synchronise internal structures (but do not overwrite the SL we just set)
-            SyncInternalSL(execSig.stop_loss);
-            SyncRefinedTargets(sig);
-            execSig.tp = sig.tp;
-        }
+
+        // ===== STEP 5: Sync internal structures =====
+        SyncInternalSL(execSig.stop_loss);
+        SyncRefinedTargets(sig);
+        execSig.tp = sig.tp;
         // ===== END SPECIES-AWARE SL ASSIGNMENT =====
         
         if(execSig.stop_loss > 0.0)
@@ -4800,6 +4769,82 @@ void ProcessC4PersistentScanPool(SLockedSignal &pool[], int maxSlots, BranchCont
 }
 
 //+------------------------------------------------------------------+
+//| ProcessC4Pipeline – Independent C4 signal processing              |
+//| TTFM: C4 expands out of upper/lower half of C3 range              |
+//| Fills two pipeline gaps: C4_DETECTED → C4_WAITING_POI (router     |
+//| only handles C4_WAITING → C4_DETECTED) and C4_WAITING_POI →       |
+//| C4_READY (final validation).                                      |
+//+------------------------------------------------------------------+
+void ProcessC4Pipeline(SLockedSignal &sig, BranchContext &ctx)
+{
+    // Gap 1: C4_DETECTED → C4_WAITING_POI (router only handles WAITING→DETECTED)
+    if(sig.stage == STAGE_C4_DETECTED)
+    {
+        if(!sig.TransitionStage(STAGE_C4_WAITING_POI))
+            return;
+        LogPrint("[C4_ADVANCE] GUID=" + IntegerToString(sig.m_guid) +
+                 " | C4_DETECTED -> C4_WAITING_POI", LOG_LEVEL_DEBUG);
+        return;
+    }
+
+    // Only process C4_WAITING_POI for the final READY transition
+    if(sig.stage != STAGE_C4_WAITING_POI)
+        return;
+
+    // Gap 2: C4_WAITING_POI → C4_READY (final validation)
+    if(sig.c3_high <= 0.0 || sig.c3_low <= 0.0)
+    {
+        LogPrint("[C4_BLOCKED] reason=no_c3_range | GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_INFO);
+        return;
+    }
+
+    if(!EE_MapTSpotPOI(sig))
+    {
+        LogPrint("[C4_POI_MISSING] GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_DEBUG);
+        return;
+    }
+
+    SSE_CISDResult c4Cisd = SSE_DetectCISD(sig.symbol, sig.entryTF, sig.direction);
+    if(!c4Cisd.confirmed)
+    {
+        LogPrint("[C4_CISD_FAILED] GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_DEBUG);
+        return;
+    }
+
+    sig.stop_loss = C4_SL_Calculator(
+        (sig.direction == DIRECTION_BUY) ? 1 : -1,
+        sig.entry_price,
+        sig.c3_high,
+        sig.c3_low,
+        InpMinStopBuffer
+    );
+
+    if(sig.stop_loss <= 0.0 || sig.stop_loss == sig.entry_price)
+    {
+        LogPrint("[C4_SL_INVALID] GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_ERROR);
+        return;
+    }
+
+    double tp1=0, tp2=0, tp3=0;
+    string err;
+    if(CalculateProjectionTPs(sig, sig.stop_loss, tp1, tp2, tp3, err))
+        sig.tp = tp1;
+    else
+    {
+        LogPrint("[C4_TP_FAIL] GUID=" + IntegerToString(sig.m_guid) + " reason=" + err, LOG_LEVEL_WARN);
+        return;
+    }
+
+    sig.TransitionStage(STAGE_C4_READY);
+    sig.Commit();
+    CommitSignalToStore(sig, sig.branchId, CLOSURE_C4);
+
+    LogPrint("[C4_ACCEPTED] GUID=" + IntegerToString(sig.m_guid) +
+             " | entry=" + DoubleToString(sig.entry_price, _Digits) +
+             " | sl=" + DoubleToString(sig.stop_loss, _Digits) +
+             " | tp=" + DoubleToString(sig.tp, _Digits), LOG_LEVEL_INFO);
+}
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -5043,7 +5088,12 @@ for(int i = 0; i < MAX_SLOTS; i++)
     g_activeC2[i].Reset();
     g_activeC3[i].Reset();
 }
-LogPrint("[STORE_INIT] All slots reset on OnInit (Dual-Registry)", LOG_LEVEL_INFO);
+
+// C4 Registry initialisation (independent from C3)
+for(int i = 0; i < MAX_C4_SLOTS; i++)
+    g_activeC4[i].Reset();
+
+LogPrint("[STORE_INIT] All slots reset on OnInit (Triple-Registry)", LOG_LEVEL_INFO);
 
 // FIX 5: POI Cache — allocate cache for all signal slots
  ArrayResize(g_poiCache, MAX_SLOTS);
@@ -6499,13 +6549,43 @@ void OnTradeTransaction(
           dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
           dealEntryType = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
        }
-       ulong dealGuid = GetGUIDFromPositionMap(trans.position);
-       LogInfo(StringFormat("[DEAL_TRACK] ticket=%I64u pos=%I64u guid=%I64u entry=%s price=%.2f vol=%.2f profit=%.2f",
-                dealTicket, trans.position, dealGuid,
-                dealEntryType == DEAL_ENTRY_IN ? "IN" :
-                dealEntryType == DEAL_ENTRY_OUT ? "OUT" :
-                dealEntryType == DEAL_ENTRY_INOUT ? "INOUT" : "STATE",
-                dealPrice, dealVolume, dealProfit));
+        ulong dealGuid = 0;
+        for(int i = 0; i < ArraySize(g_orderToGuidMap); i++)
+        {
+            if(g_orderToGuidMap[i].ticket == dealTicket)
+            {
+                dealGuid = g_orderToGuidMap[i].guid;
+                break;
+            }
+        }
+        if(dealGuid == 0)
+        {
+            dealGuid = GetGUIDFromPositionMap(trans.position);
+        }
+        if(dealGuid == 0)
+        {
+            for(int ci = 0; ci < MAX_SLOTS; ci++)
+            {
+                if(g_activeC2[ci].positionTicket == trans.position && g_activeC2[ci].m_guid != 0)
+                { dealGuid = g_activeC2[ci].m_guid; break; }
+                if(g_activeC3[ci].positionTicket == trans.position && g_activeC3[ci].m_guid != 0)
+                { dealGuid = g_activeC3[ci].m_guid; break; }
+                if(g_activeC4[ci].positionTicket == trans.position && g_activeC4[ci].m_guid != 0)
+                { dealGuid = g_activeC4[ci].m_guid; break; }
+            }
+            if(dealGuid == 0)
+                LogPrint("[DEAL_TRACK_WARNING] No GUID found for ticket=" + IntegerToString(dealTicket) +
+                         " | position=" + IntegerToString(trans.position), LOG_LEVEL_WARN);
+        }
+        LogPrint("[DEAL_TRACK] ticket=" + IntegerToString(dealTicket) +
+                 " pos=" + IntegerToString(trans.position) +
+                 " guid=" + IntegerToString(dealGuid) +
+                 " entry=" + (dealEntryType == DEAL_ENTRY_IN ? "IN" :
+                              dealEntryType == DEAL_ENTRY_OUT ? "OUT" :
+                              dealEntryType == DEAL_ENTRY_INOUT ? "INOUT" : "STATE") +
+                 " price=" + DoubleToString(dealPrice, _Digits) +
+                 " vol=" + DoubleToString(dealVolume, 2) +
+                 " profit=" + DoubleToString(dealProfit, 2), LOG_LEVEL_INFO);
 
         // Update performance counters for closing deals (broker-triggered SL/trailing)
         if((dealEntryType == DEAL_ENTRY_OUT || dealEntryType == DEAL_ENTRY_INOUT) && dealGuid != 0)
@@ -7327,6 +7407,20 @@ g_lastTickTime = currentTick;
             int c4Base = GetSignalStoreIndex(ctx.branch, CLOSURE_C4);
             int c4Max = GetMaxSignalsForClosureType(CLOSURE_C4);
             ProcessC4PipelinePool(g_activeC4, c4Base, c4Max, ctx, currentTick, s_transitionsThisTick);
+        }
+
+// Process C4 signals independently (C4_DETECTED + C4_WAITING_POI)
+        {
+            int c4IndepBase = GetSignalStoreIndex(ctx.branch, CLOSURE_C4);
+            int c4IndepMax = GetMaxSignalsForClosureType(CLOSURE_C4);
+            for(int c4i = 0; c4i < c4IndepMax; c4i++)
+            {
+                int c4Idx = c4IndepBase + c4i;
+                if(g_activeC4[c4Idx].m_guid != 0 &&
+                   (g_activeC4[c4Idx].stage == STAGE_C4_DETECTED ||
+                    g_activeC4[c4Idx].stage == STAGE_C4_WAITING_POI))
+                    ProcessC4Pipeline(g_activeC4[c4Idx], ctx);
+            }
         }
 
     MonitorTPLevels();

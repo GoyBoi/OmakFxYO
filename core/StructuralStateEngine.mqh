@@ -783,6 +783,8 @@ SSE_CISDResult SSE_DetectCISD(
     {
         LogPrint("[CISD_DETECT] Insufficient bars for delivery detection | tf=" + EnumToString(tf) +
                  " | copied=" + IntegerToString(copied), LOG_LEVEL_DEBUG);
+        LogPrint("[CISD_FAILED] reason=no_close_through_series | direction=" +
+                 EnumToString(direction) + " | keyLevel=0.0", LOG_LEVEL_DEBUG);
         return result;
     }
 
@@ -825,7 +827,8 @@ SSE_CISDResult SSE_DetectCISD(
 
         if(seriesStart < 0 || seriesEnd < 0)
         {
-            LogPrint("[CISD_FAILED] No down-close delivery series on " + EnumToString(tf), LOG_LEVEL_DEBUG);
+            LogPrint("[CISD_FAILED] reason=no_close_through_series | direction=" +
+                     EnumToString(direction) + " | keyLevel=0.0", LOG_LEVEL_DEBUG);
             return result;
         }
 
@@ -855,10 +858,9 @@ SSE_CISDResult SSE_DetectCISD(
             return result;
         }
 
-        LogPrint("[CISD_FAILED] BULLISH on " + EnumToString(tf) +
-                 " | seriesOpen=" + DoubleToString(result.seriesOpen, _Digits) +
-                 " | confirmClose=" + DoubleToString(confirmClose, _Digits) +
-                 " | swingLow=" + DoubleToString(swingLow, _Digits), LOG_LEVEL_DEBUG);
+        LogPrint("[CISD_FAILED] reason=no_close_through_series | direction=" +
+                 EnumToString(direction) + " | keyLevel=" + DoubleToString(result.seriesOpen, _Digits),
+                 LOG_LEVEL_DEBUG);
         return result;
     }
     else if(direction == DIRECTION_SELL)
@@ -890,7 +892,8 @@ SSE_CISDResult SSE_DetectCISD(
 
         if(seriesStart < 0 || seriesEnd < 0)
         {
-            LogPrint("[CISD_FAILED] No up-close delivery series on " + EnumToString(tf), LOG_LEVEL_DEBUG);
+            LogPrint("[CISD_FAILED] reason=no_close_through_series | direction=" +
+                     EnumToString(direction) + " | keyLevel=0.0", LOG_LEVEL_DEBUG);
             return result;
         }
 
@@ -920,14 +923,14 @@ SSE_CISDResult SSE_DetectCISD(
             return result;
         }
 
-        LogPrint("[CISD_FAILED] BEARISH on " + EnumToString(tf) +
-                 " | seriesOpen=" + DoubleToString(result.seriesOpen, _Digits) +
-                 " | confirmClose=" + DoubleToString(confirmClose, _Digits) +
-                 " | swingHigh=" + DoubleToString(swingHigh, _Digits), LOG_LEVEL_DEBUG);
+        LogPrint("[CISD_FAILED] reason=no_close_through_series | direction=" +
+                 EnumToString(direction) + " | keyLevel=" + DoubleToString(result.seriesOpen, _Digits),
+                 LOG_LEVEL_DEBUG);
         return result;
     }
 
-    LogPrint("[CISD_FAILED] Invalid direction | dir=" + EnumToString(direction), LOG_LEVEL_DEBUG);
+    LogPrint("[CISD_FAILED] reason=no_close_through_series | direction=" +
+             EnumToString(direction) + " | keyLevel=0.0", LOG_LEVEL_DEBUG);
     return result;
 }
 

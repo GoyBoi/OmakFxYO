@@ -1838,12 +1838,12 @@ bool ValidateTopDownContext(BranchContext &ctx, const string symbol)
       if((g_activeC2[i].stage == STAGE_WAITING_FOR_POI || g_activeC2[i].stage == STAGE_WAITING_FOR_CISD)
          && tier1Pass && tier2Pass && tier3Pass)
       {
-         // C2 sincerity gate (SMT for correlated assets, V-Shape for solo)
-         if(!ValidateC2ReversalSincerity(sig))
-         {
-            LogPrint("[C2_REJECT] sincerity gate failed | GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_INFO);
-            return false;
-         }
+          // C2 sincerity gate (SMT for correlated assets, V-Shape for solo)
+          if(!ValidateC2ReversalSincerity(sig))
+          {
+             LogPrint("[C2_REJECT] sincerity gate failed | GUID=" + IntegerToString(sig.m_guid), LOG_LEVEL_INFO);
+             continue;
+          }
          g_activeC2[i].TransitionStage(STAGE_READY);
          LogPrint(StringFormat("[STAGE_READY] C2 | GUID=%I64u branch=%s", sig.m_guid,
                   (branch==BRANCH_INTRADAY)?"A (D1-H1-M5)":"B (D1-H4-M15)"), LOG_LEVEL_INFO);
